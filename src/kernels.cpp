@@ -1,4 +1,5 @@
 #include "adi/kernels.hpp"
+#include "parallel.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -6,7 +7,6 @@
 #include <cstddef>
 #include <cstring>
 #include <stdexcept>
-#include <thread>
 
 namespace adi {
 namespace {
@@ -19,31 +19,7 @@ constexpr std::uint32_t fresh_bits = 12;
 constexpr std::uint32_t states_per_tile = tile_values / values_per_state;
 constexpr std::uint32_t stream_bits = 384;
 constexpr std::uint32_t words_per_tile = stream_bits / 16;
-
-template <typename Function>
-void parallel_ranges(
-    std::uint32_t count,
-    std::uint32_t minimum_per_worker,
-    Function &&function) {
-    const auto available = std::max(1U, std::thread::hardware_concurrency());
-    const auto workers =
-        std::min(available, std::max(1U, count / minimum_per_worker));
-    if (workers == 1) {
-        function(0, count);
-        return;
-    }
-    std::vector<std::jthread> threads;
-    threads.reserve(workers - 1);
-    for (std::uint32_t worker = 0; worker + 1 < workers; ++worker) {
-        const auto begin = count * worker / workers;
-        const auto end = count * (worker + 1) / workers;
-        threads.emplace_back([&, begin, end] { function(begin, end); });
-    }
-    function(count * (workers - 1) / workers, count);
-    for (auto &thread : threads) {
-        thread.join();
-    }
-}
+using detail::parallel_ranges;
 
 bool is_power_of_two(std::uint32_t value) {
     return value != 0 && (value & (value - 1)) == 0;

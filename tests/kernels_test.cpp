@@ -1,12 +1,28 @@
 #include "adi/kernels.hpp"
+#include "parallel.hpp"
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 int main() {
+    bool worker_exception = false;
+    try {
+        adi::detail::parallel_ranges(
+            1024, 64,
+            [](std::uint32_t begin, std::uint32_t) {
+                if (begin == 0) {
+                    throw std::runtime_error("worker failure");
+                }
+            });
+    } catch (const std::runtime_error &) {
+        worker_exception = true;
+    }
+    assert(worker_exception);
+
     constexpr std::uint32_t dimension = 16;
     std::vector<std::uint16_t> trellis(24, 0);
     std::vector<std::uint16_t> su(dimension, adi::f32_to_f16(1.0F));
