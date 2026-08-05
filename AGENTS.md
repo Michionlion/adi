@@ -5,6 +5,8 @@ is the reference model. It is not a general GGUF runner.
 
 ## Design rules
 
+- Choose the simplest, most straightforward correct solution. Limit complexity
+  wherever possible.
 - Keep one model path and one public API.
 - Keep packed weights mmap-backed. Never create a full dense-weight shadow.
 - Preserve the packed Mach-1 arithmetic. Do not requantize it at load time.
