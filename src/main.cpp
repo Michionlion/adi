@@ -1,4 +1,5 @@
 #include "adi/adi.hpp"
+#include "adi/executor.hpp"
 #include "adi/gguf.hpp"
 #include "adi/model.hpp"
 
@@ -209,6 +210,40 @@ int embedding_row(const char *path, std::string_view token_string) {
     return 0;
 }
 
+int bench_moe(int argc, char **argv) {
+    const adi::MachModel model(argv[2]);
+    const auto layer = parse_u32(argv[3], "layer");
+    const auto iterations = argc == 5 ? parse_u32(argv[4], "iterations") : 1;
+    if (iterations == 0) {
+        throw std::invalid_argument("iterations must be positive");
+    }
+    std::vector<float> input(model.config().hidden);
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        input[index] = std::sin(static_cast<float>(index) * 0.01F);
+    }
+    std::vector<float> output(model.config().hidden);
+    adi::MoeScratch scratch;
+    std::array<adi::ExpertRoute, 8> routes;
+    const auto start = std::chrono::steady_clock::now();
+    for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
+        routes = adi::moe_forward(model, layer, input, output, scratch);
+    }
+    const auto elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    double checksum = 0.0;
+    for (const auto value : output) {
+        checksum += value;
+    }
+    std::cout << "routes:";
+    for (const auto route : routes) {
+        std::cout << ' ' << route.expert << ':' << route.weight;
+    }
+    std::cout << '\n'
+              << "milliseconds/forward: " << elapsed * 1000.0 / iterations << '\n'
+              << "checksum: " << checksum << '\n';
+    return 0;
+}
+
 void usage() {
     std::cerr << "usage:\n"
               << "  adi --version\n"
@@ -217,6 +252,7 @@ void usage() {
               << "  adi bench-expert MODEL.gguf LAYER EXPERT PROJECTION [ITERATIONS]\n"
               << "  adi bench-ne MODEL.gguf LAYER SOURCE_NAME [ITERATIONS]\n"
               << "  adi bench-head MODEL.gguf CHUNK [ITERATIONS]\n"
+              << "  adi bench-moe MODEL.gguf LAYER [ITERATIONS]\n"
               << "  adi embedding-row MODEL.gguf TOKEN\n";
 }
 
@@ -270,6 +306,14 @@ int main(int argc, char **argv) {
     if (argc == 4 && std::string_view(argv[1]) == "embedding-row") {
         try {
             return embedding_row(argv[2], argv[3]);
+        } catch (const std::exception &error) {
+            std::cerr << "adi: " << error.what() << '\n';
+            return 1;
+        }
+    }
+    if ((argc == 4 || argc == 5) && std::string_view(argv[1]) == "bench-moe") {
+        try {
+            return bench_moe(argc, argv);
         } catch (const std::exception &error) {
             std::cerr << "adi: " << error.what() << '\n';
             return 1;

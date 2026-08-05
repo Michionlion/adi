@@ -92,4 +92,21 @@ int main() {
         head_input,
         head_output);
     assert(head_output[0] == -512.0F);
+
+    std::vector<std::uint16_t> bf16_values{
+        0x3F80U, 0x4000U, 0x4040U,
+        0x4080U, 0x40A0U, 0x40C0U,
+    };
+    std::vector<float> bf16_input{1.0F, 2.0F, 3.0F};
+    std::vector<float> bf16_output(2);
+    adi::bf16_matvec({2, 3, bf16_values}, bf16_input, bf16_output);
+    assert(bf16_output[0] == 14.0F);
+    assert(bf16_output[1] == 32.0F);
+
+    std::vector<std::uint16_t> norm_weight(2, 0x3F80U);
+    std::vector<float> norm_input{3.0F, 4.0F};
+    std::vector<float> norm_output(2);
+    adi::rms_norm(norm_input, norm_weight, 0.0F, norm_output);
+    assert(std::abs(norm_output[0] - 3.0F / std::sqrt(12.5F)) < 1e-6F);
+    assert(std::abs(norm_output[1] - 4.0F / std::sqrt(12.5F)) < 1e-6F);
 }

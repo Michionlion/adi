@@ -51,6 +51,12 @@ struct MachHeadChunk {
     std::span<const std::uint16_t> protected_bf16;
 };
 
+struct Bf16Matrix {
+    std::uint32_t rows;
+    std::uint32_t columns;
+    std::span<const std::uint16_t> values;
+};
+
 // Computes y = W*x directly from the Mach-1 K=1.5/V=8 additive stream.
 // No dense copy of W is constructed.
 void mach_expert_matvec(
@@ -75,6 +81,20 @@ void mach_head_matvec(
     const MachHeadChunk &head,
     std::span<const float> input,
     std::span<float> output);
+
+void bf16_matvec(
+    const Bf16Matrix &matrix,
+    std::span<const float> input,
+    std::span<float> output);
+
+void rms_norm(
+    std::span<const float> input,
+    std::span<const std::uint16_t> weight_bf16,
+    float epsilon,
+    std::span<float> output);
+
+[[nodiscard]] float silu(float value) noexcept;
+[[nodiscard]] float sigmoid(float value) noexcept;
 
 [[nodiscard]] float f16_to_f32(std::uint16_t bits) noexcept;
 [[nodiscard]] std::uint16_t f32_to_f16(float value) noexcept;

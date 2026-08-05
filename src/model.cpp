@@ -201,6 +201,31 @@ MachHeadChunk MachModel::head_chunk(std::uint32_t chunk) const {
     };
 }
 
+Bf16Matrix MachModel::bf16_matrix(std::string_view source_name) const {
+    const auto name = "hf." + std::string(source_name);
+    const auto &tensor = required_tensor(file_, name, GgmlType::bf16);
+    if (tensor.dimensions.size() != 2 ||
+        tensor.dimensions[0] > 0xFFFFFFFFULL ||
+        tensor.dimensions[1] > 0xFFFFFFFFULL) {
+        throw std::runtime_error("model: expected BF16 matrix '" + name + "'");
+    }
+    return {
+        static_cast<std::uint32_t>(tensor.dimensions[1]),
+        static_cast<std::uint32_t>(tensor.dimensions[0]),
+        view<std::uint16_t>(file_, tensor),
+    };
+}
+
+std::span<const std::uint16_t> MachModel::bf16_vector(
+    std::string_view source_name) const {
+    const auto name = "hf." + std::string(source_name);
+    const auto &tensor = required_tensor(file_, name, GgmlType::bf16);
+    if (tensor.dimensions.size() != 1) {
+        throw std::runtime_error("model: expected BF16 vector '" + name + "'");
+    }
+    return view<std::uint16_t>(file_, tensor);
+}
+
 MachExpertMatrix MachModel::expert(
     std::uint32_t layer,
     std::uint32_t expert_index,

@@ -40,6 +40,9 @@ class MachModel {
         std::string_view source_name) const;
     [[nodiscard]] MachEmbedding embedding() const;
     [[nodiscard]] MachHeadChunk head_chunk(std::uint32_t chunk) const;
+    [[nodiscard]] Bf16Matrix bf16_matrix(std::string_view source_name) const;
+    [[nodiscard]] std::span<const std::uint16_t> bf16_vector(
+        std::string_view source_name) const;
 
   private:
     GgufFile file_;

@@ -445,4 +445,51 @@ void mach_head_matvec(
     }
 }
 
+void bf16_matvec(
+    const Bf16Matrix &matrix,
+    std::span<const float> input,
+    std::span<float> output) {
+    if (input.size() != matrix.columns || output.size() != matrix.rows ||
+        matrix.values.size() !=
+            static_cast<std::size_t>(matrix.rows) * matrix.columns) {
+        throw std::invalid_argument("BF16 matrix-vector shape mismatch");
+    }
+    for (std::uint32_t row = 0; row < matrix.rows; ++row) {
+        float sum = 0.0F;
+        const auto offset = static_cast<std::size_t>(row) * matrix.columns;
+        for (std::uint32_t column = 0; column < matrix.columns; ++column) {
+            sum += bf16_to_f32(matrix.values[offset + column]) * input[column];
+        }
+        output[row] = sum;
+    }
+}
+
+void rms_norm(
+    std::span<const float> input,
+    std::span<const std::uint16_t> weight_bf16,
+    float epsilon,
+    std::span<float> output) {
+    if (input.size() != weight_bf16.size() || output.size() != input.size() ||
+        input.empty()) {
+        throw std::invalid_argument("RMS norm shape mismatch");
+    }
+    float squares = 0.0F;
+    for (const auto value : input) {
+        squares += value * value;
+    }
+    const float scale =
+        1.0F / std::sqrt(squares / static_cast<float>(input.size()) + epsilon);
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        output[index] = input[index] * scale * bf16_to_f32(weight_bf16[index]);
+    }
+}
+
+float silu(float value) noexcept {
+    return value / (1.0F + std::exp(-value));
+}
+
+float sigmoid(float value) noexcept {
+    return 1.0F / (1.0F + std::exp(-value));
+}
+
 } // namespace adi
