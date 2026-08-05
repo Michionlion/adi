@@ -9,6 +9,7 @@ option(ADI_BUILD_TESTS "Build ADI tests" ON)
 
 add_library(adi_runtime STATIC
     src/executor.cpp
+    src/generation.cpp
     src/gguf.cpp
     src/kernels.cpp
     src/model.cpp
@@ -42,6 +43,10 @@ if(ADI_BUILD_TESTS)
     add_executable(adi_executor_test tests/executor_test.cpp)
     target_link_libraries(adi_executor_test PRIVATE adi_runtime)
     add_test(NAME executor COMMAND adi_executor_test)
+
+    add_executable(adi_generation_test tests/generation_test.cpp)
+    target_link_libraries(adi_generation_test PRIVATE adi_runtime)
+    add_test(NAME generation COMMAND adi_generation_test)
 
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)

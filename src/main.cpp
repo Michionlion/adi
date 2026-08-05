@@ -1,5 +1,6 @@
 #include "adi/adi.hpp"
 #include "adi/executor.hpp"
+#include "adi/generation.hpp"
 #include "adi/gguf.hpp"
 #include "adi/model.hpp"
 #include "adi/tokenizer.hpp"
@@ -351,6 +352,23 @@ int tokenize(const char *path, std::string_view text) {
     return 0;
 }
 
+int generate_text(int argc, char **argv) {
+    const adi::MachModel model(argv[2]);
+    adi::Tokenizer tokenizer(model);
+    adi::GenerationOptions options;
+    options.max_output_tokens = argc == 5 ? parse_u32(argv[4], "max tokens") : 16;
+    options.temperature = 0.0F;
+    const auto start = std::chrono::steady_clock::now();
+    const auto result = adi::generate(model, tokenizer, argv[3], options);
+    const auto elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    std::cout << result.text << '\n'
+              << "input_tokens: " << result.input_tokens << '\n'
+              << "output_tokens: " << result.output_tokens << '\n'
+              << "seconds: " << elapsed << '\n';
+    return 0;
+}
+
 void usage() {
     std::cerr << "usage:\n"
               << "  adi --version\n"
@@ -364,6 +382,7 @@ void usage() {
               << "  adi bench-linear MODEL.gguf LAYER [TOKENS]\n"
               << "  adi decode-token MODEL.gguf TOKEN\n"
               << "  adi tokenize MODEL.gguf TEXT\n"
+              << "  adi generate MODEL.gguf PROMPT [MAX_TOKENS]\n"
               << "  adi embedding-row MODEL.gguf TOKEN\n";
 }
 
@@ -458,6 +477,14 @@ int main(int argc, char **argv) {
     if (argc == 4 && std::string_view(argv[1]) == "tokenize") {
         try {
             return tokenize(argv[2], argv[3]);
+        } catch (const std::exception &error) {
+            std::cerr << "adi: " << error.what() << '\n';
+            return 1;
+        }
+    }
+    if ((argc == 4 || argc == 5) && std::string_view(argv[1]) == "generate") {
+        try {
+            return generate_text(argc, argv);
         } catch (const std::exception &error) {
             std::cerr << "adi: " << error.what() << '\n';
             return 1;
