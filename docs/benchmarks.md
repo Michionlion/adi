@@ -18,7 +18,25 @@ The complete decoder reached 0.242 tokens/s, up from the initial scalar
 0.0322 tokens/s baseline. These numbers are correctness-oriented starting
 points, not tuned ceilings. The implementation uses simple row/tile
 parallelism across eight cores; it does not yet use architecture-specific SIMD,
-persistent worker threads, batched prompt evaluation, or NUMA tuning.
+batched prompt evaluation, or NUMA tuning.
+
+## Initial batch kernels
+
+The first batching increment keeps single-vector kernels unchanged and decodes
+packed weights once across several independent input vectors. On the same
+machine, the per-vector costs were:
+
+| Batch | Non-expert 512 x 2048 | Output head 31,040 x 2048 |
+| ---: | ---: | ---: |
+| 1 | 2.31 ms | 17.48 ms |
+| 2 | 1.08 ms | 14.94 ms |
+| 4 | 0.59 ms | 7.19 ms |
+| 8 | 0.37 ms | 4.53 ms |
+
+`decode_batch` currently uses the batched output head and preserves logits
+bit-for-bit relative to independent `decode_token` calls. A layer-major
+executor is still needed to route attention and shared-expert projections
+through the non-expert batch kernel.
 
 Reproduce the component suite:
 

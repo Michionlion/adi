@@ -72,6 +72,15 @@ void mach_ne_matvec(
     std::span<float> output,
     ExpertScratch &scratch);
 
+// Inputs and outputs are contiguous batch-major matrices with shapes
+// [batch, matrix.columns] and [batch, matrix.rows].
+void mach_ne_matmul(
+    const MachNeMatrix &matrix,
+    std::span<const float> inputs,
+    std::uint32_t batch,
+    std::span<float> outputs,
+    ExpertScratch &scratch);
+
 void mach_embedding_row(
     const MachEmbedding &embedding,
     std::uint32_t token,
@@ -81,6 +90,14 @@ void mach_head_matvec(
     const MachHeadChunk &head,
     std::span<const float> input,
     std::span<float> output);
+
+// Inputs and outputs are contiguous batch-major matrices with shapes
+// [batch, head.columns] and [batch, head.rows].
+void mach_head_matmul(
+    const MachHeadChunk &head,
+    std::span<const float> inputs,
+    std::uint32_t batch,
+    std::span<float> outputs);
 
 void bf16_matvec(
     const Bf16Matrix &matrix,

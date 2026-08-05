@@ -159,20 +159,44 @@ int bench_ne(int argc, char **argv) {
     const adi::MachModel model(argv[2]);
     const auto layer = parse_u32(argv[3], "layer");
     const auto matrix = model.non_expert(layer, argv[4]);
-    const auto iterations = argc == 6 ? parse_u32(argv[5], "iterations") : 3;
-    if (iterations == 0) {
-        throw std::invalid_argument("iterations must be positive");
+    const auto iterations = argc >= 6 ? parse_u32(argv[5], "iterations") : 3;
+    const auto batch = argc == 7 ? parse_u32(argv[6], "batch") : 1;
+    if (iterations == 0 || batch == 0) {
+        throw std::invalid_argument("iterations and batch must be positive");
     }
-    std::vector<float> input(matrix.columns);
-    for (std::size_t index = 0; index < input.size(); ++index) {
-        input[index] = std::sin(static_cast<float>(index) * 0.01F);
+    std::vector<float> inputs(
+        static_cast<std::size_t>(batch) * matrix.columns);
+    for (std::uint32_t batch_index = 0; batch_index < batch; ++batch_index) {
+        for (std::uint32_t column = 0; column < matrix.columns; ++column) {
+            inputs[
+                static_cast<std::size_t>(batch_index) * matrix.columns +
+                column] =
+                std::sin(
+                    static_cast<float>(column + batch_index) * 0.01F);
+        }
     }
-    std::vector<float> output(matrix.rows);
+    std::vector<float> outputs(
+        static_cast<std::size_t>(batch) * matrix.rows);
     adi::ExpertScratch scratch;
-    std::cout << "matrix: " << matrix.rows << "x" << matrix.columns << '\n';
-    print_benchmark(iterations, output, [&] {
-        adi::mach_ne_matvec(matrix, input, output, scratch);
-    });
+    adi::mach_ne_matmul(matrix, inputs, batch, outputs, scratch);
+    const auto start = std::chrono::steady_clock::now();
+    for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
+        adi::mach_ne_matmul(matrix, inputs, batch, outputs, scratch);
+    }
+    const auto elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    double checksum = 0.0;
+    for (const auto value : outputs) {
+        checksum += value;
+    }
+    std::cout << "matrix: " << matrix.rows << "x" << matrix.columns << '\n'
+              << "batch: " << batch << '\n'
+              << "iterations: " << iterations << '\n'
+              << "milliseconds/batch: "
+              << elapsed * 1000.0 / iterations << '\n'
+              << "milliseconds/vector: "
+              << elapsed * 1000.0 / iterations / batch << '\n'
+              << "checksum: " << checksum << '\n';
     return 0;
 }
 
@@ -180,19 +204,43 @@ int bench_head(int argc, char **argv) {
     const adi::MachModel model(argv[2]);
     const auto chunk_index = parse_u32(argv[3], "chunk");
     const auto head = model.head_chunk(chunk_index);
-    const auto iterations = argc == 5 ? parse_u32(argv[4], "iterations") : 1;
-    if (iterations == 0) {
-        throw std::invalid_argument("iterations must be positive");
+    const auto iterations = argc >= 5 ? parse_u32(argv[4], "iterations") : 1;
+    const auto batch = argc == 6 ? parse_u32(argv[5], "batch") : 1;
+    if (iterations == 0 || batch == 0) {
+        throw std::invalid_argument("iterations and batch must be positive");
     }
-    std::vector<float> input(head.columns);
-    for (std::size_t index = 0; index < input.size(); ++index) {
-        input[index] = std::sin(static_cast<float>(index) * 0.01F);
+    std::vector<float> inputs(
+        static_cast<std::size_t>(batch) * head.columns);
+    for (std::uint32_t batch_index = 0; batch_index < batch; ++batch_index) {
+        for (std::uint32_t column = 0; column < head.columns; ++column) {
+            inputs[
+                static_cast<std::size_t>(batch_index) * head.columns +
+                column] =
+                std::sin(
+                    static_cast<float>(column + batch_index) * 0.01F);
+        }
     }
-    std::vector<float> output(head.rows);
-    std::cout << "matrix: " << head.rows << "x" << head.columns << '\n';
-    print_benchmark(iterations, output, [&] {
-        adi::mach_head_matvec(head, input, output);
-    });
+    std::vector<float> outputs(
+        static_cast<std::size_t>(batch) * head.rows);
+    adi::mach_head_matmul(head, inputs, batch, outputs);
+    const auto start = std::chrono::steady_clock::now();
+    for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
+        adi::mach_head_matmul(head, inputs, batch, outputs);
+    }
+    const auto elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    double checksum = 0.0;
+    for (const auto value : outputs) {
+        checksum += value;
+    }
+    std::cout << "matrix: " << head.rows << "x" << head.columns << '\n'
+              << "batch: " << batch << '\n'
+              << "iterations: " << iterations << '\n'
+              << "milliseconds/batch: "
+              << elapsed * 1000.0 / iterations << '\n'
+              << "milliseconds/vector: "
+              << elapsed * 1000.0 / iterations / batch << '\n'
+              << "checksum: " << checksum << '\n';
     return 0;
 }
 
@@ -341,6 +389,39 @@ int decode_one(const char *path, std::string_view token_string) {
     return 0;
 }
 
+int decode_batch(
+    const char *path,
+    std::string_view token_string,
+    std::string_view batch_string) {
+    const adi::MachModel model(path);
+    const auto token = parse_u32(token_string, "token");
+    const auto batch = parse_u32(batch_string, "batch");
+    if (batch == 0) {
+        throw std::invalid_argument("batch must be positive");
+    }
+    std::vector<std::uint32_t> tokens(batch, token);
+    std::vector<adi::DecoderState> states(batch);
+    std::vector<adi::DecoderScratch> scratches(batch);
+    std::vector<float> logits(
+        static_cast<std::size_t>(batch) * model.config().vocabulary);
+    adi::DecoderBatchScratch batch_scratch;
+    const auto start = std::chrono::steady_clock::now();
+    adi::decode_batch(
+        model,
+        tokens,
+        states,
+        logits,
+        scratches,
+        batch_scratch);
+    const auto elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    std::cout << "batch: " << batch << '\n'
+              << "seconds: " << elapsed << '\n'
+              << "sequences/second: "
+              << static_cast<double>(batch) / elapsed << '\n';
+    return 0;
+}
+
 int tokenize(const char *path, std::string_view text) {
     const adi::MachModel model(path);
     adi::Tokenizer tokenizer(model);
@@ -400,12 +481,13 @@ void usage() {
               << "  adi inspect MODEL.gguf\n"
               << "  adi validate MODEL.gguf\n"
               << "  adi bench-expert MODEL.gguf LAYER EXPERT PROJECTION [ITERATIONS]\n"
-              << "  adi bench-ne MODEL.gguf LAYER SOURCE_NAME [ITERATIONS]\n"
-              << "  adi bench-head MODEL.gguf CHUNK [ITERATIONS]\n"
+              << "  adi bench-ne MODEL.gguf LAYER SOURCE_NAME [ITERATIONS] [BATCH]\n"
+              << "  adi bench-head MODEL.gguf CHUNK [ITERATIONS] [BATCH]\n"
               << "  adi bench-moe MODEL.gguf LAYER [ITERATIONS]\n"
               << "  adi bench-attention MODEL.gguf LAYER [TOKENS]\n"
               << "  adi bench-linear MODEL.gguf LAYER [TOKENS]\n"
               << "  adi decode-token MODEL.gguf TOKEN\n"
+              << "  adi decode-batch MODEL.gguf TOKEN BATCH\n"
               << "  adi tokenize MODEL.gguf TEXT\n"
               << "  adi generate MODEL.gguf PROMPT [MAX_TOKENS]\n"
               << "  adi serve --model MODEL.gguf [--host ADDRESS] [--port PORT]\n"
@@ -443,7 +525,8 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    if ((argc == 5 || argc == 6) && std::string_view(argv[1]) == "bench-ne") {
+    if ((argc == 5 || argc == 6 || argc == 7) &&
+        std::string_view(argv[1]) == "bench-ne") {
         try {
             return bench_ne(argc, argv);
         } catch (const std::exception &error) {
@@ -451,7 +534,8 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    if ((argc == 4 || argc == 5) && std::string_view(argv[1]) == "bench-head") {
+    if ((argc == 4 || argc == 5 || argc == 6) &&
+        std::string_view(argv[1]) == "bench-head") {
         try {
             return bench_head(argc, argv);
         } catch (const std::exception &error) {
@@ -495,6 +579,14 @@ int main(int argc, char **argv) {
     if (argc == 4 && std::string_view(argv[1]) == "decode-token") {
         try {
             return decode_one(argv[2], argv[3]);
+        } catch (const std::exception &error) {
+            std::cerr << "adi: " << error.what() << '\n';
+            return 1;
+        }
+    }
+    if (argc == 5 && std::string_view(argv[1]) == "decode-batch") {
+        try {
+            return decode_batch(argv[2], argv[3], argv[4]);
         } catch (const std::exception &error) {
             std::cerr << "adi: " << error.what() << '\n';
             return 1;

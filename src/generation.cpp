@@ -117,11 +117,18 @@ GenerationResult generate_from_prompt(
     DecoderState state;
     DecoderScratch scratch;
     std::vector<float> logits(model.config().vocabulary);
-    for (const auto token : prompt_tokens) {
+    for (std::size_t index = 0; index < prompt_tokens.size(); ++index) {
         if (cancelled && cancelled()) {
             throw std::runtime_error("generation cancelled");
         }
-        decode_token(model, token, state, logits, scratch);
+        decode_token(
+            model,
+            prompt_tokens[index],
+            state,
+            index + 1 == prompt_tokens.size()
+                ? std::span<float>(logits)
+                : std::span<float>{},
+            scratch);
     }
     std::mt19937_64 random(options.seed);
     std::vector<std::uint32_t> output_tokens;

@@ -25,8 +25,8 @@ cmake --build build -j
 ctest --test-dir build
 ```
 
-To include tokenizer goldens and the deterministic one-token end-to-end
-checkpoint test:
+To include tokenizer goldens plus deterministic end-to-end and batch-equivalence
+checkpoint tests:
 
 ```bash
 cmake -S . -B build \
@@ -47,6 +47,14 @@ Package it without decoding or requantizing any weights:
 python3 tools/pack_mach.py /path/to/Mach-1-Additive-35B \
   --output models/Mach-1-Additive-35B.gguf
 ./build/adi inspect models/Mach-1-Additive-35B.gguf
+```
+
+The CPU benchmark command also accepts a batch size for packed non-expert and
+output-head projections:
+
+```bash
+build/adi bench-ne MODEL.gguf 0 TENSOR_NAME 10 4
+build/adi bench-head MODEL.gguf 0 10 4
 ```
 
 Start the Responses API:

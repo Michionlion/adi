@@ -78,6 +78,11 @@ struct DecoderScratch {
     MoeScratch moe;
 };
 
+struct DecoderBatchScratch {
+    std::vector<float> head_inputs;
+    std::vector<float> head_outputs;
+};
+
 [[nodiscard]] std::array<ExpertRoute, 8> top_experts(
     std::span<const float> logits);
 
@@ -117,8 +122,20 @@ void decode_token(
     const MachModel &model,
     std::uint32_t token,
     DecoderState &state,
+    // An empty span advances the model state without computing unused logits.
     std::span<float> logits,
     DecoderScratch &scratch,
+    const Backend &backend = cpu_backend());
+
+// Decodes one token for each independent sequence. Logits are batch-major
+// [tokens.size(), model.config().vocabulary].
+void decode_batch(
+    const MachModel &model,
+    std::span<const std::uint32_t> tokens,
+    std::span<DecoderState> states,
+    std::span<float> logits,
+    std::span<DecoderScratch> scratches,
+    DecoderBatchScratch &batch_scratch,
     const Backend &backend = cpu_backend());
 
 } // namespace adi

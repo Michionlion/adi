@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <exception>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -485,16 +486,17 @@ void linear_attention_forward(
         scratch.codec);
 }
 
-void decode_token(
+namespace {
+
+void decode_hidden(
     const MachModel &model,
     std::uint32_t token,
     DecoderState &state,
-    std::span<float> logits,
     DecoderScratch &scratch,
     const Backend &backend) {
     const auto &config = model.config();
-    if (token >= config.vocabulary || logits.size() != config.vocabulary) {
-        throw std::invalid_argument("decoder token or logits shape mismatch");
+    if (token >= config.vocabulary) {
+        throw std::invalid_argument("decoder token is out of range");
     }
     scratch.hidden.resize(config.hidden);
     scratch.normalized.resize(config.hidden);
@@ -556,6 +558,26 @@ void decode_token(
         1.0F,
         1.0e-6F,
         scratch.normalized);
+    ++state.position;
+}
+
+} // namespace
+
+void decode_token(
+    const MachModel &model,
+    std::uint32_t token,
+    DecoderState &state,
+    std::span<float> logits,
+    DecoderScratch &scratch,
+    const Backend &backend) {
+    const auto &config = model.config();
+    if (!logits.empty() && logits.size() != config.vocabulary) {
+        throw std::invalid_argument("decoder logits shape mismatch");
+    }
+    decode_hidden(model, token, state, scratch, backend);
+    if (logits.empty()) {
+        return;
+    }
     for (std::uint32_t chunk = 0; chunk < 8; ++chunk) {
         const auto head = model.head_chunk(chunk);
         backend.head_matvec(
@@ -563,7 +585,62 @@ void decode_token(
             scratch.normalized,
             logits.subspan(static_cast<std::size_t>(chunk) * head.rows, head.rows));
     }
-    ++state.position;
+}
+
+void decode_batch(
+    const MachModel &model,
+    std::span<const std::uint32_t> tokens,
+    std::span<DecoderState> states,
+    std::span<float> logits,
+    std::span<DecoderScratch> scratches,
+    DecoderBatchScratch &batch_scratch,
+    const Backend &backend) {
+    const auto &config = model.config();
+    const auto batch = tokens.size();
+    if (batch == 0 || batch > std::numeric_limits<std::uint32_t>::max() ||
+        states.size() != batch || scratches.size() != batch ||
+        logits.size() != batch * config.vocabulary) {
+        throw std::invalid_argument("decoder batch shape mismatch");
+    }
+    if (std::any_of(tokens.begin(), tokens.end(), [&](std::uint32_t token) {
+            return token >= config.vocabulary;
+        })) {
+        throw std::invalid_argument("decoder batch token is out of range");
+    }
+
+    batch_scratch.head_inputs.resize(batch * config.hidden);
+    for (std::size_t batch_index = 0; batch_index < batch; ++batch_index) {
+        decode_hidden(
+            model,
+            tokens[batch_index],
+            states[batch_index],
+            scratches[batch_index],
+            backend);
+        std::copy(
+            scratches[batch_index].normalized.begin(),
+            scratches[batch_index].normalized.end(),
+            batch_scratch.head_inputs.begin() + batch_index * config.hidden);
+    }
+
+    for (std::uint32_t chunk = 0; chunk < 8; ++chunk) {
+        const auto head = model.head_chunk(chunk);
+        batch_scratch.head_outputs.resize(batch * head.rows);
+        backend.head_matmul(
+            head,
+            batch_scratch.head_inputs,
+            static_cast<std::uint32_t>(batch),
+            batch_scratch.head_outputs);
+        for (std::size_t batch_index = 0; batch_index < batch; ++batch_index) {
+            const auto source = std::span<const float>(
+                batch_scratch.head_outputs)
+                                    .subspan(batch_index * head.rows, head.rows);
+            auto destination = logits.subspan(
+                batch_index * config.vocabulary +
+                    static_cast<std::size_t>(chunk) * head.rows,
+                head.rows);
+            std::copy(source.begin(), source.end(), destination.begin());
+        }
+    }
 }
 
 } // namespace adi

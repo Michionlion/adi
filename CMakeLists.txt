@@ -68,9 +68,12 @@ if(ADI_BUILD_TESTS)
     target_link_libraries(adi_tokenizer_test PRIVATE adi_runtime)
     add_executable(adi_model_e2e_test tests/model_e2e_test.cpp)
     target_link_libraries(adi_model_e2e_test PRIVATE adi_runtime)
+    add_executable(adi_model_batch_test tests/model_batch_test.cpp)
+    target_link_libraries(adi_model_batch_test PRIVATE adi_runtime)
     if(ADI_TEST_MODEL)
         add_test(NAME tokenizer COMMAND adi_tokenizer_test ${ADI_TEST_MODEL})
         add_test(NAME model_e2e COMMAND adi_model_e2e_test ${ADI_TEST_MODEL})
+        add_test(NAME model_batch COMMAND adi_model_batch_test ${ADI_TEST_MODEL})
     endif()
 
     foreach(test_target
@@ -82,7 +85,8 @@ if(ADI_BUILD_TESTS)
             adi_json_test
             adi_unicode_test
             adi_tokenizer_test
-            adi_model_e2e_test)
+            adi_model_e2e_test
+            adi_model_batch_test)
         target_compile_options(${test_target} PRIVATE -UNDEBUG)
     endforeach()
 

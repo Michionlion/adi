@@ -34,6 +34,9 @@ echo
 "$binary" bench-ne "$model_path" 0 \
     model.language_model.layers.0.mlp.shared_expert.gate_proj.weight 10
 echo
+"$binary" bench-ne "$model_path" 0 \
+    model.language_model.layers.0.mlp.shared_expert.gate_proj.weight 10 4
+echo
 "$binary" bench-moe "$model_path" 0 5
 echo
 "$binary" bench-attention "$model_path" 3 5
@@ -41,6 +44,8 @@ echo
 "$binary" bench-linear "$model_path" 0 5
 echo
 "$binary" bench-head "$model_path" 0 5
+echo
+"$binary" bench-head "$model_path" 0 5 4
 
 if [[ "$full" == "--full" ]]; then
     echo

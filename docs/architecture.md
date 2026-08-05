@@ -37,9 +37,12 @@ Unknown architecture, codec version, shape, or required tensor is a load error.
 - `Scratch` owns request-local temporary buffers.
 - The backend operation table contains stateless kernel entry points.
 
-Model data is immutable after load. A server process currently owns one model
-and serializes inference. Request parsing may be concurrent later, but batching
-is outside the first implementation.
+Model data is immutable after load. The executor can advance a batch of
+independent decoder states and coalesces their output projections. The packed
+head and non-expert kernels decode each weight once for all vectors in a batch.
+A server process still owns one model and serializes requests; continuous
+request scheduling and layer-major use of every batch kernel are the next
+runtime step.
 
 ## Backend seam
 
@@ -55,5 +58,6 @@ views and produce the same results; it must not fork model execution.
 - No training, conversion during load, or runtime quantization.
 - No chat-completions, completions, embeddings, reranking, or admin API.
 - No multimodal path.
-- No speculative decoding, batching, disk KV cache, or distributed execution.
+- No speculative decoding, continuous request batching, disk KV cache, or
+  distributed execution.
 - No graph compiler or general tensor library.
