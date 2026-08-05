@@ -6,5 +6,6 @@
 *.fatbin
 __pycache__/
 /build/
+/build-*/
 /models/
 *.gguf

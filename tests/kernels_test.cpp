@@ -39,7 +39,7 @@ int main() {
         assert(std::abs(output[index]) < 1e-5F);
     }
 
-    for (float value : {0.0F, -0.0F, 1.0F, -2.0F, 0.33325F, 65504.0F}) {
+    for (float value : {0.0F, -0.0F, 1.0F, -2.0F, 0.333251953125F, 65504.0F}) {
         const auto round_trip = adi::f16_to_f32(adi::f32_to_f16(value));
         assert(round_trip == value);
     }

@@ -48,6 +48,10 @@ Start the Responses API:
 
 See [`docs/api.md`](docs/api.md) for the request shape and a curl example.
 
+The current CPU measurements and reproduction command are in
+[`docs/benchmarks.md`](docs/benchmarks.md). Implementation references are
+recorded in [`docs/references.md`](docs/references.md).
+
 ## Repository layout
 
 - `include/adi/`: public runtime API.
