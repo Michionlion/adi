@@ -15,6 +15,10 @@ struct ResponseIdentity {
     std::time_t created_at;
 };
 
+[[nodiscard]] std::string error_event_json(
+    std::string_view message,
+    std::uint32_t sequence_number);
+
 [[nodiscard]] std::string response_json(
     std::string_view model_name,
     const GenerationResult &result,

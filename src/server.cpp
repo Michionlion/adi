@@ -328,6 +328,14 @@ float float_option(
 
 namespace server_detail {
 
+std::string error_event_json(
+    std::string_view message,
+    std::uint32_t sequence_number) {
+    return "{\"type\":\"error\",\"sequence_number\":" +
+           std::to_string(sequence_number) +
+           ",\"message\":" + json_string(message) + "}";
+}
+
 std::string response_json(
     std::string_view model_name,
     const GenerationResult &result,
@@ -346,15 +354,20 @@ std::string response_json(
            ",\"error\":null,\"incomplete_details\":" +
            std::string(incomplete_details) +
            ",\"model\":" + json_string(model_name) +
-           ",\"output\":[{\"id\":" + json_string(identity.message_id) +
+           ",\"parallel_tool_calls\":false,\"tool_choice\":\"none\""
+           ",\"tools\":[],\"output\":[{\"id\":" +
+           json_string(identity.message_id) +
            ",\"type\":\"message\",\"status\":" + json_string(item_status) +
            ",\"role\":\"assistant\""
            ",\"content\":[{\"type\":\"output_text\",\"text\":" +
            json_string(result.text) +
            ",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":" +
            std::to_string(result.input_tokens) +
-           ",\"output_tokens\":" + std::to_string(result.output_tokens) +
-           ",\"total_tokens\":" +
+           ",\"input_tokens_details\":{\"cache_write_tokens\":0,"
+           "\"cached_tokens\":0},\"output_tokens\":" +
+           std::to_string(result.output_tokens) +
+           ",\"output_tokens_details\":{\"reasoning_tokens\":0},"
+           "\"total_tokens\":" +
            std::to_string(result.input_tokens + result.output_tokens) + "}}";
 }
 
@@ -458,16 +471,19 @@ void stream_responses(
         "Cache-Control: no-cache\r\n"
         "Connection: close\r\n\r\n";
     send_all(connection, headers);
+    std::uint32_t sequence = 0;
     try {
         const auto identity = make_identity();
         const std::string model_name(request_model(request, model));
-        std::uint32_t sequence = 0;
         const auto response_stub =
             "{\"id\":" + json_string(identity.id) +
             ",\"object\":\"response\",\"created_at\":" +
             std::to_string(identity.created_at) +
-            ",\"status\":\"in_progress\",\"model\":" +
-            json_string(model_name) + ",\"output\":[]}";
+            ",\"status\":\"in_progress\",\"error\":null,"
+            "\"incomplete_details\":null,\"model\":" +
+            json_string(model_name) +
+            ",\"parallel_tool_calls\":false,\"tool_choice\":\"none\","
+            "\"tools\":[],\"output\":[]}";
         send_event(
             connection,
             "response.created",
@@ -605,9 +621,7 @@ void stream_responses(
             send_event(
                 connection,
                 "error",
-                "{\"type\":\"error\",\"error\":{\"message\":" +
-                    json_string(error.what()) +
-                    ",\"type\":\"invalid_request_error\"}}");
+                server_detail::error_event_json(error.what(), sequence++));
         } catch (const SocketFailure &) {
         }
     }

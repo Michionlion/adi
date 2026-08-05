@@ -30,6 +30,29 @@ int main() {
              ->string() == "max_output_tokens");
     assert(limited_json.find("\"reason\":\"max_tokens\"") ==
            std::string::npos);
+    assert(*limited_response.find("parallel_tool_calls")->boolean() == false);
+    assert(*limited_response.find("tool_choice")->string() == "none");
+    assert(limited_response.find("tools")->array()->empty());
+    const auto *usage = limited_response.find("usage");
+    assert(
+        *usage->find("input_tokens_details")
+             ->find("cache_write_tokens")
+             ->number() == 0.0);
+    assert(
+        *usage->find("input_tokens_details")
+             ->find("cached_tokens")
+             ->number() == 0.0);
+    assert(
+        *usage->find("output_tokens_details")
+             ->find("reasoning_tokens")
+             ->number() == 0.0);
+
+    const auto error_event = adi::parse_json(
+        adi::server_detail::error_event_json("bad request", 7));
+    assert(*error_event.find("type")->string() == "error");
+    assert(*error_event.find("sequence_number")->number() == 7.0);
+    assert(*error_event.find("message")->string() == "bad request");
+    assert(error_event.find("error") == nullptr);
 
     auto completed = limited;
     completed.finish_reason = adi::FinishReason::stop_token;
