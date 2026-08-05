@@ -9,6 +9,8 @@ option(ADI_BUILD_TESTS "Build ADI tests" ON)
 
 add_library(adi_runtime STATIC
     src/gguf.cpp
+    src/kernels.cpp
+    src/model.cpp
     src/version.cpp
 )
 target_include_directories(adi_runtime PUBLIC include)
@@ -30,6 +32,10 @@ if(ADI_BUILD_TESTS)
     add_executable(adi_gguf_test tests/gguf_test.cpp)
     target_link_libraries(adi_gguf_test PRIVATE adi_runtime)
     add_test(NAME gguf COMMAND adi_gguf_test)
+
+    add_executable(adi_kernels_test tests/kernels_test.cpp)
+    target_link_libraries(adi_kernels_test PRIVATE adi_runtime)
+    add_test(NAME kernels COMMAND adi_kernels_test)
 
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
