@@ -31,7 +31,7 @@ std::filesystem::path write_fixture(bool truncate = false) {
     append(bytes, std::uint32_t{0x46554747});
     append(bytes, std::uint32_t{3});
     append(bytes, std::uint64_t{1});
-    append(bytes, std::uint64_t{3});
+    append(bytes, std::uint64_t{5});
 
     append_string(bytes, "general.alignment");
     append(bytes, std::uint32_t{4});
@@ -42,6 +42,18 @@ std::filesystem::path write_fixture(bool truncate = false) {
     append_string(bytes, "adi.additive");
     append(bytes, std::uint32_t{7});
     append(bytes, std::uint8_t{1});
+    append_string(bytes, "tokenizer.ggml.tokens");
+    append(bytes, std::uint32_t{9});
+    append(bytes, std::uint32_t{8});
+    append(bytes, std::uint64_t{2});
+    append_string(bytes, "hello");
+    append_string(bytes, "world");
+    append_string(bytes, "tokenizer.ggml.token_type");
+    append(bytes, std::uint32_t{9});
+    append(bytes, std::uint32_t{4});
+    append(bytes, std::uint64_t{2});
+    append(bytes, std::uint32_t{1});
+    append(bytes, std::uint32_t{3});
 
     append_string(bytes, "test.weight");
     append(bytes, std::uint32_t{2});
@@ -77,11 +89,15 @@ int main() {
         const adi::GgufFile file(path);
         assert(file.version() == 3);
         assert(file.alignment() == 32);
-        assert(file.metadata().size() == 3);
+        assert(file.metadata().size() == 5);
         assert(file.tensors().size() == 1);
         assert(file.integer("general.alignment") == 32);
         assert(file.string("general.architecture") == "adi");
         assert(file.boolean("adi.additive") == true);
+        assert((file.string_array("tokenizer.ggml.tokens") ==
+                std::vector<std::string_view>{"hello", "world"}));
+        assert((file.integer_array("tokenizer.ggml.token_type") ==
+                std::vector<std::uint64_t>{1, 3}));
 
         const auto *tensor = file.find_tensor("test.weight");
         assert(tensor != nullptr);

@@ -63,6 +63,17 @@ def metadata_value(value: object) -> tuple[int, bytes]:
         return 10, struct.pack("<Q", value)
     if isinstance(value, float):
         return 6, struct.pack("<f", value)
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        encoded = bytearray(struct.pack("<IQ", 8, len(value)))
+        for item in value:
+            encoded.extend(gguf_string(item))
+        return 9, bytes(encoded)
+    if isinstance(value, list) and all(
+            isinstance(item, int) and 0 <= item <= 0xFFFFFFFF for item in value):
+        encoded = bytearray(struct.pack("<IQ", 4, len(value)))
+        for item in value:
+            encoded.extend(struct.pack("<I", item))
+        return 9, bytes(encoded)
     raise TypeError(f"unsupported metadata value: {value!r}")
 
 
@@ -138,7 +149,21 @@ def checkpoint_metadata(root: Path) -> dict[str, object]:
     rope = text["rope_parameters"]
     codec = json.loads((root / "packed/experts/codec.json").read_text())
     cb = codec["cb_params"]
-    return {
+    tokenizer = json.loads((root / "tokenizer.json").read_text())
+    vocabulary_size = int(text["vocab_size"])
+    tokens = [""] * vocabulary_size
+    token_types = [5] * vocabulary_size
+    for token, token_id in tokenizer["model"]["vocab"].items():
+        tokens[int(token_id)] = token
+        token_types[int(token_id)] = 1
+    for added in tokenizer["added_tokens"]:
+        token_id = int(added["id"])
+        tokens[token_id] = added["content"]
+        token_types[token_id] = 3 if added.get("special", False) else 4
+    for token_id, token in enumerate(tokens):
+        if not token:
+            tokens[token_id] = f"[PAD{token_id}]"
+    metadata = {
         "general.architecture": "qwen35moe",
         "general.name": "Mach-1-Additive-35B",
         "general.alignment": ALIGNMENT,
@@ -175,7 +200,16 @@ def checkpoint_metadata(root: Path) -> dict[str, object]:
         "qwen35moe.ssm.state_size": int(text["linear_value_head_dim"]),
         "qwen35moe.ssm.time_step_rank": int(text["linear_num_value_heads"]),
         "qwen35moe.ssm.group_count": int(text["linear_num_key_heads"]),
+        "tokenizer.ggml.model": "gpt2",
+        "tokenizer.ggml.pre": "qwen2",
+        "tokenizer.ggml.tokens": tokens,
+        "tokenizer.ggml.token_type": token_types,
+        "tokenizer.ggml.merges": tokenizer["model"]["merges"],
+        "tokenizer.ggml.bos_token_id": int(text["bos_token_id"]),
+        "tokenizer.ggml.eos_token_id": int(text["eos_token_id"]),
+        "tokenizer.chat_template": (root / "chat_template.jinja").read_text(),
     }
+    return metadata
 
 
 def assign_offsets(tensors: Iterable[TensorSource]) -> list[TensorSource]:

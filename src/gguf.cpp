@@ -400,6 +400,64 @@ std::optional<std::string_view> GgufFile::string(std::string_view key) const {
     return cursor.read_string();
 }
 
+std::vector<std::string_view> GgufFile::string_array(std::string_view key) const {
+    const auto *entry = find_metadata(key);
+    if (entry == nullptr || entry->type != GgufValueType::array) {
+        return {};
+    }
+    Cursor cursor(mapping_, file_size_);
+    cursor.skip(entry->value_offset);
+    if (read_value_type(cursor) != GgufValueType::string) {
+        return {};
+    }
+    const auto count = cursor.read<std::uint64_t>();
+    if (count > cursor.remaining() || count > std::numeric_limits<std::size_t>::max()) {
+        fail("metadata string array count is invalid");
+    }
+    std::vector<std::string_view> values;
+    values.reserve(static_cast<std::size_t>(count));
+    for (std::uint64_t index = 0; index < count; ++index) {
+        values.push_back(cursor.read_string());
+    }
+    return values;
+}
+
+std::vector<std::uint64_t> GgufFile::integer_array(std::string_view key) const {
+    const auto *entry = find_metadata(key);
+    if (entry == nullptr || entry->type != GgufValueType::array) {
+        return {};
+    }
+    Cursor cursor(mapping_, file_size_);
+    cursor.skip(entry->value_offset);
+    const auto type = read_value_type(cursor);
+    const auto count = cursor.read<std::uint64_t>();
+    if (scalar_size(type) == 0 || count > cursor.remaining() ||
+        count > std::numeric_limits<std::size_t>::max()) {
+        return {};
+    }
+    std::vector<std::uint64_t> values;
+    values.reserve(static_cast<std::size_t>(count));
+    for (std::uint64_t index = 0; index < count; ++index) {
+        switch (type) {
+        case GgufValueType::u8:
+            values.push_back(cursor.read<std::uint8_t>());
+            break;
+        case GgufValueType::u16:
+            values.push_back(cursor.read<std::uint16_t>());
+            break;
+        case GgufValueType::u32:
+            values.push_back(cursor.read<std::uint32_t>());
+            break;
+        case GgufValueType::u64:
+            values.push_back(cursor.read<std::uint64_t>());
+            break;
+        default:
+            return {};
+        }
+    }
+    return values;
+}
+
 std::span<const std::byte> GgufFile::tensor_data(const GgufTensor &tensor) const {
     return {at(tensor.offset, tensor.bytes), static_cast<std::size_t>(tensor.bytes)};
 }

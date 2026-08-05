@@ -2,6 +2,7 @@
 #include "adi/executor.hpp"
 #include "adi/gguf.hpp"
 #include "adi/model.hpp"
+#include "adi/tokenizer.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -338,6 +339,18 @@ int decode_one(const char *path, std::string_view token_string) {
     return 0;
 }
 
+int tokenize(const char *path, std::string_view text) {
+    const adi::MachModel model(path);
+    adi::Tokenizer tokenizer(model);
+    const auto tokens = tokenizer.encode(text);
+    std::cout << "tokens:";
+    for (const auto token : tokens) {
+        std::cout << ' ' << token;
+    }
+    std::cout << '\n' << "decoded: " << tokenizer.decode(tokens) << '\n';
+    return 0;
+}
+
 void usage() {
     std::cerr << "usage:\n"
               << "  adi --version\n"
@@ -350,6 +363,7 @@ void usage() {
               << "  adi bench-attention MODEL.gguf LAYER [TOKENS]\n"
               << "  adi bench-linear MODEL.gguf LAYER [TOKENS]\n"
               << "  adi decode-token MODEL.gguf TOKEN\n"
+              << "  adi tokenize MODEL.gguf TEXT\n"
               << "  adi embedding-row MODEL.gguf TOKEN\n";
 }
 
@@ -436,6 +450,14 @@ int main(int argc, char **argv) {
     if (argc == 4 && std::string_view(argv[1]) == "decode-token") {
         try {
             return decode_one(argv[2], argv[3]);
+        } catch (const std::exception &error) {
+            std::cerr << "adi: " << error.what() << '\n';
+            return 1;
+        }
+    }
+    if (argc == 4 && std::string_view(argv[1]) == "tokenize") {
+        try {
+            return tokenize(argv[2], argv[3]);
         } catch (const std::exception &error) {
             std::cerr << "adi: " << error.what() << '\n';
             return 1;

@@ -12,6 +12,7 @@ add_library(adi_runtime STATIC
     src/gguf.cpp
     src/kernels.cpp
     src/model.cpp
+    src/tokenizer.cpp
     src/version.cpp
 )
 target_include_directories(adi_runtime PUBLIC include)

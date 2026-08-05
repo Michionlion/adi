@@ -73,6 +73,8 @@ class GgufFile {
     [[nodiscard]] std::optional<double> number(std::string_view key) const;
     [[nodiscard]] std::optional<bool> boolean(std::string_view key) const;
     [[nodiscard]] std::optional<std::string_view> string(std::string_view key) const;
+    [[nodiscard]] std::vector<std::string_view> string_array(std::string_view key) const;
+    [[nodiscard]] std::vector<std::uint64_t> integer_array(std::string_view key) const;
     [[nodiscard]] std::span<const std::byte> tensor_data(const GgufTensor &tensor) const;
 
   private:
