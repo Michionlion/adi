@@ -39,6 +39,16 @@ DTYPE_BYTES = {
     "BOOL": 1,
 }
 
+SUPPORTED_ADDED_TOKENS = {
+    248070: "<|audio_start|>",
+    248071: "<|audio_end|>",
+    248072: "<tts_pad>",
+    248073: "<tts_text_bos>",
+    248074: "<tts_text_eod>",
+    248075: "<tts_text_bos_single>",
+    248076: "<|audio_pad|>",
+}
+
 
 @dataclass(frozen=True)
 class TensorSource:
@@ -151,6 +161,83 @@ def collect_checkpoint(root: Path) -> list[TensorSource]:
     return tensors
 
 
+
+
+def tokenizer_vocabulary(
+    tokenizer: dict[str, object],
+    tokenizer_config: dict[str, object],
+    vocabulary_size: int,
+) -> tuple[list[str], list[int]]:
+    tokens = [""] * vocabulary_size
+    token_types = [5] * vocabulary_size
+
+    def add_token(token_id: int, content: str, token_type: int) -> None:
+        if token_id < 0 or token_id >= vocabulary_size or not content:
+            raise ValueError("tokenizer token is invalid")
+        if tokens[token_id] and tokens[token_id] != content:
+            raise ValueError(f"tokenizer ID {token_id} has conflicting content")
+        if tokens[token_id] == content and token_types[token_id] not in {1, token_type}:
+            raise ValueError(f"tokenizer ID {token_id} has conflicting type")
+        tokens[token_id] = content
+        token_types[token_id] = token_type
+
+    model = tokenizer.get("model")
+    if not isinstance(model, dict) or not isinstance(model.get("vocab"), dict):
+        raise ValueError("tokenizer vocabulary is missing")
+    for content, raw_token_id in model["vocab"].items():
+        if not isinstance(content, str):
+            raise ValueError("tokenizer vocabulary token is invalid")
+        add_token(int(raw_token_id), content, 1)
+
+    added_tokens = tokenizer.get("added_tokens")
+    if not isinstance(added_tokens, list):
+        raise ValueError("tokenizer added tokens are missing")
+    for added in added_tokens:
+        if not isinstance(added, dict) or not isinstance(added.get("content"), str):
+            raise ValueError("tokenizer added token is invalid")
+        add_token(
+            int(added["id"]),
+            added["content"],
+            3 if added.get("special", False) else 4,
+        )
+
+    decoder = tokenizer_config.get("added_tokens_decoder", {})
+    if not isinstance(decoder, dict):
+        raise ValueError("tokenizer added token decoder is invalid")
+    for raw_token_id, added in decoder.items():
+        if (
+            not isinstance(added, dict)
+            or not isinstance(added.get("content"), str)
+            or not isinstance(added.get("special"), bool)
+            or any(
+                added.get(key) is not False
+                for key in ("single_word", "lstrip", "rstrip", "normalized")
+            )
+        ):
+            raise ValueError("tokenizer added token decoder entry is invalid")
+        add_token(
+            int(raw_token_id),
+            added["content"],
+            3 if added["special"] else 4,
+        )
+
+    for token_id, content in SUPPORTED_ADDED_TOKENS.items():
+        if tokens[token_id] != content or token_types[token_id] != 3:
+            raise ValueError(
+                f"tokenizer ID {token_id} does not match the supported checkpoint"
+            )
+
+    populated = [token_id for token_id, token in enumerate(tokens) if token]
+    if not populated:
+        raise ValueError("tokenizer vocabulary is empty")
+    effective_vocabulary = max(populated) + 1
+    if any(not tokens[token_id] for token_id in range(effective_vocabulary)):
+        raise ValueError("tokenizer vocabulary has a non-tail ID gap")
+    for token_id, token in enumerate(tokens):
+        if not token:
+            tokens[token_id] = f"[PAD{token_id}]"
+    return tokens, token_types
+
 def checkpoint_metadata(root: Path) -> dict[str, object]:
     config = json.loads((root / "config.json").read_text())
     text = config["text_config"]
@@ -169,6 +256,7 @@ def checkpoint_metadata(root: Path) -> dict[str, object]:
     codec = json.loads((root / "packed/experts/codec.json").read_text())
     cb = codec["cb_params"]
     tokenizer = json.loads((root / "tokenizer.json").read_text())
+    tokenizer_config = json.loads((root / "tokenizer_config.json").read_text())
     chat_template = (root / "chat_template.jinja").read_text()
     if (
         hashlib.sha256(chat_template.encode()).hexdigest()
@@ -227,22 +315,9 @@ def checkpoint_metadata(root: Path) -> dict[str, object]:
     ):
         raise ValueError("checkpoint has an unsupported tokenizer pipeline")
     vocabulary_size = int(text["vocab_size"])
-    tokens = [""] * vocabulary_size
-    token_types = [5] * vocabulary_size
-    for token, token_id in tokenizer["model"]["vocab"].items():
-        tokens[int(token_id)] = token
-        token_types[int(token_id)] = 1
-    for added in tokenizer["added_tokens"]:
-        token_id = int(added["id"])
-        tokens[token_id] = added["content"]
-        token_types[token_id] = 3 if added.get("special", False) else 4
-    populated = [token_id for token_id, token in enumerate(tokens) if token]
-    effective_vocabulary = max(populated) + 1
-    if any(not tokens[token_id] for token_id in range(effective_vocabulary)):
-        raise ValueError("tokenizer vocabulary has a non-tail ID gap")
-    for token_id, token in enumerate(tokens):
-        if not token:
-            tokens[token_id] = f"[PAD{token_id}]"
+    tokens, token_types = tokenizer_vocabulary(
+        tokenizer, tokenizer_config, vocabulary_size
+    )
     metadata = {
         "general.architecture": "qwen35moe",
         "general.name": "Mach-1-Additive-35B",
@@ -392,6 +467,36 @@ def self_test() -> None:
         assert count == 1
         assert output.stat().st_size == size
         assert output.read_bytes()[-16:] == values
+
+        added_tokens_decoder = {
+            str(token_id): {
+                "content": content,
+                "single_word": False,
+                "lstrip": False,
+                "rstrip": False,
+                "normalized": False,
+                "special": True,
+            }
+            for token_id, content in SUPPORTED_ADDED_TOKENS.items()
+        }
+        tokens, token_types = tokenizer_vocabulary(
+            {
+                "model": {
+                    "vocab": {
+                        f"token{token_id}": token_id
+                        for token_id in range(248070)
+                    }
+                },
+                "added_tokens": [],
+            },
+            {"added_tokens_decoder": added_tokens_decoder},
+            248320,
+        )
+        for token_id, content in SUPPORTED_ADDED_TOKENS.items():
+            assert tokens[token_id] == content
+            assert token_types[token_id] == 3
+        assert tokens[248077] == "[PAD248077]"
+        assert token_types[248077] == 5
 
 
 def parse_args() -> argparse.Namespace:

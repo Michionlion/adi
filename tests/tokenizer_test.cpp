@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cstdint>
 #include <string>
+#include <limits>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -54,4 +55,13 @@ int main(int argc, char **argv) {
                    std::vector<std::uint32_t>{token});
         }
     }
+    std::vector<float> logits(tokens.size(), 1.0F);
+    tokenizer.mask_unused_logits(logits);
+    for (std::uint32_t token = 0; token < tokens.size(); ++token) {
+        const auto expected = types[token] == 5
+                                  ? std::numeric_limits<float>::lowest()
+                                  : 1.0F;
+        assert(logits[token] == expected);
+    }
+
 }

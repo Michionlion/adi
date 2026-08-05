@@ -130,6 +130,7 @@ GenerationResult generate_from_prompt(
                 : std::span<float>{},
             scratch);
     }
+    tokenizer.mask_unused_logits(logits);
     std::mt19937_64 random(options.seed);
     std::vector<std::uint32_t> output_tokens;
     output_tokens.reserve(options.max_output_tokens);
@@ -151,6 +152,7 @@ GenerationResult generate_from_prompt(
         }
         if (index + 1 < options.max_output_tokens) {
             decode_token(model, token, state, logits, scratch);
+            tokenizer.mask_unused_logits(logits);
         }
     }
     return {

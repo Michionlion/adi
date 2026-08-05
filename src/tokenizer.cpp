@@ -48,6 +48,8 @@ Tokenizer::Tokenizer(const MachModel &model) {
         }
         if (token_types_[index] == 3 || token_types_[index] == 4) {
             special_tokens_.emplace_back(tokens_[index], index);
+        } else if (token_types_[index] == 5) {
+            unused_tokens_.push_back(index);
         }
     }
     std::sort(
@@ -223,6 +225,15 @@ std::string Tokenizer::decode(std::span<const std::uint32_t> tokens) const {
 std::string Tokenizer::token_text(std::uint32_t token) const {
     const std::uint32_t value[] = {token};
     return decode(value);
+}
+
+void Tokenizer::mask_unused_logits(std::span<float> logits) const {
+    if (logits.size() != tokens_.size()) {
+        throw std::invalid_argument("tokenizer: logits shape mismatch");
+    }
+    for (const auto token : unused_tokens_) {
+        logits[token] = std::numeric_limits<float>::lowest();
+    }
 }
 
 std::string qwen_user_prompt(std::string_view input) {

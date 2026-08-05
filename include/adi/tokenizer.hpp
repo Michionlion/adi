@@ -18,6 +18,7 @@ class Tokenizer {
     [[nodiscard]] std::vector<std::uint32_t> encode(std::string_view text);
     [[nodiscard]] std::string decode(std::span<const std::uint32_t> tokens) const;
     [[nodiscard]] std::string token_text(std::uint32_t token) const;
+    void mask_unused_logits(std::span<float> logits) const;
     [[nodiscard]] std::uint32_t bos_token() const noexcept { return bos_token_; }
     [[nodiscard]] std::uint32_t eos_token() const noexcept { return eos_token_; }
 
@@ -35,6 +36,7 @@ class Tokenizer {
     std::unordered_map<std::string_view, std::uint32_t> token_ids_;
     std::unordered_map<std::string, std::uint32_t> merge_ranks_;
     std::vector<std::pair<std::string_view, std::uint32_t>> special_tokens_;
+    std::vector<std::uint32_t> unused_tokens_;
     std::unordered_map<unsigned char, std::string> byte_encoder_;
     std::unordered_map<std::uint32_t, unsigned char> byte_decoder_;
     std::list<std::string> cache_recency_;
