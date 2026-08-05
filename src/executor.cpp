@@ -574,6 +574,9 @@ void decode_token(
     if (!logits.empty() && logits.size() != config.vocabulary) {
         throw std::invalid_argument("decoder logits shape mismatch");
     }
+    if (state.position >= config.context) {
+        throw std::out_of_range("decoder context is exhausted");
+    }
     decode_hidden(model, token, state, scratch, backend);
     if (logits.empty()) {
         return;
@@ -606,6 +609,11 @@ void decode_batch(
             return token >= config.vocabulary;
         })) {
         throw std::invalid_argument("decoder batch token is out of range");
+    }
+    if (std::any_of(states.begin(), states.end(), [&](const DecoderState &state) {
+            return state.position >= config.context;
+        })) {
+        throw std::out_of_range("decoder context is exhausted");
     }
 
     batch_scratch.head_inputs.resize(batch * config.hidden);

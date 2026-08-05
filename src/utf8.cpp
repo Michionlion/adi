@@ -1,5 +1,7 @@
 #include "utf8.hpp"
 
+#include <stdexcept>
+
 namespace adi {
 namespace {
 
@@ -92,11 +94,13 @@ void append_utf8(std::string &output, std::uint32_t codepoint) {
         output.push_back(static_cast<char>(0xE0U | (codepoint >> 12)));
         output.push_back(static_cast<char>(0x80U | ((codepoint >> 6) & 0x3FU)));
         output.push_back(static_cast<char>(0x80U | (codepoint & 0x3FU)));
-    } else if (codepoint <= 0x10FFFFU) {
+    } else if (codepoint >= 0x10000U && codepoint <= 0x10FFFFU) {
         output.push_back(static_cast<char>(0xF0U | (codepoint >> 18)));
         output.push_back(static_cast<char>(0x80U | ((codepoint >> 12) & 0x3FU)));
         output.push_back(static_cast<char>(0x80U | ((codepoint >> 6) & 0x3FU)));
         output.push_back(static_cast<char>(0x80U | (codepoint & 0x3FU)));
+    } else {
+        throw std::invalid_argument("codepoint is not a Unicode scalar value");
     }
 }
 

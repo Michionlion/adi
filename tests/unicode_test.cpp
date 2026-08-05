@@ -1,10 +1,24 @@
 #include "unicode.hpp"
+#include "utf8.hpp"
 
 #include <cassert>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 int main() {
+    std::string encoded;
+    adi::append_utf8(encoded, 0x10000);
+    assert(encoded == "\xF0\x90\x80\x80");
+    bool invalid_scalar = false;
+    try {
+        adi::append_utf8(encoded, 0xD800);
+    } catch (const std::invalid_argument &) {
+        invalid_scalar = true;
+    }
+    assert(invalid_scalar);
+    assert(encoded == "\xF0\x90\x80\x80");
+
     assert(adi::normalize_nfc("e\xCC\x81") == "\xC3\xA9");
     assert(adi::normalize_nfc("\xEA\xB0\x80") == "\xEA\xB0\x80");
     assert(adi::normalize_nfc("\xE1\x84\x80\xE1\x85\xA1") == "\xEA\xB0\x80");
