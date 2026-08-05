@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace adi {
 namespace {
@@ -109,31 +111,53 @@ std::array<ExpertRoute, 8> moe_forward(
     const auto routes = top_experts(scratch.router_logits);
 
     std::fill(output.begin(), output.end(), 0.0F);
-    scratch.gate.resize(config.expert_hidden);
-    scratch.up.resize(config.expert_hidden);
-    scratch.activated.resize(config.expert_hidden);
-    scratch.projected.resize(config.hidden);
-    for (const auto route : routes) {
-        mach_expert_matvec(
-            model.expert(layer, route.expert, ExpertProjection::gate),
-            input,
-            scratch.gate,
-            scratch.codec);
-        mach_expert_matvec(
-            model.expert(layer, route.expert, ExpertProjection::up),
-            input,
-            scratch.up,
-            scratch.codec);
-        for (std::size_t index = 0; index < scratch.activated.size(); ++index) {
-            scratch.activated[index] = silu(scratch.gate[index]) * scratch.up[index];
+    std::array<std::exception_ptr, 8> failures;
+    std::array<std::thread, 8> workers;
+    for (std::size_t route_index = 0; route_index < routes.size(); ++route_index) {
+        workers[route_index] = std::thread([&, route_index] {
+            try {
+                const auto route = routes[route_index];
+                auto &worker = scratch.experts[route_index];
+                worker.gate.resize(config.expert_hidden);
+                worker.up.resize(config.expert_hidden);
+                worker.activated.resize(config.expert_hidden);
+                worker.projected.resize(config.hidden);
+                mach_expert_matvec(
+                    model.expert(layer, route.expert, ExpertProjection::gate),
+                    input,
+                    worker.gate,
+                    worker.codec);
+                mach_expert_matvec(
+                    model.expert(layer, route.expert, ExpertProjection::up),
+                    input,
+                    worker.up,
+                    worker.codec);
+                for (std::size_t index = 0; index < worker.activated.size(); ++index) {
+                    worker.activated[index] =
+                        silu(worker.gate[index]) * worker.up[index];
+                }
+                mach_expert_matvec(
+                    model.expert(layer, route.expert, ExpertProjection::down),
+                    worker.activated,
+                    worker.projected,
+                    worker.codec);
+            } catch (...) {
+                failures[route_index] = std::current_exception();
+            }
+        });
+    }
+    for (auto &worker : workers) {
+        worker.join();
+    }
+    for (const auto &failure : failures) {
+        if (failure) {
+            std::rethrow_exception(failure);
         }
-        mach_expert_matvec(
-            model.expert(layer, route.expert, ExpertProjection::down),
-            scratch.activated,
-            scratch.projected,
-            scratch.codec);
+    }
+    for (std::size_t route_index = 0; route_index < routes.size(); ++route_index) {
+        const auto &projected = scratch.experts[route_index].projected;
         for (std::size_t index = 0; index < output.size(); ++index) {
-            output[index] += route.weight * scratch.projected[index];
+            output[index] += routes[route_index].weight * projected[index];
         }
     }
 
@@ -145,12 +169,12 @@ std::array<ExpertRoute, 8> moe_forward(
         model.non_expert(layer, shared_prefix + "gate_proj.weight"),
         input,
         scratch.shared_gate,
-        scratch.codec);
+        scratch.shared_codec);
     mach_ne_matvec(
         model.non_expert(layer, shared_prefix + "up_proj.weight"),
         input,
         scratch.shared_up,
-        scratch.codec);
+        scratch.shared_codec);
     for (std::size_t index = 0; index < scratch.shared_gate.size(); ++index) {
         scratch.shared_gate[index] =
             silu(scratch.shared_gate[index]) * scratch.shared_up[index];
@@ -159,7 +183,7 @@ std::array<ExpertRoute, 8> moe_forward(
         model.non_expert(layer, shared_prefix + "down_proj.weight"),
         scratch.shared_gate,
         scratch.shared_down,
-        scratch.codec);
+        scratch.shared_codec);
 
     const auto shared_gate =
         model.bf16_matrix(prefix + "mlp.shared_expert_gate.weight");

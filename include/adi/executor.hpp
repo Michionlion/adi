@@ -14,13 +14,18 @@ struct ExpertRoute {
     float weight;
 };
 
-struct MoeScratch {
+struct MoeExpertScratch {
     ExpertScratch codec;
-    std::vector<float> router_logits;
     std::vector<float> gate;
     std::vector<float> up;
     std::vector<float> activated;
     std::vector<float> projected;
+};
+
+struct MoeScratch {
+    std::array<MoeExpertScratch, 8> experts;
+    ExpertScratch shared_codec;
+    std::vector<float> router_logits;
     std::vector<float> shared_gate;
     std::vector<float> shared_up;
     std::vector<float> shared_down;

@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstring>
 #include <stdexcept>
+#include <thread>
 
 namespace adi {
 namespace {
@@ -18,6 +19,31 @@ constexpr std::uint32_t fresh_bits = 12;
 constexpr std::uint32_t states_per_tile = tile_values / values_per_state;
 constexpr std::uint32_t stream_bits = 384;
 constexpr std::uint32_t words_per_tile = stream_bits / 16;
+
+template <typename Function>
+void parallel_ranges(
+    std::uint32_t count,
+    std::uint32_t minimum_per_worker,
+    Function &&function) {
+    const auto available = std::max(1U, std::thread::hardware_concurrency());
+    const auto workers =
+        std::min(available, std::max(1U, count / minimum_per_worker));
+    if (workers == 1) {
+        function(0, count);
+        return;
+    }
+    std::vector<std::thread> threads;
+    threads.reserve(workers - 1);
+    for (std::uint32_t worker = 0; worker + 1 < workers; ++worker) {
+        const auto begin = count * worker / workers;
+        const auto end = count * (worker + 1) / workers;
+        threads.emplace_back([&, begin, end] { function(begin, end); });
+    }
+    function(count * (workers - 1) / workers, count);
+    for (auto &thread : threads) {
+        thread.join();
+    }
+}
 
 bool is_power_of_two(std::uint32_t value) {
     return value != 0 && (value & (value - 1)) == 0;
@@ -292,46 +318,52 @@ void mach_ne_matvec(
     }
     hadamard(scratch.input);
 
-    for (std::uint32_t tile_row = 0; tile_row < tile_rows; ++tile_row) {
-        float row_sums[tile_size] = {};
-        for (std::uint32_t tile_column = 0; tile_column < tile_columns; ++tile_column) {
-            const auto tile_index =
-                static_cast<std::size_t>(tile_row) * tile_columns + tile_column;
-            const auto *words =
-                matrix.trellis.data() + tile_index * ne_words_per_tile;
-            std::uint32_t state = words[0];
-            for (std::uint32_t state_index = 0; state_index < ne_states_per_tile;
-                 ++state_index) {
-                if (state_index != 0) {
-                    const auto position =
-                        register_bits + (state_index - 1) * ne_fresh_bits;
-                    std::uint32_t fresh = 0;
-                    for (std::uint32_t bit = 0; bit < ne_fresh_bits; ++bit) {
-                        auto stream_position = position + bit;
-                        if (stream_position >= ne_stream_bits) {
-                            stream_position -= ne_stream_bits;
+    parallel_ranges(tile_rows, 4, [&](std::uint32_t row_begin, std::uint32_t row_end) {
+        for (std::uint32_t tile_row = row_begin; tile_row < row_end; ++tile_row) {
+            float row_sums[tile_size] = {};
+            for (std::uint32_t tile_column = 0; tile_column < tile_columns;
+                 ++tile_column) {
+                const auto tile_index =
+                    static_cast<std::size_t>(tile_row) * tile_columns + tile_column;
+                const auto *words =
+                    matrix.trellis.data() + tile_index * ne_words_per_tile;
+                std::uint32_t state = words[0];
+                for (std::uint32_t state_index = 0; state_index < ne_states_per_tile;
+                     ++state_index) {
+                    if (state_index != 0) {
+                        const auto position =
+                            register_bits + (state_index - 1) * ne_fresh_bits;
+                        std::uint32_t fresh = 0;
+                        for (std::uint32_t bit = 0; bit < ne_fresh_bits; ++bit) {
+                            auto stream_position = position + bit;
+                            if (stream_position >= ne_stream_bits) {
+                                stream_position -= ne_stream_bits;
+                            }
+                            fresh = (fresh << 1) |
+                                    ((words[stream_position / 16] >>
+                                      (15 - stream_position % 16)) & 1U);
                         }
-                        fresh = (fresh << 1) |
-                                ((words[stream_position / 16] >>
-                                  (15 - stream_position % 16)) & 1U);
+                        state = ((state << ne_fresh_bits) & 0xFFFFU) | fresh;
                     }
-                    state = ((state << ne_fresh_bits) & 0xFFFFU) | fresh;
-                }
-                for (std::uint32_t component = 0; component < ne_values_per_state;
-                     ++component) {
-                    const auto element =
-                        state_index * ne_values_per_state + component;
-                    const auto local_row = element / tile_size;
-                    const auto local_column = element % tile_size;
-                    const auto column = tile_column * tile_size + local_column;
-                    row_sums[local_row] +=
-                        ne_lattice_value(matrix.tlut, state, component) *
-                        matrix.weight_scale * scratch.input[column];
+                    for (std::uint32_t component = 0;
+                         component < ne_values_per_state; ++component) {
+                        const auto element =
+                            state_index * ne_values_per_state + component;
+                        const auto local_row = element / tile_size;
+                        const auto local_column = element % tile_size;
+                        const auto column = tile_column * tile_size + local_column;
+                        row_sums[local_row] +=
+                            ne_lattice_value(matrix.tlut, state, component) *
+                            matrix.weight_scale * scratch.input[column];
+                    }
                 }
             }
+            std::copy_n(
+                row_sums,
+                tile_size,
+                scratch.output.begin() + tile_row * tile_size);
         }
-        std::copy_n(row_sums, tile_size, scratch.output.begin() + tile_row * tile_size);
-    }
+    });
     hadamard(scratch.output);
     for (std::size_t index = 0; index < output.size(); ++index) {
         output[index] = scratch.output[index] * static_cast<float>(matrix.sv[index]);
@@ -397,30 +429,32 @@ void mach_head_matvec(
     }
     const auto bytes_per_row = head.columns / 8 * 5;
     const auto groups_per_row = head.columns / group;
-    for (std::uint32_t row = 0; row < head.rows; ++row) {
-        const auto packed_row =
-            head.packed.subspan(static_cast<std::size_t>(row) * bytes_per_row,
-                                bytes_per_row);
-        float sum = 0.0F;
-        for (std::uint32_t block = 0; block < head.columns / 8; ++block) {
-            std::uint64_t word = 0;
-            for (std::uint32_t byte = 0; byte < 5; ++byte) {
-                word |= static_cast<std::uint64_t>(packed_row[block * 5 + byte])
-                        << (byte * 8);
+    parallel_ranges(head.rows, 512, [&](std::uint32_t row_begin, std::uint32_t row_end) {
+        for (std::uint32_t row = row_begin; row < row_end; ++row) {
+            const auto packed_row =
+                head.packed.subspan(static_cast<std::size_t>(row) * bytes_per_row,
+                                    bytes_per_row);
+            float sum = 0.0F;
+            for (std::uint32_t block = 0; block < head.columns / 8; ++block) {
+                std::uint64_t word = 0;
+                for (std::uint32_t byte = 0; byte < 5; ++byte) {
+                    word |= static_cast<std::uint64_t>(packed_row[block * 5 + byte])
+                            << (byte * 8);
+                }
+                for (std::uint32_t index = 0; index < 8; ++index) {
+                    const auto column = block * 8 + index;
+                    const auto code = static_cast<std::int32_t>(
+                        (word >> (index * 5)) & 0x1FU) - 16;
+                    const float scale = f16_to_f32(
+                        head.group_scale_f16[
+                            static_cast<std::size_t>(row) * groups_per_row +
+                            column / group]);
+                    sum += static_cast<float>(code) * scale * input[column];
+                }
             }
-            for (std::uint32_t index = 0; index < 8; ++index) {
-                const auto column = block * 8 + index;
-                const auto code = static_cast<std::int32_t>(
-                    (word >> (index * 5)) & 0x1FU) - 16;
-                const float scale = f16_to_f32(
-                    head.group_scale_f16[
-                        static_cast<std::size_t>(row) * groups_per_row +
-                        column / group]);
-                sum += static_cast<float>(code) * scale * input[column];
-            }
+            output[row] = sum;
         }
-        output[row] = sum;
-    }
+    });
 
     if (head.protected_rows.empty()) {
         return;
