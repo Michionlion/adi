@@ -30,4 +30,12 @@ if(ADI_BUILD_TESTS)
     add_executable(adi_gguf_test tests/gguf_test.cpp)
     target_link_libraries(adi_gguf_test PRIVATE adi_runtime)
     add_test(NAME gguf COMMAND adi_gguf_test)
+
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(
+            NAME pack_mach
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/pack_mach.py --self-test
+        )
+    endif()
 endif()

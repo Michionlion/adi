@@ -45,14 +45,14 @@ Packed bytes use GGML `I8`; code words use `I16`; signs use `I8`; indexes use
 are `BF16` or `F32`. Signed GGML storage types are byte containers where the
 codec defines an unsigned interpretation.
 
-The packager consolidates the checkpoint's per-expert and per-head shards.
-Names use the following stable prefixes:
+The packager consolidates the checkpoint's files into one GGUF while retaining
+its 32-expert chunks for direct indexed access. Names use these stable forms:
 
-- `mach.expert.{layer}.{gate|up|down}.{trellis|su|sv|wave_gamma}`
-- `mach.ne.{original_tensor_name}.{trellis|su|sv|wscale}`
-- `mach.embedding.{q_packed|mn|mx|exception_index|exception_bits}`
-- `mach.output.{q_packed|group_scale|protected_rows|protected_dense}`
-- `mach.tlut.{expert|ne}`
+- `mach.expert.{layer}.e{chunk_base}.{gate|up|down}.{trellis|su|sv|wave_gamma}`
+- `mach.ne.{layer}.{original_tensor_name}|{trellis|SU|SV|Wscale}`
+- `mach.embedding.{q_packed|mn|mx|exc_idx|exc_bits}`
+- `mach.output.{chunk}.{source_key}`
+- `mach.tlut.{expert|ne}.tlut`
 
 Non-expert tensors retain llama.cpp's Qwen3.5 MoE tensor names, such as
 `blk.0.attn_norm.weight`. This keeps the architecture legible while the `mach.*`

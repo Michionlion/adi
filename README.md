@@ -25,6 +25,20 @@ cmake --build build -j
 ctest --test-dir build
 ```
 
+Validate a native Mach-1 checkpoint and show the planned GGUF size:
+
+```bash
+python3 tools/pack_mach.py /path/to/Mach-1-Additive-35B --plan
+```
+
+Package it without decoding or requantizing any weights:
+
+```bash
+python3 tools/pack_mach.py /path/to/Mach-1-Additive-35B \
+  --output models/Mach-1-Additive-35B.gguf
+./build/adi inspect models/Mach-1-Additive-35B.gguf
+```
+
 ## Repository layout
 
 - `include/adi/`: public runtime API.
