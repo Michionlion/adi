@@ -449,4 +449,78 @@ void linear_attention_forward(
         scratch.codec);
 }
 
+void decode_token(
+    const MachModel &model,
+    std::uint32_t token,
+    DecoderState &state,
+    std::span<float> logits,
+    DecoderScratch &scratch) {
+    const auto &config = model.config();
+    if (token >= config.vocabulary || logits.size() != config.vocabulary) {
+        throw std::invalid_argument("decoder token or logits shape mismatch");
+    }
+    scratch.hidden.resize(config.hidden);
+    scratch.normalized.resize(config.hidden);
+    scratch.attention.resize(config.hidden);
+    scratch.feed_forward.resize(config.hidden);
+    mach_embedding_row(model.embedding(), token, scratch.hidden);
+
+    for (std::uint32_t layer = 0; layer < config.layers; ++layer) {
+        const auto prefix = layer_prefix(layer);
+        rms_norm(
+            scratch.hidden,
+            model.bf16_vector(prefix + "input_layernorm.weight"),
+            1.0e-6F,
+            scratch.normalized);
+        if ((layer + 1) % 4 == 0) {
+            full_attention_forward(
+                model,
+                layer,
+                state.position,
+                scratch.normalized,
+                scratch.attention,
+                state.full_attention[layer],
+                scratch.full_attention);
+        } else {
+            linear_attention_forward(
+                model,
+                layer,
+                scratch.normalized,
+                scratch.attention,
+                state.linear_attention[layer],
+                scratch.linear_attention);
+        }
+        for (std::size_t index = 0; index < scratch.hidden.size(); ++index) {
+            scratch.hidden[index] += scratch.attention[index];
+        }
+        rms_norm(
+            scratch.hidden,
+            model.bf16_vector(prefix + "post_attention_layernorm.weight"),
+            1.0e-6F,
+            scratch.normalized);
+        (void)moe_forward(
+            model,
+            layer,
+            scratch.normalized,
+            scratch.feed_forward,
+            scratch.moe);
+        for (std::size_t index = 0; index < scratch.hidden.size(); ++index) {
+            scratch.hidden[index] += scratch.feed_forward[index];
+        }
+    }
+    rms_norm(
+        scratch.hidden,
+        model.bf16_vector("model.language_model.norm.weight"),
+        1.0e-6F,
+        scratch.normalized);
+    for (std::uint32_t chunk = 0; chunk < 8; ++chunk) {
+        const auto head = model.head_chunk(chunk);
+        mach_head_matvec(
+            head,
+            scratch.normalized,
+            logits.subspan(static_cast<std::size_t>(chunk) * head.rows, head.rows));
+    }
+    ++state.position;
+}
+
 } // namespace adi

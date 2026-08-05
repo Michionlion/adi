@@ -56,6 +56,22 @@ struct LinearAttentionScratch {
     std::vector<float> normalized;
 };
 
+struct DecoderState {
+    std::uint32_t position = 0;
+    std::array<FullAttentionState, 40> full_attention;
+    std::array<LinearAttentionState, 40> linear_attention;
+};
+
+struct DecoderScratch {
+    std::vector<float> hidden;
+    std::vector<float> normalized;
+    std::vector<float> attention;
+    std::vector<float> feed_forward;
+    FullAttentionScratch full_attention;
+    LinearAttentionScratch linear_attention;
+    MoeScratch moe;
+};
+
 [[nodiscard]] std::array<ExpertRoute, 8> top_experts(
     std::span<const float> logits);
 
@@ -82,5 +98,12 @@ void linear_attention_forward(
     std::span<float> output,
     LinearAttentionState &state,
     LinearAttentionScratch &scratch);
+
+void decode_token(
+    const MachModel &model,
+    std::uint32_t token,
+    DecoderState &state,
+    std::span<float> logits,
+    DecoderScratch &scratch);
 
 } // namespace adi

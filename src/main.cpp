@@ -9,6 +9,7 @@
 #include <cmath>
 #include <exception>
 #include <iostream>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -308,6 +309,35 @@ int bench_linear_attention(int argc, char **argv) {
     return 0;
 }
 
+int decode_one(const char *path, std::string_view token_string) {
+    const adi::MachModel model(path);
+    const auto token = parse_u32(token_string, "token");
+    std::vector<float> logits(model.config().vocabulary);
+    adi::DecoderState state;
+    adi::DecoderScratch scratch;
+    const auto start = std::chrono::steady_clock::now();
+    adi::decode_token(model, token, state, logits, scratch);
+    const auto elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    std::vector<std::uint32_t> indexes(logits.size());
+    std::iota(indexes.begin(), indexes.end(), 0);
+    std::partial_sort(
+        indexes.begin(),
+        indexes.begin() + 5,
+        indexes.end(),
+        [&](std::uint32_t left, std::uint32_t right) {
+            return logits[left] > logits[right];
+        });
+    std::cout << "seconds: " << elapsed << '\n'
+              << "tokens/second: " << 1.0 / elapsed << '\n'
+              << "top logits:";
+    for (std::size_t index = 0; index < 5; ++index) {
+        std::cout << ' ' << indexes[index] << ':' << logits[indexes[index]];
+    }
+    std::cout << '\n';
+    return 0;
+}
+
 void usage() {
     std::cerr << "usage:\n"
               << "  adi --version\n"
@@ -319,6 +349,7 @@ void usage() {
               << "  adi bench-moe MODEL.gguf LAYER [ITERATIONS]\n"
               << "  adi bench-attention MODEL.gguf LAYER [TOKENS]\n"
               << "  adi bench-linear MODEL.gguf LAYER [TOKENS]\n"
+              << "  adi decode-token MODEL.gguf TOKEN\n"
               << "  adi embedding-row MODEL.gguf TOKEN\n";
 }
 
@@ -397,6 +428,14 @@ int main(int argc, char **argv) {
     if ((argc == 4 || argc == 5) && std::string_view(argv[1]) == "bench-linear") {
         try {
             return bench_linear_attention(argc, argv);
+        } catch (const std::exception &error) {
+            std::cerr << "adi: " << error.what() << '\n';
+            return 1;
+        }
+    }
+    if (argc == 4 && std::string_view(argv[1]) == "decode-token") {
+        try {
+            return decode_one(argv[2], argv[3]);
         } catch (const std::exception &error) {
             std::cerr << "adi: " << error.what() << '\n';
             return 1;
