@@ -26,6 +26,20 @@ struct MoeScratch {
     std::vector<float> shared_down;
 };
 
+struct FullAttentionState {
+    std::vector<float> keys;
+    std::vector<float> values;
+};
+
+struct FullAttentionScratch {
+    ExpertScratch codec;
+    std::vector<float> query_gate;
+    std::vector<float> key;
+    std::vector<float> value;
+    std::vector<float> attended;
+    std::vector<float> scores;
+};
+
 [[nodiscard]] std::array<ExpertRoute, 8> top_experts(
     std::span<const float> logits);
 
@@ -35,5 +49,14 @@ struct MoeScratch {
     std::span<const float> input,
     std::span<float> output,
     MoeScratch &scratch);
+
+void full_attention_forward(
+    const MachModel &model,
+    std::uint32_t layer,
+    std::uint32_t position,
+    std::span<const float> input,
+    std::span<float> output,
+    FullAttentionState &state,
+    FullAttentionScratch &scratch);
 
 } // namespace adi

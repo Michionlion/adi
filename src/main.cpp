@@ -244,6 +244,38 @@ int bench_moe(int argc, char **argv) {
     return 0;
 }
 
+int bench_attention(int argc, char **argv) {
+    const adi::MachModel model(argv[2]);
+    const auto layer = parse_u32(argv[3], "layer");
+    const auto tokens = argc == 5 ? parse_u32(argv[4], "tokens") : 1;
+    if (tokens == 0) {
+        throw std::invalid_argument("tokens must be positive");
+    }
+    std::vector<float> input(model.config().hidden);
+    std::vector<float> output(model.config().hidden);
+    adi::FullAttentionState state;
+    adi::FullAttentionScratch scratch;
+    const auto start = std::chrono::steady_clock::now();
+    for (std::uint32_t position = 0; position < tokens; ++position) {
+        for (std::size_t index = 0; index < input.size(); ++index) {
+            input[index] =
+                std::sin(static_cast<float>(index + position) * 0.01F);
+        }
+        adi::full_attention_forward(
+            model, layer, position, input, output, state, scratch);
+    }
+    const auto elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    double checksum = 0.0;
+    for (const auto value : output) {
+        checksum += value;
+    }
+    std::cout << "tokens: " << tokens << '\n'
+              << "milliseconds/token: " << elapsed * 1000.0 / tokens << '\n'
+              << "checksum: " << checksum << '\n';
+    return 0;
+}
+
 void usage() {
     std::cerr << "usage:\n"
               << "  adi --version\n"
@@ -253,6 +285,7 @@ void usage() {
               << "  adi bench-ne MODEL.gguf LAYER SOURCE_NAME [ITERATIONS]\n"
               << "  adi bench-head MODEL.gguf CHUNK [ITERATIONS]\n"
               << "  adi bench-moe MODEL.gguf LAYER [ITERATIONS]\n"
+              << "  adi bench-attention MODEL.gguf LAYER [TOKENS]\n"
               << "  adi embedding-row MODEL.gguf TOKEN\n";
 }
 
@@ -314,6 +347,15 @@ int main(int argc, char **argv) {
     if ((argc == 4 || argc == 5) && std::string_view(argv[1]) == "bench-moe") {
         try {
             return bench_moe(argc, argv);
+        } catch (const std::exception &error) {
+            std::cerr << "adi: " << error.what() << '\n';
+            return 1;
+        }
+    }
+    if ((argc == 4 || argc == 5) &&
+        std::string_view(argv[1]) == "bench-attention") {
+        try {
+            return bench_attention(argc, argv);
         } catch (const std::exception &error) {
             std::cerr << "adi: " << error.what() << '\n';
             return 1;
