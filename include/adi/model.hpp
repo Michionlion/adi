@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <string_view>
 
 namespace adi {
 
@@ -21,6 +22,7 @@ struct MachConfig {
     std::uint32_t active_experts;
     std::uint32_t expert_hidden;
     std::uint32_t context;
+    std::uint32_t vocabulary;
 };
 
 class MachModel {
@@ -33,6 +35,11 @@ class MachModel {
         std::uint32_t layer,
         std::uint32_t expert,
         ExpertProjection projection) const;
+    [[nodiscard]] MachNeMatrix non_expert(
+        std::uint32_t layer,
+        std::string_view source_name) const;
+    [[nodiscard]] MachEmbedding embedding() const;
+    [[nodiscard]] MachHeadChunk head_chunk(std::uint32_t chunk) const;
 
   private:
     GgufFile file_;

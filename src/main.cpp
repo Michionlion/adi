@@ -83,7 +83,8 @@ int validate(const char *path) {
               << "experts: " << config.experts << '\n'
               << "active experts: " << config.active_experts << '\n'
               << "expert hidden: " << config.expert_hidden << '\n'
-              << "context: " << config.context << '\n';
+              << "context: " << config.context << '\n'
+              << "vocabulary: " << config.vocabulary << '\n';
     return 0;
 }
 
@@ -125,12 +126,98 @@ int bench_expert(int argc, char **argv) {
     return 0;
 }
 
+template <typename Function>
+void print_benchmark(
+    std::uint32_t iterations,
+    std::span<const float> output,
+    Function &&function) {
+    function();
+    const auto start = std::chrono::steady_clock::now();
+    for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
+        function();
+    }
+    const auto elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    double checksum = 0.0;
+    float max_abs = 0.0F;
+    for (const auto value : output) {
+        checksum += value;
+        max_abs = std::max(max_abs, std::abs(value));
+    }
+    std::cout << "iterations: " << iterations << '\n'
+              << "milliseconds/matvec: " << elapsed * 1000.0 / iterations << '\n'
+              << "checksum: " << checksum << '\n'
+              << "max_abs: " << max_abs << '\n';
+}
+
+int bench_ne(int argc, char **argv) {
+    const adi::MachModel model(argv[2]);
+    const auto layer = parse_u32(argv[3], "layer");
+    const auto matrix = model.non_expert(layer, argv[4]);
+    const auto iterations = argc == 6 ? parse_u32(argv[5], "iterations") : 3;
+    if (iterations == 0) {
+        throw std::invalid_argument("iterations must be positive");
+    }
+    std::vector<float> input(matrix.columns);
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        input[index] = std::sin(static_cast<float>(index) * 0.01F);
+    }
+    std::vector<float> output(matrix.rows);
+    adi::ExpertScratch scratch;
+    std::cout << "matrix: " << matrix.rows << "x" << matrix.columns << '\n';
+    print_benchmark(iterations, output, [&] {
+        adi::mach_ne_matvec(matrix, input, output, scratch);
+    });
+    return 0;
+}
+
+int bench_head(int argc, char **argv) {
+    const adi::MachModel model(argv[2]);
+    const auto chunk_index = parse_u32(argv[3], "chunk");
+    const auto head = model.head_chunk(chunk_index);
+    const auto iterations = argc == 5 ? parse_u32(argv[4], "iterations") : 1;
+    if (iterations == 0) {
+        throw std::invalid_argument("iterations must be positive");
+    }
+    std::vector<float> input(head.columns);
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        input[index] = std::sin(static_cast<float>(index) * 0.01F);
+    }
+    std::vector<float> output(head.rows);
+    std::cout << "matrix: " << head.rows << "x" << head.columns << '\n';
+    print_benchmark(iterations, output, [&] {
+        adi::mach_head_matvec(head, input, output);
+    });
+    return 0;
+}
+
+int embedding_row(const char *path, std::string_view token_string) {
+    const adi::MachModel model(path);
+    const auto token = parse_u32(token_string, "token");
+    const auto embedding = model.embedding();
+    std::vector<float> output(embedding.columns);
+    adi::mach_embedding_row(embedding, token, output);
+    double checksum = 0.0;
+    float max_abs = 0.0F;
+    for (const auto value : output) {
+        checksum += value;
+        max_abs = std::max(max_abs, std::abs(value));
+    }
+    std::cout << "token: " << token << '\n'
+              << "checksum: " << checksum << '\n'
+              << "max_abs: " << max_abs << '\n';
+    return 0;
+}
+
 void usage() {
     std::cerr << "usage:\n"
               << "  adi --version\n"
               << "  adi inspect MODEL.gguf\n"
               << "  adi validate MODEL.gguf\n"
-              << "  adi bench-expert MODEL.gguf LAYER EXPERT PROJECTION [ITERATIONS]\n";
+              << "  adi bench-expert MODEL.gguf LAYER EXPERT PROJECTION [ITERATIONS]\n"
+              << "  adi bench-ne MODEL.gguf LAYER SOURCE_NAME [ITERATIONS]\n"
+              << "  adi bench-head MODEL.gguf CHUNK [ITERATIONS]\n"
+              << "  adi embedding-row MODEL.gguf TOKEN\n";
 }
 
 } // namespace
@@ -159,6 +246,30 @@ int main(int argc, char **argv) {
     if ((argc == 6 || argc == 7) && std::string_view(argv[1]) == "bench-expert") {
         try {
             return bench_expert(argc, argv);
+        } catch (const std::exception &error) {
+            std::cerr << "adi: " << error.what() << '\n';
+            return 1;
+        }
+    }
+    if ((argc == 5 || argc == 6) && std::string_view(argv[1]) == "bench-ne") {
+        try {
+            return bench_ne(argc, argv);
+        } catch (const std::exception &error) {
+            std::cerr << "adi: " << error.what() << '\n';
+            return 1;
+        }
+    }
+    if ((argc == 4 || argc == 5) && std::string_view(argv[1]) == "bench-head") {
+        try {
+            return bench_head(argc, argv);
+        } catch (const std::exception &error) {
+            std::cerr << "adi: " << error.what() << '\n';
+            return 1;
+        }
+    }
+    if (argc == 4 && std::string_view(argv[1]) == "embedding-row") {
+        try {
+            return embedding_row(argv[2], argv[3]);
         } catch (const std::exception &error) {
             std::cerr << "adi: " << error.what() << '\n';
             return 1;

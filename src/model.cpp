@@ -88,6 +88,7 @@ MachModel::MachModel(const std::filesystem::path &path) : file_(path) {
         required_u32(file_, "qwen35moe.expert_used_count"),
         required_u32(file_, "qwen35moe.expert_feed_forward_length"),
         required_u32(file_, "qwen35moe.context_length"),
+        0,
     };
     if (config_.layers != 40 || config_.hidden != 2048 || config_.experts != 256 ||
         config_.active_experts != 8 || config_.expert_hidden != 512) {
@@ -96,7 +97,108 @@ MachModel::MachModel(const std::filesystem::path &path) : file_(path) {
 
     (void)required_tensor(file_, "mach.tlut.expert.tlut", GgmlType::f32);
     (void)required_tensor(file_, "mach.tlut.ne.tlut", GgmlType::f32);
-    (void)required_tensor(file_, "mach.embedding.q_packed", GgmlType::i8);
+    const auto &embedding =
+        required_tensor(file_, "mach.embedding.q_packed", GgmlType::i8);
+    if (embedding.dimensions.size() != 2 ||
+        embedding.dimensions[0] * 2 != config_.hidden ||
+        embedding.dimensions[1] > 0xFFFFFFFFULL) {
+        throw std::runtime_error("model: malformed embedding geometry");
+    }
+    config_.vocabulary = static_cast<std::uint32_t>(embedding.dimensions[1]);
+}
+
+MachNeMatrix MachModel::non_expert(
+    std::uint32_t layer,
+    std::string_view source_name) const {
+    if (layer >= config_.layers) {
+        throw std::out_of_range("model: layer index is out of range");
+    }
+    const auto prefix = "mach.ne." + std::to_string(layer) + "." +
+                        std::string(source_name) + "|";
+    const auto &trellis_tensor =
+        required_tensor(file_, prefix + "trellis", GgmlType::i16);
+    const auto &su_tensor = required_tensor(file_, prefix + "SU", GgmlType::i8);
+    const auto &sv_tensor = required_tensor(file_, prefix + "SV", GgmlType::i8);
+    const auto &scale_tensor =
+        required_tensor(file_, prefix + "Wscale", GgmlType::f32);
+    const auto &tlut_tensor =
+        required_tensor(file_, "mach.tlut.ne.tlut", GgmlType::f32);
+    const auto trellis = view<std::uint16_t>(file_, trellis_tensor);
+    const auto su = view<std::int8_t>(file_, su_tensor);
+    const auto sv = view<std::int8_t>(file_, sv_tensor);
+    const auto scale = view<float>(file_, scale_tensor);
+    const auto tlut = view<float>(file_, tlut_tensor);
+    if (su.size() > 0xFFFFFFFFULL || sv.size() > 0xFFFFFFFFULL || scale.size() != 1) {
+        throw std::runtime_error("model: malformed non-expert tensor '" + prefix + "'");
+    }
+    return {
+        static_cast<std::uint32_t>(sv.size()),
+        static_cast<std::uint32_t>(su.size()),
+        trellis,
+        su,
+        sv,
+        scale[0],
+        tlut,
+    };
+}
+
+MachEmbedding MachModel::embedding() const {
+    const auto &packed_tensor =
+        required_tensor(file_, "mach.embedding.q_packed", GgmlType::i8);
+    const auto &minimum_tensor =
+        required_tensor(file_, "mach.embedding.mn", GgmlType::f16);
+    const auto &maximum_tensor =
+        required_tensor(file_, "mach.embedding.mx", GgmlType::f16);
+    const auto &index_tensor =
+        required_tensor(file_, "mach.embedding.exc_idx", GgmlType::i32);
+    const auto &bits_tensor =
+        required_tensor(file_, "mach.embedding.exc_bits", GgmlType::i16);
+    return {
+        config_.vocabulary,
+        config_.hidden,
+        view<std::uint8_t>(file_, packed_tensor),
+        view<std::uint16_t>(file_, minimum_tensor),
+        view<std::uint16_t>(file_, maximum_tensor),
+        view<std::uint32_t>(file_, index_tensor),
+        view<std::uint16_t>(file_, bits_tensor),
+    };
+}
+
+MachHeadChunk MachModel::head_chunk(std::uint32_t chunk) const {
+    constexpr std::uint32_t chunk_count = 8;
+    if (chunk >= chunk_count || config_.vocabulary % chunk_count != 0) {
+        throw std::out_of_range("model: output chunk index is out of range");
+    }
+    const auto rows = config_.vocabulary / chunk_count;
+    const auto row_begin = chunk * rows;
+    const auto row_end = row_begin + rows;
+    const auto source = "LMHEADCHUNK:" + std::to_string(row_begin) + ":" +
+                        std::to_string(row_end);
+    const auto prefix = "mach.output." + std::to_string(chunk) + "." + source + "|";
+    const auto &packed_tensor =
+        required_tensor(file_, prefix + "qp", GgmlType::i8);
+    const auto &scale_tensor =
+        required_tensor(file_, prefix + "gscale", GgmlType::f16);
+
+    std::span<const std::uint32_t> protected_rows;
+    std::span<const std::uint16_t> protected_bf16;
+    if (const auto *tensor = file_.find_tensor(prefix + "prot_rows")) {
+        if (tensor->type != GgmlType::i32) {
+            throw std::runtime_error("model: invalid protected output row indexes");
+        }
+        protected_rows = view<std::uint32_t>(file_, *tensor);
+        const auto &dense =
+            required_tensor(file_, prefix + "prot_dense", GgmlType::bf16);
+        protected_bf16 = view<std::uint16_t>(file_, dense);
+    }
+    return {
+        rows,
+        config_.hidden,
+        view<std::uint8_t>(file_, packed_tensor),
+        view<std::uint16_t>(file_, scale_tensor),
+        protected_rows,
+        protected_bf16,
+    };
 }
 
 MachExpertMatrix MachModel::expert(
