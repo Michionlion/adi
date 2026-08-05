@@ -106,7 +106,17 @@ int main() {
     std::vector<std::uint16_t> norm_weight(2, 0x3F80U);
     std::vector<float> norm_input{3.0F, 4.0F};
     std::vector<float> norm_output(2);
-    adi::rms_norm(norm_input, norm_weight, 0.0F, norm_output);
+    adi::rms_norm(norm_input, norm_weight, 0.0F, 0.0F, norm_output);
     assert(std::abs(norm_output[0] - 3.0F / std::sqrt(12.5F)) < 1e-6F);
     assert(std::abs(norm_output[1] - 4.0F / std::sqrt(12.5F)) < 1e-6F);
+
+    std::vector<std::uint16_t> zero_centered_weight(2, 0);
+    adi::rms_norm(
+        norm_input, zero_centered_weight, 1.0F, 0.0F, norm_output);
+    assert(std::abs(norm_output[0] - 3.0F / std::sqrt(12.5F)) < 1e-6F);
+    assert(std::abs(norm_output[1] - 4.0F / std::sqrt(12.5F)) < 1e-6F);
+
+    std::vector<float> tiny{1.0e-5F};
+    adi::l2_normalize(tiny, 1.0e-6F);
+    assert(std::abs(tiny[0] - 1.0e-5F / std::sqrt(1.0001e-6F)) < 1e-7F);
 }

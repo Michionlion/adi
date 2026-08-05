@@ -81,6 +81,11 @@ struct DecoderScratch {
 [[nodiscard]] std::array<ExpertRoute, 8> top_experts(
     std::span<const float> logits);
 
+[[nodiscard]] std::uint32_t gated_delta_key_head(
+    std::uint32_t value_head,
+    std::uint32_t value_heads,
+    std::uint32_t key_heads);
+
 [[nodiscard]] std::array<ExpertRoute, 8> moe_forward(
     const MachModel &model,
     std::uint32_t layer,

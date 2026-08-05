@@ -19,6 +19,9 @@ void normalize_head(
     std::span<float> values,
     std::span<const std::uint16_t> weights,
     float epsilon) {
+    if (values.empty() || values.size() != weights.size()) {
+        throw std::invalid_argument("attention norm shape mismatch");
+    }
     float squares = 0.0F;
     for (const auto value : values) {
         squares += value * value;
@@ -26,7 +29,7 @@ void normalize_head(
     const float scale =
         1.0F / std::sqrt(squares / static_cast<float>(values.size()) + epsilon);
     for (std::size_t index = 0; index < values.size(); ++index) {
-        values[index] *= scale * bf16_to_f32(weights[index]);
+        values[index] *= scale * (1.0F + bf16_to_f32(weights[index]));
     }
 }
 
@@ -93,6 +96,17 @@ std::array<ExpertRoute, 8> top_experts(std::span<const float> logits) {
     return routes;
 }
 
+std::uint32_t gated_delta_key_head(
+    std::uint32_t value_head,
+    std::uint32_t value_heads,
+    std::uint32_t key_heads) {
+    if (key_heads == 0 || value_heads == 0 || value_heads % key_heads != 0 ||
+        value_head >= value_heads) {
+        throw std::invalid_argument("Gated DeltaNet head geometry is invalid");
+    }
+    return value_head / (value_heads / key_heads);
+}
+
 std::array<ExpertRoute, 8> moe_forward(
     const MachModel &model,
     std::uint32_t layer,
@@ -113,9 +127,9 @@ std::array<ExpertRoute, 8> moe_forward(
 
     std::fill(output.begin(), output.end(), 0.0F);
     std::array<std::exception_ptr, 8> failures;
-    std::array<std::thread, 8> workers;
+    std::array<std::jthread, 8> workers;
     for (std::size_t route_index = 0; route_index < routes.size(); ++route_index) {
-        workers[route_index] = std::thread([&, route_index] {
+        workers[route_index] = std::jthread([&, route_index] {
             try {
                 const auto route = routes[route_index];
                 auto &worker = scratch.experts[route_index];
@@ -393,14 +407,7 @@ void linear_attention_forward(
         for (auto vector : {
                  query.subspan(static_cast<std::size_t>(head) * head_size, head_size),
                  key.subspan(static_cast<std::size_t>(head) * head_size, head_size)}) {
-            float squares = 0.0F;
-            for (const auto component : vector) {
-                squares += component * component;
-            }
-            const float scale = 1.0F / std::max(std::sqrt(squares), epsilon);
-            for (auto &component : vector) {
-                component *= scale;
-            }
+            l2_normalize(vector, epsilon);
         }
     }
 
@@ -420,7 +427,8 @@ void linear_attention_forward(
 
     const float output_scale = 1.0F / std::sqrt(static_cast<float>(head_size));
     for (std::uint32_t head = 0; head < value_heads; ++head) {
-        const auto key_head = head % key_heads;
+        const auto key_head =
+            gated_delta_key_head(head, value_heads, key_heads);
         const auto q = query.subspan(
             static_cast<std::size_t>(key_head) * head_size, head_size);
         const auto k = key.subspan(
@@ -464,7 +472,7 @@ void linear_attention_forward(
         auto destination = std::span<float>(
             scratch.normalized.data() + static_cast<std::size_t>(head) * head_size,
             head_size);
-        backend.normalize_rms(source, norm, epsilon, destination);
+        backend.normalize_rms(source, norm, 0.0F, epsilon, destination);
         for (std::uint32_t index = 0; index < head_size; ++index) {
             destination[index] *= silu(
                 scratch.gate[static_cast<std::size_t>(head) * head_size + index]);
@@ -499,6 +507,7 @@ void decode_token(
         backend.normalize_rms(
             scratch.hidden,
             model.bf16_vector(prefix + "input_layernorm.weight"),
+            1.0F,
             1.0e-6F,
             scratch.normalized);
         if ((layer + 1) % 4 == 0) {
@@ -527,6 +536,7 @@ void decode_token(
         backend.normalize_rms(
             scratch.hidden,
             model.bf16_vector(prefix + "post_attention_layernorm.weight"),
+            1.0F,
             1.0e-6F,
             scratch.normalized);
         (void)moe_forward(
@@ -543,6 +553,7 @@ void decode_token(
     backend.normalize_rms(
         scratch.hidden,
         model.bf16_vector("model.language_model.norm.weight"),
+        1.0F,
         1.0e-6F,
         scratch.normalized);
     for (std::uint32_t chunk = 0; chunk < 8; ++chunk) {

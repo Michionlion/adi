@@ -90,8 +90,11 @@ void bf16_matvec(
 void rms_norm(
     std::span<const float> input,
     std::span<const std::uint16_t> weight_bf16,
+    float weight_offset,
     float epsilon,
     std::span<float> output);
+
+void l2_normalize(std::span<float> values, float epsilon);
 
 [[nodiscard]] float silu(float value) noexcept;
 [[nodiscard]] float sigmoid(float value) noexcept;

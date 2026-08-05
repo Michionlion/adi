@@ -32,7 +32,7 @@ void parallel_ranges(
         function(0, count);
         return;
     }
-    std::vector<std::thread> threads;
+    std::vector<std::jthread> threads;
     threads.reserve(workers - 1);
     for (std::uint32_t worker = 0; worker + 1 < workers; ++worker) {
         const auto begin = count * worker / workers;
@@ -501,6 +501,7 @@ void bf16_matvec(
 void rms_norm(
     std::span<const float> input,
     std::span<const std::uint16_t> weight_bf16,
+    float weight_offset,
     float epsilon,
     std::span<float> output) {
     if (input.size() != weight_bf16.size() || output.size() != input.size() ||
@@ -514,7 +515,22 @@ void rms_norm(
     const float scale =
         1.0F / std::sqrt(squares / static_cast<float>(input.size()) + epsilon);
     for (std::size_t index = 0; index < input.size(); ++index) {
-        output[index] = input[index] * scale * bf16_to_f32(weight_bf16[index]);
+        output[index] = input[index] * scale *
+                        (weight_offset + bf16_to_f32(weight_bf16[index]));
+    }
+}
+
+void l2_normalize(std::span<float> values, float epsilon) {
+    if (values.empty() || epsilon < 0.0F) {
+        throw std::invalid_argument("L2 norm shape or epsilon is invalid");
+    }
+    float squares = 0.0F;
+    for (const auto value : values) {
+        squares += value * value;
+    }
+    const float scale = 1.0F / std::sqrt(squares + epsilon);
+    for (auto &value : values) {
+        value *= scale;
     }
 }
 

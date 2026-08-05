@@ -26,4 +26,9 @@ int main() {
         sum += routes[index].weight;
     }
     assert(std::abs(sum - 1.0F) < 1e-6F);
+
+    for (std::uint32_t value_head = 0; value_head < 32; ++value_head) {
+        assert(adi::gated_delta_key_head(value_head, 32, 16) ==
+               value_head / 2);
+    }
 }
