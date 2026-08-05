@@ -10,9 +10,10 @@ The initial server accepts JSON bodies with:
 
 - `input`: a string or an array of text-only `system`, `user`, and `assistant`
   messages;
-- `model`: optional response label;
-- `max_output_tokens`: non-negative integer;
-- `temperature`: non-negative number (`0` selects greedy decoding);
+- `model`: optional; when present it must equal the loaded model's
+  `general.name`;
+- `max_output_tokens`: positive integer;
+- `temperature`: `0` for greedy decoding or a number in `[0.0001, 2]`;
 - `top_p`: number in `(0, 1]`;
 - `seed`: non-negative integer;
 - `stream`: boolean; `true` returns Responses API server-sent events.
@@ -40,5 +41,14 @@ Successful responses use the Responses API `response` object with one
 assistant `message`, one `output_text` content item, and input/output/total
 token usage. Streaming responses emit the normal lifecycle from
 `response.created` through `response.completed`, including UTF-8-safe
-`response.output_text.delta` events. Errors use an `error` object and an HTTP
-4xx status, or an SSE `error` event after streaming headers have been sent.
+`response.output_text.delta` events. Hitting `max_output_tokens` instead
+returns status `incomplete`, `incomplete_details.reason` set to `max_tokens`,
+and a terminal `response.incomplete` event. Errors use an `error` object and
+an HTTP 4xx status, or an SSE `error` event after streaming headers have been
+sent.
+
+Header reads have a 15-second deadline, body reads have a 30-second deadline,
+socket writes have a 15-second no-progress deadline, and a request has a
+30-minute wall-clock deadline. A disconnected peer cancels generation at the
+next token boundary. These bounds keep the intentionally serialized inference
+slot from being held indefinitely by network I/O.
