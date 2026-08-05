@@ -31,7 +31,6 @@ struct GenerationResult {
 };
 
 using TokenCallback = std::function<void(std::string_view)>;
-using CancelCallback = std::function<bool()>;
 
 [[nodiscard]] std::uint32_t sample_token(
     std::span<const float> logits,

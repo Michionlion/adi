@@ -1,5 +1,6 @@
 #include "adi/tokenizer.hpp"
 #include "chat.hpp"
+#include "bpe.hpp"
 #include "unicode.hpp"
 #include "utf8.hpp"
 
@@ -57,9 +58,21 @@ Tokenizer::Tokenizer(const MachModel &model) {
         [](const auto &left, const auto &right) {
             return left.first.size() > right.first.size();
         });
-    merge_ranks_.reserve(merges.size());
+    merge_rules_.reserve(merges.size());
     for (std::uint32_t rank = 0; rank < merges.size(); ++rank) {
-        if (!merge_ranks_.emplace(std::string(merges[rank]), rank).second) {
+        const auto separator = merges[rank].find(' ');
+        if (separator == std::string_view::npos) {
+            throw std::runtime_error("tokenizer: invalid BPE merge");
+        }
+        const auto left = token_ids_.at(merges[rank].substr(0, separator));
+        const auto right = token_ids_.at(merges[rank].substr(separator + 1));
+        const auto combined = token_ids_.at(
+            std::string(merges[rank].substr(0, separator)) +
+            std::string(merges[rank].substr(separator + 1)));
+        if (!merge_rules_
+                 .emplace(bpe_pair_key(left, right),
+                          std::pair{rank, combined})
+                 .second) {
             throw std::runtime_error("tokenizer: duplicate BPE merge");
         }
     }
@@ -90,10 +103,15 @@ Tokenizer::Tokenizer(const MachModel &model) {
     }
 }
 
-std::vector<std::uint32_t> Tokenizer::encode(std::string_view text) {
+std::vector<std::uint32_t> Tokenizer::encode(
+    std::string_view text,
+    const CancelCallback &cancelled) {
     std::vector<std::uint32_t> result;
     std::size_t position = 0;
     while (position < text.size()) {
+        if (cancelled && cancelled()) {
+            throw std::runtime_error("tokenization cancelled");
+        }
         std::size_t special_position = std::string_view::npos;
         std::string_view special;
         std::uint32_t special_id = 0;
@@ -106,11 +124,14 @@ std::vector<std::uint32_t> Tokenizer::encode(std::string_view text) {
             }
         }
         if (special_position == std::string_view::npos) {
-            encode_normal(text.substr(position), result);
+            encode_normal(text.substr(position), result, cancelled);
             break;
         }
         if (special_position > position) {
-            encode_normal(text.substr(position, special_position - position), result);
+            encode_normal(
+                text.substr(position, special_position - position),
+                result,
+                cancelled);
         }
         result.push_back(special_id);
         position = special_position + special.size();
@@ -120,16 +141,27 @@ std::vector<std::uint32_t> Tokenizer::encode(std::string_view text) {
 
 void Tokenizer::encode_normal(
     std::string_view text,
-    std::vector<std::uint32_t> &output) {
+    std::vector<std::uint32_t> &output,
+    const CancelCallback &cancelled) {
+    if (cancelled && cancelled()) {
+        throw std::runtime_error("tokenization cancelled");
+    }
     const auto normalized = normalize_nfc(text);
+    if (cancelled && cancelled()) {
+        throw std::runtime_error("tokenization cancelled");
+    }
     for (const auto &piece : qwen35_pretokenize(normalized)) {
-        encode_piece(piece, output);
+        encode_piece(piece, output, cancelled);
     }
 }
 
 void Tokenizer::encode_piece(
     std::string_view piece,
-    std::vector<std::uint32_t> &output) {
+    std::vector<std::uint32_t> &output,
+    const CancelCallback &cancelled) {
+    if (cancelled && cancelled()) {
+        throw std::runtime_error("tokenization cancelled");
+    }
     std::string encoded;
     for (const auto byte : piece) {
         encoded += byte_encoder_.at(static_cast<unsigned char>(byte));
@@ -143,50 +175,15 @@ void Tokenizer::encode_piece(
             found->second.tokens.end());
         return;
     }
-    std::vector<std::string> symbols;
+
+    std::vector<std::uint32_t> symbols;
     for (const auto codepoint : utf8_codepoints(encoded)) {
         std::string symbol;
         append_utf8(symbol, codepoint);
-        symbols.push_back(std::move(symbol));
+        symbols.push_back(token_ids_.at(symbol));
     }
-    while (symbols.size() > 1) {
-        std::uint32_t best_rank = std::numeric_limits<std::uint32_t>::max();
-        std::string best_left;
-        std::string best_right;
-        for (std::size_t index = 0; index + 1 < symbols.size(); ++index) {
-            const auto found =
-                merge_ranks_.find(symbols[index] + " " + symbols[index + 1]);
-            if (found != merge_ranks_.end() && found->second < best_rank) {
-                best_rank = found->second;
-                best_left = symbols[index];
-                best_right = symbols[index + 1];
-            }
-        }
-        if (best_rank == std::numeric_limits<std::uint32_t>::max()) {
-            break;
-        }
-        std::vector<std::string> merged;
-        for (std::size_t index = 0; index < symbols.size();) {
-            if (index + 1 < symbols.size() && symbols[index] == best_left &&
-                symbols[index + 1] == best_right) {
-                merged.push_back(symbols[index] + symbols[index + 1]);
-                index += 2;
-            } else {
-                merged.push_back(std::move(symbols[index]));
-                ++index;
-            }
-        }
-        symbols = std::move(merged);
-    }
-    std::vector<std::uint32_t> ids;
-    ids.reserve(symbols.size());
-    for (const auto &symbol : symbols) {
-        const auto found = token_ids_.find(symbol);
-        if (found == token_ids_.end()) {
-            throw std::runtime_error("tokenizer: BPE symbol is absent from vocabulary");
-        }
-        ids.push_back(found->second);
-    }
+    auto ids = bpe_merge(symbols, merge_rules_, cancelled);
+
     constexpr std::size_t maximum_cache_entries = 4096;
     constexpr std::size_t maximum_cacheable_piece_bytes = 256;
     if (piece.size() <= maximum_cacheable_piece_bytes) {

@@ -11,6 +11,7 @@ set(ADI_TEST_MODEL "" CACHE FILEPATH "Mach-1 GGUF used for checkpoint tests")
 
 add_library(adi_runtime STATIC
     src/backend.cpp
+    src/bpe.cpp
     src/chat.cpp
     src/executor.cpp
     src/generation.cpp
@@ -66,6 +67,11 @@ if(ADI_BUILD_TESTS)
     target_include_directories(adi_unicode_test PRIVATE src)
     add_test(NAME unicode COMMAND adi_unicode_test)
 
+    add_executable(adi_bpe_test tests/bpe_test.cpp)
+    target_link_libraries(adi_bpe_test PRIVATE adi_runtime)
+    target_include_directories(adi_bpe_test PRIVATE src)
+    add_test(NAME bpe COMMAND adi_bpe_test)
+
     add_executable(adi_chat_test tests/chat_test.cpp)
     target_link_libraries(adi_chat_test PRIVATE adi_runtime)
     target_include_directories(adi_chat_test PRIVATE src)
@@ -97,6 +103,7 @@ if(ADI_BUILD_TESTS)
             adi_generation_test
             adi_json_test
             adi_unicode_test
+            adi_bpe_test
             adi_chat_test
             adi_server_test
             adi_tokenizer_test

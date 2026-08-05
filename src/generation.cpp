@@ -103,7 +103,7 @@ GenerationResult generate_from_prompt(
         options.top_p <= 0.0F || options.top_p > 1.0F) {
         throw std::invalid_argument("invalid generation options");
     }
-    const auto prompt_tokens = tokenizer.encode(formatted_prompt);
+    const auto prompt_tokens = tokenizer.encode(formatted_prompt, cancelled);
     if (prompt_tokens.empty() ||
         prompt_tokens.size() + options.max_output_tokens > model.config().context) {
         throw std::invalid_argument("prompt exceeds model context");
