@@ -20,6 +20,10 @@ from typing import Iterable
 
 
 ALIGNMENT = 32
+QWEN35_PATTERN = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|"
+    r"\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
 GGUF_TYPES = {
     "F32": 0, "F16": 1, "I8": 24, "U8": 24, "I16": 25, "U16": 25,
     "I32": 26, "U32": 26, "I64": 27, "U64": 27, "F64": 28, "BF16": 30,
@@ -146,10 +150,72 @@ def collect_checkpoint(root: Path) -> list[TensorSource]:
 def checkpoint_metadata(root: Path) -> dict[str, object]:
     config = json.loads((root / "config.json").read_text())
     text = config["text_config"]
+    expected_layers = [
+        "full_attention" if (layer + 1) % 4 == 0 else "linear_attention"
+        for layer in range(40)
+    ]
+    if (
+        config.get("model_type") != "qwen3_5_moe"
+        or config.get("architectures") != ["Qwen3_5MoeForConditionalGeneration"]
+        or text.get("model_type") != "qwen3_5_moe_text"
+        or text.get("layer_types") != expected_layers
+    ):
+        raise ValueError("checkpoint is not the supported Qwen3.5-MoE architecture")
     rope = text["rope_parameters"]
     codec = json.loads((root / "packed/experts/codec.json").read_text())
     cb = codec["cb_params"]
     tokenizer = json.loads((root / "tokenizer.json").read_text())
+    expected_pre_tokenizer = {
+        "type": "Sequence",
+        "pretokenizers": [
+            {
+                "type": "Split",
+                "pattern": {"Regex": QWEN35_PATTERN},
+                "behavior": "Isolated",
+                "invert": False,
+            },
+            {
+                "type": "ByteLevel",
+                "add_prefix_space": False,
+                "trim_offsets": False,
+                "use_regex": False,
+            },
+        ],
+    }
+    expected_decoder = {
+        "type": "ByteLevel",
+        "add_prefix_space": False,
+        "trim_offsets": False,
+        "use_regex": False,
+    }
+    if (
+        tokenizer.get("normalizer") != {"type": "NFC"}
+        or tokenizer.get("pre_tokenizer") != expected_pre_tokenizer
+        or tokenizer.get("decoder") != expected_decoder
+        or {
+            key: value
+            for key, value in tokenizer.get("model", {}).items()
+            if key not in {"vocab", "merges"}
+        }
+        != {
+            "type": "BPE",
+            "dropout": None,
+            "unk_token": None,
+            "continuing_subword_prefix": "",
+            "end_of_word_suffix": "",
+            "fuse_unk": False,
+            "byte_fallback": False,
+            "ignore_merges": False,
+        }
+        or any(
+            added.get("single_word") is not False
+            or added.get("lstrip") is not False
+            or added.get("rstrip") is not False
+            or added.get("normalized") is not False
+            for added in tokenizer.get("added_tokens", [])
+        )
+    ):
+        raise ValueError("checkpoint has an unsupported tokenizer pipeline")
     vocabulary_size = int(text["vocab_size"])
     tokens = [""] * vocabulary_size
     token_types = [5] * vocabulary_size
@@ -160,6 +226,10 @@ def checkpoint_metadata(root: Path) -> dict[str, object]:
         token_id = int(added["id"])
         tokens[token_id] = added["content"]
         token_types[token_id] = 3 if added.get("special", False) else 4
+    populated = [token_id for token_id, token in enumerate(tokens) if token]
+    effective_vocabulary = max(populated) + 1
+    if any(not tokens[token_id] for token_id in range(effective_vocabulary)):
+        raise ValueError("tokenizer vocabulary has a non-tail ID gap")
     for token_id, token in enumerate(tokens):
         if not token:
             tokens[token_id] = f"[PAD{token_id}]"
@@ -174,6 +244,10 @@ def checkpoint_metadata(root: Path) -> dict[str, object]:
         "adi.ne_codec": codec["ne_tier"]["codec"],
         "adi.embedding_codec": "affine_int4_g64_exceptions",
         "adi.head_codec": "int5_g64",
+        "adi.regular_rms_norm": "qwen3next_zero_centered",
+        "adi.gated_rms_norm": "multiplicative",
+        "adi.tokenizer_normalizer": "nfc_unicode_15_0",
+        "adi.tokenizer_pretokenizer": "qwen35_unicode_16_0_regex",
         "adi.expert.k_num": 3,
         "adi.expert.k_den": 2,
         "adi.expert.l": int(cb["L"]),

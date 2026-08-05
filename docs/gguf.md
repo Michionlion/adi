@@ -17,10 +17,28 @@ GGUF readers can determine every tensor's size and safely skip it.
 | `adi.ne_codec` | string | `canon_rht_bitshift_trellis_intlattice` |
 | `adi.embedding_codec` | string | `affine_int4_g64_exceptions` |
 | `adi.head_codec` | string | `int5_g64` |
+| `adi.regular_rms_norm` | string | `qwen3next_zero_centered` |
+| `adi.gated_rms_norm` | string | `multiplicative` |
+| `adi.tokenizer_normalizer` | string | `nfc_unicode_15_0` |
+| `adi.tokenizer_pretokenizer` | string | `qwen35_unicode_16_0_regex` |
 
 Qwen architecture and tokenizer metadata use the established llama.cpp GGUF
 keys where they apply. ADI deliberately reads only the values required by its
 single supported model architecture.
+
+Format version 1 copies `extras.safetensors` unchanged. Regular Qwen3Next
+RMSNorm weights—including decoder input/post-attention norms, the final norm,
+and full-attention Q/K norms—are zero-centered and execute with a `1 + weight`
+multiplier. Gated DeltaNet `RMSNormGated` weights are conventional
+multiplicative weights and execute without the offset. Original version-1
+files predate the explicit metadata keys above but have the same required
+semantics.
+
+The tokenizer contract is the checkpoint's Unicode 15.0 NFC normalizer
+followed by its Unicode 16.0 Qwen3.5 regex split and byte-level BPE. The
+versions differ because that is the pipeline implemented by the checkpoint's
+`tokenizers` release. The packer rejects a
+checkpoint whose `tokenizer.json` pipeline differs from that contract.
 
 The initial Mach-1 expert codec is identified by these values:
 

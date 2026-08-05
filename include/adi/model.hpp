@@ -30,6 +30,7 @@ class MachModel {
     explicit MachModel(const std::filesystem::path &path);
 
     [[nodiscard]] const MachConfig &config() const noexcept { return config_; }
+    [[nodiscard]] std::string_view name() const noexcept { return name_; }
     [[nodiscard]] const GgufFile &gguf() const noexcept { return file_; }
     [[nodiscard]] MachExpertMatrix expert(
         std::uint32_t layer,
@@ -47,8 +48,11 @@ class MachModel {
         std::string_view source_name) const;
 
   private:
+    void validate_manifest() const;
+
     GgufFile file_;
     MachConfig config_;
+    std::string_view name_;
 };
 
 } // namespace adi

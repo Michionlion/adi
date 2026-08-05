@@ -5,7 +5,7 @@ ADI has one vertical execution path:
 ```text
 Responses request
   -> prompt rendering and BPE
-  -> Qwen3.6 model loop
+  -> Qwen3.5-MoE model loop
   -> backend operation table
   -> CPU additive and dense kernels
   -> sampler
