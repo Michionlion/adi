@@ -9,6 +9,7 @@ add_compile_options(-pipe)
 option(ADI_BUILD_TESTS "Build ADI tests" ON)
 
 add_library(adi_runtime STATIC
+    src/backend.cpp
     src/executor.cpp
     src/generation.cpp
     src/gguf.cpp
@@ -54,6 +55,16 @@ if(ADI_BUILD_TESTS)
     add_executable(adi_json_test tests/json_test.cpp)
     target_link_libraries(adi_json_test PRIVATE adi_runtime)
     add_test(NAME json COMMAND adi_json_test)
+
+    foreach(test_target
+            adi_smoke_test
+            adi_gguf_test
+            adi_kernels_test
+            adi_executor_test
+            adi_generation_test
+            adi_json_test)
+        target_compile_options(${test_target} PRIVATE -UNDEBUG)
+    endforeach()
 
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)

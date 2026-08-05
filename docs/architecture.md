@@ -44,7 +44,8 @@ is outside the first implementation.
 ## Backend seam
 
 The model calls a compact operation table for dense GEMV, additive GEMV,
-normalization, attention, and small vector operations. The CPU table is the
+embedding lookup, output projection, and RMS normalization. Attention, routing,
+sampling, and the layer loop remain one shared model path. The CPU table is the
 only implementation initially. A later CUDA table must consume the same tensor
 views and produce the same results; it must not fork model execution.
 

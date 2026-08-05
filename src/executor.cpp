@@ -98,7 +98,8 @@ std::array<ExpertRoute, 8> moe_forward(
     std::uint32_t layer,
     std::span<const float> input,
     std::span<float> output,
-    MoeScratch &scratch) {
+    MoeScratch &scratch,
+    const Backend &backend) {
     const auto &config = model.config();
     if (input.size() != config.hidden || output.size() != config.hidden) {
         throw std::invalid_argument("MoE input shape mismatch");
@@ -107,7 +108,7 @@ std::array<ExpertRoute, 8> moe_forward(
     const auto router =
         model.bf16_matrix(prefix + "mlp.gate.weight");
     scratch.router_logits.resize(config.experts);
-    bf16_matvec(router, input, scratch.router_logits);
+    backend.dense_bf16_matvec(router, input, scratch.router_logits);
     const auto routes = top_experts(scratch.router_logits);
 
     std::fill(output.begin(), output.end(), 0.0F);
@@ -122,12 +123,12 @@ std::array<ExpertRoute, 8> moe_forward(
                 worker.up.resize(config.expert_hidden);
                 worker.activated.resize(config.expert_hidden);
                 worker.projected.resize(config.hidden);
-                mach_expert_matvec(
+                backend.expert_matvec(
                     model.expert(layer, route.expert, ExpertProjection::gate),
                     input,
                     worker.gate,
                     worker.codec);
-                mach_expert_matvec(
+                backend.expert_matvec(
                     model.expert(layer, route.expert, ExpertProjection::up),
                     input,
                     worker.up,
@@ -136,7 +137,7 @@ std::array<ExpertRoute, 8> moe_forward(
                     worker.activated[index] =
                         silu(worker.gate[index]) * worker.up[index];
                 }
-                mach_expert_matvec(
+                backend.expert_matvec(
                     model.expert(layer, route.expert, ExpertProjection::down),
                     worker.activated,
                     worker.projected,
@@ -165,12 +166,12 @@ std::array<ExpertRoute, 8> moe_forward(
     scratch.shared_up.resize(config.expert_hidden);
     scratch.shared_down.resize(config.hidden);
     const auto shared_prefix = prefix + "mlp.shared_expert.";
-    mach_ne_matvec(
+    backend.ne_matvec(
         model.non_expert(layer, shared_prefix + "gate_proj.weight"),
         input,
         scratch.shared_gate,
         scratch.shared_codec);
-    mach_ne_matvec(
+    backend.ne_matvec(
         model.non_expert(layer, shared_prefix + "up_proj.weight"),
         input,
         scratch.shared_up,
@@ -179,7 +180,7 @@ std::array<ExpertRoute, 8> moe_forward(
         scratch.shared_gate[index] =
             silu(scratch.shared_gate[index]) * scratch.shared_up[index];
     }
-    mach_ne_matvec(
+    backend.ne_matvec(
         model.non_expert(layer, shared_prefix + "down_proj.weight"),
         scratch.shared_gate,
         scratch.shared_down,
@@ -188,7 +189,8 @@ std::array<ExpertRoute, 8> moe_forward(
     const auto shared_gate =
         model.bf16_matrix(prefix + "mlp.shared_expert_gate.weight");
     float shared_weight = 0.0F;
-    bf16_matvec(shared_gate, input, std::span<float>(&shared_weight, 1));
+    backend.dense_bf16_matvec(
+        shared_gate, input, std::span<float>(&shared_weight, 1));
     shared_weight = sigmoid(shared_weight);
     for (std::size_t index = 0; index < output.size(); ++index) {
         output[index] += shared_weight * scratch.shared_down[index];
@@ -203,7 +205,8 @@ void full_attention_forward(
     std::span<const float> input,
     std::span<float> output,
     FullAttentionState &state,
-    FullAttentionScratch &scratch) {
+    FullAttentionScratch &scratch,
+    const Backend &backend) {
     constexpr std::uint32_t query_heads = 16;
     constexpr std::uint32_t kv_heads = 2;
     constexpr std::uint32_t head_size = 256;
@@ -220,17 +223,17 @@ void full_attention_forward(
     scratch.key.resize(kv_heads * head_size);
     scratch.value.resize(kv_heads * head_size);
     scratch.attended.resize(query_heads * head_size);
-    mach_ne_matvec(
+    backend.ne_matvec(
         model.non_expert(layer, prefix + "q_proj.weight"),
         input,
         scratch.query_gate,
         scratch.codec);
-    mach_ne_matvec(
+    backend.ne_matvec(
         model.non_expert(layer, prefix + "k_proj.weight"),
         input,
         scratch.key,
         scratch.codec);
-    mach_ne_matvec(
+    backend.ne_matvec(
         model.non_expert(layer, prefix + "v_proj.weight"),
         input,
         scratch.value,
@@ -298,7 +301,7 @@ void full_attention_forward(
             attended[index] *= sigmoid(scratch.query_gate[gate_offset + index]);
         }
     }
-    mach_ne_matvec(
+    backend.ne_matvec(
         model.non_expert(layer, prefix + "o_proj.weight"),
         scratch.attended,
         output,
@@ -311,7 +314,8 @@ void linear_attention_forward(
     std::span<const float> input,
     std::span<float> output,
     LinearAttentionState &state,
-    LinearAttentionScratch &scratch) {
+    LinearAttentionScratch &scratch,
+    const Backend &backend) {
     constexpr std::uint32_t key_heads = 16;
     constexpr std::uint32_t value_heads = 32;
     constexpr std::uint32_t head_size = 128;
@@ -332,21 +336,21 @@ void linear_attention_forward(
     scratch.beta.resize(value_heads);
     scratch.recurrent_output.resize(value_size);
     scratch.normalized.resize(value_size);
-    mach_ne_matvec(
+    backend.ne_matvec(
         model.non_expert(layer, prefix + "in_proj_qkv.weight"),
         input,
         scratch.qkv,
         scratch.codec);
-    mach_ne_matvec(
+    backend.ne_matvec(
         model.non_expert(layer, prefix + "in_proj_z.weight"),
         input,
         scratch.gate,
         scratch.codec);
-    bf16_matvec(
+    backend.dense_bf16_matvec(
         model.bf16_matrix(prefix + "in_proj_a.weight"),
         input,
         scratch.alpha);
-    bf16_matvec(
+    backend.dense_bf16_matvec(
         model.bf16_matrix(prefix + "in_proj_b.weight"),
         input,
         scratch.beta);
@@ -460,13 +464,13 @@ void linear_attention_forward(
         auto destination = std::span<float>(
             scratch.normalized.data() + static_cast<std::size_t>(head) * head_size,
             head_size);
-        rms_norm(source, norm, epsilon, destination);
+        backend.normalize_rms(source, norm, epsilon, destination);
         for (std::uint32_t index = 0; index < head_size; ++index) {
             destination[index] *= silu(
                 scratch.gate[static_cast<std::size_t>(head) * head_size + index]);
         }
     }
-    mach_ne_matvec(
+    backend.ne_matvec(
         model.non_expert(layer, prefix + "out_proj.weight"),
         scratch.normalized,
         output,
@@ -478,7 +482,8 @@ void decode_token(
     std::uint32_t token,
     DecoderState &state,
     std::span<float> logits,
-    DecoderScratch &scratch) {
+    DecoderScratch &scratch,
+    const Backend &backend) {
     const auto &config = model.config();
     if (token >= config.vocabulary || logits.size() != config.vocabulary) {
         throw std::invalid_argument("decoder token or logits shape mismatch");
@@ -487,11 +492,11 @@ void decode_token(
     scratch.normalized.resize(config.hidden);
     scratch.attention.resize(config.hidden);
     scratch.feed_forward.resize(config.hidden);
-    mach_embedding_row(model.embedding(), token, scratch.hidden);
+    backend.embedding_row(model.embedding(), token, scratch.hidden);
 
     for (std::uint32_t layer = 0; layer < config.layers; ++layer) {
         const auto prefix = layer_prefix(layer);
-        rms_norm(
+        backend.normalize_rms(
             scratch.hidden,
             model.bf16_vector(prefix + "input_layernorm.weight"),
             1.0e-6F,
@@ -504,7 +509,8 @@ void decode_token(
                 scratch.normalized,
                 scratch.attention,
                 state.full_attention[layer],
-                scratch.full_attention);
+                scratch.full_attention,
+                backend);
         } else {
             linear_attention_forward(
                 model,
@@ -512,12 +518,13 @@ void decode_token(
                 scratch.normalized,
                 scratch.attention,
                 state.linear_attention[layer],
-                scratch.linear_attention);
+                scratch.linear_attention,
+                backend);
         }
         for (std::size_t index = 0; index < scratch.hidden.size(); ++index) {
             scratch.hidden[index] += scratch.attention[index];
         }
-        rms_norm(
+        backend.normalize_rms(
             scratch.hidden,
             model.bf16_vector(prefix + "post_attention_layernorm.weight"),
             1.0e-6F,
@@ -527,19 +534,20 @@ void decode_token(
             layer,
             scratch.normalized,
             scratch.feed_forward,
-            scratch.moe);
+            scratch.moe,
+            backend);
         for (std::size_t index = 0; index < scratch.hidden.size(); ++index) {
             scratch.hidden[index] += scratch.feed_forward[index];
         }
     }
-    rms_norm(
+    backend.normalize_rms(
         scratch.hidden,
         model.bf16_vector("model.language_model.norm.weight"),
         1.0e-6F,
         scratch.normalized);
     for (std::uint32_t chunk = 0; chunk < 8; ++chunk) {
         const auto head = model.head_chunk(chunk);
-        mach_head_matvec(
+        backend.head_matvec(
             head,
             scratch.normalized,
             logits.subspan(static_cast<std::size_t>(chunk) * head.rows, head.rows));

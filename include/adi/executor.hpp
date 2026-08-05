@@ -1,5 +1,6 @@
 #pragma once
 
+#include "adi/backend.hpp"
 #include "adi/model.hpp"
 
 #include <array>
@@ -85,7 +86,8 @@ struct DecoderScratch {
     std::uint32_t layer,
     std::span<const float> input,
     std::span<float> output,
-    MoeScratch &scratch);
+    MoeScratch &scratch,
+    const Backend &backend = cpu_backend());
 
 void full_attention_forward(
     const MachModel &model,
@@ -94,7 +96,8 @@ void full_attention_forward(
     std::span<const float> input,
     std::span<float> output,
     FullAttentionState &state,
-    FullAttentionScratch &scratch);
+    FullAttentionScratch &scratch,
+    const Backend &backend = cpu_backend());
 
 void linear_attention_forward(
     const MachModel &model,
@@ -102,13 +105,15 @@ void linear_attention_forward(
     std::span<const float> input,
     std::span<float> output,
     LinearAttentionState &state,
-    LinearAttentionScratch &scratch);
+    LinearAttentionScratch &scratch,
+    const Backend &backend = cpu_backend());
 
 void decode_token(
     const MachModel &model,
     std::uint32_t token,
     DecoderState &state,
     std::span<float> logits,
-    DecoderScratch &scratch);
+    DecoderScratch &scratch,
+    const Backend &backend = cpu_backend());
 
 } // namespace adi
