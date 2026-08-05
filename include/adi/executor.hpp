@@ -40,6 +40,22 @@ struct FullAttentionScratch {
     std::vector<float> scores;
 };
 
+struct LinearAttentionState {
+    std::vector<float> convolution;
+    std::vector<float> recurrent;
+};
+
+struct LinearAttentionScratch {
+    ExpertScratch codec;
+    std::vector<float> qkv;
+    std::vector<float> gate;
+    std::vector<float> convolved;
+    std::vector<float> alpha;
+    std::vector<float> beta;
+    std::vector<float> recurrent_output;
+    std::vector<float> normalized;
+};
+
 [[nodiscard]] std::array<ExpertRoute, 8> top_experts(
     std::span<const float> logits);
 
@@ -58,5 +74,13 @@ void full_attention_forward(
     std::span<float> output,
     FullAttentionState &state,
     FullAttentionScratch &scratch);
+
+void linear_attention_forward(
+    const MachModel &model,
+    std::uint32_t layer,
+    std::span<const float> input,
+    std::span<float> output,
+    LinearAttentionState &state,
+    LinearAttentionScratch &scratch);
 
 } // namespace adi

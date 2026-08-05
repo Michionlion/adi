@@ -43,6 +43,8 @@ class MachModel {
     [[nodiscard]] Bf16Matrix bf16_matrix(std::string_view source_name) const;
     [[nodiscard]] std::span<const std::uint16_t> bf16_vector(
         std::string_view source_name) const;
+    [[nodiscard]] std::span<const std::uint16_t> bf16_data(
+        std::string_view source_name) const;
 
   private:
     GgufFile file_;

@@ -226,6 +226,13 @@ std::span<const std::uint16_t> MachModel::bf16_vector(
     return view<std::uint16_t>(file_, tensor);
 }
 
+std::span<const std::uint16_t> MachModel::bf16_data(
+    std::string_view source_name) const {
+    const auto name = "hf." + std::string(source_name);
+    const auto &tensor = required_tensor(file_, name, GgmlType::bf16);
+    return view<std::uint16_t>(file_, tensor);
+}
+
 MachExpertMatrix MachModel::expert(
     std::uint32_t layer,
     std::uint32_t expert_index,
