@@ -39,6 +39,15 @@ python3 tools/pack_mach.py /path/to/Mach-1-Additive-35B \
 ./build/adi inspect models/Mach-1-Additive-35B.gguf
 ```
 
+Start the Responses API:
+
+```bash
+./build/adi serve --model models/Mach-1-Additive-35B.gguf \
+  --host 127.0.0.1 --port 8080
+```
+
+See [`docs/api.md`](docs/api.md) for the request shape and a curl example.
+
 ## Repository layout
 
 - `include/adi/`: public runtime API.

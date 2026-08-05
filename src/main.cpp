@@ -3,6 +3,7 @@
 #include "adi/generation.hpp"
 #include "adi/gguf.hpp"
 #include "adi/model.hpp"
+#include "adi/server.hpp"
 #include "adi/tokenizer.hpp"
 
 #include <algorithm>
@@ -369,6 +370,30 @@ int generate_text(int argc, char **argv) {
     return 0;
 }
 
+int serve_command(int argc, char **argv) {
+    adi::ServerOptions options;
+    for (int index = 2; index < argc; ++index) {
+        const std::string_view argument = argv[index];
+        if (argument == "--model" && index + 1 < argc) {
+            options.model = argv[++index];
+        } else if (argument == "--host" && index + 1 < argc) {
+            options.host = argv[++index];
+        } else if (argument == "--port" && index + 1 < argc) {
+            const auto port = parse_u32(argv[++index], "port");
+            if (port == 0 || port > 65535) {
+                throw std::invalid_argument("port is out of range");
+            }
+            options.port = static_cast<std::uint16_t>(port);
+        } else {
+            throw std::invalid_argument("invalid serve argument");
+        }
+    }
+    if (options.model.empty()) {
+        throw std::invalid_argument("--model is required");
+    }
+    adi::serve(options);
+}
+
 void usage() {
     std::cerr << "usage:\n"
               << "  adi --version\n"
@@ -383,6 +408,7 @@ void usage() {
               << "  adi decode-token MODEL.gguf TOKEN\n"
               << "  adi tokenize MODEL.gguf TEXT\n"
               << "  adi generate MODEL.gguf PROMPT [MAX_TOKENS]\n"
+              << "  adi serve --model MODEL.gguf [--host ADDRESS] [--port PORT]\n"
               << "  adi embedding-row MODEL.gguf TOKEN\n";
 }
 
@@ -485,6 +511,14 @@ int main(int argc, char **argv) {
     if ((argc == 4 || argc == 5) && std::string_view(argv[1]) == "generate") {
         try {
             return generate_text(argc, argv);
+        } catch (const std::exception &error) {
+            std::cerr << "adi: " << error.what() << '\n';
+            return 1;
+        }
+    }
+    if (argc >= 2 && std::string_view(argv[1]) == "serve") {
+        try {
+            return serve_command(argc, argv);
         } catch (const std::exception &error) {
             std::cerr << "adi: " << error.what() << '\n';
             return 1;

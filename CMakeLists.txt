@@ -4,6 +4,7 @@ project(adi VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+add_compile_options(-pipe)
 
 option(ADI_BUILD_TESTS "Build ADI tests" ON)
 
@@ -11,8 +12,10 @@ add_library(adi_runtime STATIC
     src/executor.cpp
     src/generation.cpp
     src/gguf.cpp
+    src/json.cpp
     src/kernels.cpp
     src/model.cpp
+    src/server.cpp
     src/tokenizer.cpp
     src/version.cpp
 )
@@ -47,6 +50,10 @@ if(ADI_BUILD_TESTS)
     add_executable(adi_generation_test tests/generation_test.cpp)
     target_link_libraries(adi_generation_test PRIVATE adi_runtime)
     add_test(NAME generation COMMAND adi_generation_test)
+
+    add_executable(adi_json_test tests/json_test.cpp)
+    target_link_libraries(adi_json_test PRIVATE adi_runtime)
+    add_test(NAME json COMMAND adi_json_test)
 
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)

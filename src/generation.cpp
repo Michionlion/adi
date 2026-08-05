@@ -69,12 +69,20 @@ GenerationResult generate(
     Tokenizer &tokenizer,
     std::string_view input,
     const GenerationOptions &options) {
+    return generate_from_prompt(
+        model, tokenizer, qwen_user_prompt(input), options);
+}
+
+GenerationResult generate_from_prompt(
+    const MachModel &model,
+    Tokenizer &tokenizer,
+    std::string_view formatted_prompt,
+    const GenerationOptions &options) {
     if (options.max_output_tokens > model.config().context ||
         options.temperature < 0.0F || options.top_p <= 0.0F || options.top_p > 1.0F) {
         throw std::invalid_argument("invalid generation options");
     }
-    const auto prompt = qwen_user_prompt(input);
-    const auto prompt_tokens = tokenizer.encode(prompt);
+    const auto prompt_tokens = tokenizer.encode(formatted_prompt);
     if (prompt_tokens.empty() ||
         prompt_tokens.size() + options.max_output_tokens > model.config().context) {
         throw std::invalid_argument("prompt exceeds model context");

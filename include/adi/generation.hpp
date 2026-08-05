@@ -35,4 +35,10 @@ struct GenerationResult {
     std::string_view input,
     const GenerationOptions &options);
 
+[[nodiscard]] GenerationResult generate_from_prompt(
+    const MachModel &model,
+    Tokenizer &tokenizer,
+    std::string_view formatted_prompt,
+    const GenerationOptions &options);
+
 } // namespace adi
