@@ -49,6 +49,43 @@ SUPPORTED_ADDED_TOKENS = {
     248076: "<|audio_pad|>",
 }
 
+SUPPORTED_TEXT_CONFIG = {
+    "attention_bias": False,
+    "attention_dropout": 0.0,
+    "attn_output_gate": True,
+    "dtype": "bfloat16",
+    "full_attention_interval": 4,
+    "head_dim": 256,
+    "hidden_act": "silu",
+    "hidden_size": 2048,
+    "linear_conv_kernel_dim": 4,
+    "linear_key_head_dim": 128,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 32,
+    "linear_value_head_dim": 128,
+    "max_position_embeddings": 262144,
+    "mlp_only_layers": [],
+    "model_type": "qwen3_5_moe_text",
+    "moe_intermediate_size": 512,
+    "num_attention_heads": 16,
+    "num_experts": 256,
+    "num_experts_per_tok": 8,
+    "num_hidden_layers": 40,
+    "num_key_value_heads": 2,
+    "rms_norm_eps": 1.0e-6,
+    "shared_expert_intermediate_size": 512,
+    "use_cache": True,
+    "vocab_size": 248320,
+    "mamba_ssm_dtype": "float32",
+}
+SUPPORTED_ROPE_PARAMETERS = {
+    "mrope_interleaved": True,
+    "mrope_section": [11, 11, 10],
+    "rope_type": "default",
+    "rope_theta": 10000000,
+    "partial_rotary_factor": 0.25,
+}
+
 
 @dataclass(frozen=True)
 class TensorSource:
@@ -105,9 +142,21 @@ def read_safetensors(path: Path, prefix: str) -> list[TensorSource]:
         if header_length > file_size - 8:
             raise ValueError(f"{path}: invalid safetensors header length")
         header = json.loads(source.read(header_length))
+    if not isinstance(header, dict):
+        raise ValueError(f"{path}: invalid safetensors header")
+    metadata = header.get("__metadata__")
+    if metadata is not None and (
+        not isinstance(metadata, dict)
+        or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in metadata.items()
+        )
+    ):
+        raise ValueError(f"{path}: invalid safetensors metadata")
 
     data_start = 8 + header_length
     tensors: list[TensorSource] = []
+    ranges: list[tuple[int, int, str]] = []
     for key in sorted(key for key in header if key != "__metadata__"):
         descriptor = header[key]
         dtype = descriptor["dtype"]
@@ -125,6 +174,7 @@ def read_safetensors(path: Path, prefix: str) -> list[TensorSource]:
             raise ValueError(f"{path}: byte count mismatch for {key}")
         if data_start + end > file_size:
             raise ValueError(f"{path}: tensor {key} points outside file")
+        ranges.append((begin, end, key))
         tensors.append(TensorSource(
             name=f"{prefix}{key}",
             path=path,
@@ -133,6 +183,13 @@ def read_safetensors(path: Path, prefix: str) -> list[TensorSource]:
             shape=shape,
             dtype=dtype,
         ))
+    position = 0
+    for begin, end, key in sorted(ranges):
+        if begin != position:
+            raise ValueError(f"{path}: tensor {key} has a gap or overlap")
+        position = end
+    if data_start + position != file_size:
+        raise ValueError(f"{path}: safetensors payload size mismatch")
     return tensors
 
 
@@ -238,9 +295,9 @@ def tokenizer_vocabulary(
             tokens[token_id] = f"[PAD{token_id}]"
     return tokens, token_types
 
-def checkpoint_metadata(root: Path) -> dict[str, object]:
-    config = json.loads((root / "config.json").read_text())
-    text = config["text_config"]
+
+
+def validate_model_config(config: dict[str, object]) -> dict[str, object]:
     expected_layers = [
         "full_attention" if (layer + 1) % 4 == 0 else "linear_attention"
         for layer in range(40)
@@ -248,13 +305,49 @@ def checkpoint_metadata(root: Path) -> dict[str, object]:
     if (
         config.get("model_type") != "qwen3_5_moe"
         or config.get("architectures") != ["Qwen3_5MoeForConditionalGeneration"]
-        or text.get("model_type") != "qwen3_5_moe_text"
-        or text.get("layer_types") != expected_layers
+        or config.get("tie_word_embeddings") is not False
     ):
         raise ValueError("checkpoint is not the supported Qwen3.5-MoE architecture")
+    text = config.get("text_config")
+    if not isinstance(text, dict) or text.get("layer_types") != expected_layers:
+        raise ValueError("checkpoint has unsupported decoder layers")
+    for key, expected in SUPPORTED_TEXT_CONFIG.items():
+        if text.get(key) != expected:
+            raise ValueError(f"checkpoint has unsupported text_config.{key}")
+    rope = text.get("rope_parameters")
+    if not isinstance(rope, dict):
+        raise ValueError("checkpoint has missing RoPE parameters")
+    for key, expected in SUPPORTED_ROPE_PARAMETERS.items():
+        if rope.get(key) != expected:
+            raise ValueError(
+                f"checkpoint has unsupported text_config.rope_parameters.{key}"
+            )
+    return text
+
+
+def validate_codec(codec: dict[str, object]) -> dict[str, object]:
+    ne_tier = codec.get("ne_tier")
+    cb = codec.get("cb_params")
+    if (
+        codec.get("container") != "trained_susv_wave_gamma_chunked_v1"
+        or not isinstance(ne_tier, dict)
+        or ne_tier.get("codec") != "canon_rht_bitshift_trellis_intlattice"
+        or not isinstance(cb, dict)
+        or cb.get("L") != 16
+        or cb.get("V") != 8
+        or cb.get("tlut_bits") != 15
+        or cb.get("td_x") != 16
+        or cb.get("td_y") != 16
+    ):
+        raise ValueError("checkpoint has an unsupported additive codec")
+    return cb
+
+def checkpoint_metadata(root: Path) -> dict[str, object]:
+    config = json.loads((root / "config.json").read_text())
+    text = validate_model_config(config)
     rope = text["rope_parameters"]
     codec = json.loads((root / "packed/experts/codec.json").read_text())
-    cb = codec["cb_params"]
+    cb = validate_codec(codec)
     tokenizer = json.loads((root / "tokenizer.json").read_text())
     tokenizer_config = json.loads((root / "tokenizer_config.json").read_text())
     chat_template = (root / "chat_template.jinja").read_text()
@@ -458,6 +551,14 @@ def self_test() -> None:
         header += b" " * ((8 - len(header) % 8) % 8)
         source.write_bytes(struct.pack("<Q", len(header)) + header + values)
         tensors = read_safetensors(source, "test.")
+        malformed = root / "malformed.safetensors"
+        malformed.write_bytes(source.read_bytes() + b"x")
+        try:
+            read_safetensors(malformed, "test.")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("trailing safetensors data was accepted")
         output = root / "test.gguf"
         size, count = write_gguf(
             output,
@@ -497,6 +598,43 @@ def self_test() -> None:
             assert token_types[token_id] == 3
         assert tokens[248077] == "[PAD248077]"
         assert token_types[248077] == 5
+
+        expected_layers = [
+            "full_attention" if (layer + 1) % 4 == 0 else "linear_attention"
+            for layer in range(40)
+        ]
+        valid_config = {
+            "model_type": "qwen3_5_moe",
+            "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+            "tie_word_embeddings": False,
+            "text_config": {
+                **SUPPORTED_TEXT_CONFIG,
+                "layer_types": expected_layers,
+                "rope_parameters": dict(SUPPORTED_ROPE_PARAMETERS),
+            },
+        }
+        assert validate_model_config(valid_config) is valid_config["text_config"]
+        invalid_config = json.loads(json.dumps(valid_config))
+        invalid_config["text_config"]["attn_output_gate"] = False
+        try:
+            validate_model_config(invalid_config)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("unsupported output gating was accepted")
+
+        valid_codec = {
+            "container": "trained_susv_wave_gamma_chunked_v1",
+            "ne_tier": {"codec": "canon_rht_bitshift_trellis_intlattice"},
+            "cb_params": {
+                "L": 16,
+                "V": 8,
+                "tlut_bits": 15,
+                "td_x": 16,
+                "td_y": 16,
+            },
+        }
+        assert validate_codec(valid_codec) is valid_codec["cb_params"]
 
 
 def parse_args() -> argparse.Namespace:
