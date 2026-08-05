@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(ADI_BUILD_TESTS "Build ADI tests" ON)
 
 add_library(adi_runtime STATIC
+    src/gguf.cpp
     src/version.cpp
 )
 target_include_directories(adi_runtime PUBLIC include)
@@ -25,4 +26,8 @@ if(ADI_BUILD_TESTS)
     add_executable(adi_smoke_test tests/smoke.cpp)
     target_link_libraries(adi_smoke_test PRIVATE adi_runtime)
     add_test(NAME smoke COMMAND adi_smoke_test)
+
+    add_executable(adi_gguf_test tests/gguf_test.cpp)
+    target_link_libraries(adi_gguf_test PRIVATE adi_runtime)
+    add_test(NAME gguf COMMAND adi_gguf_test)
 endif()
