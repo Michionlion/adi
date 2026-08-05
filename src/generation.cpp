@@ -1,4 +1,5 @@
 #include "adi/generation.hpp"
+#include "utf8.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -14,7 +15,15 @@ std::uint32_t sample_token(
     float temperature,
     float top_p,
     std::mt19937_64 &random) {
-    if (logits.empty() || temperature < 0.0F || top_p <= 0.0F || top_p > 1.0F) {
+    constexpr float minimum_temperature = 1.0e-4F;
+    constexpr float maximum_temperature = 2.0F;
+    if (logits.empty() || !std::isfinite(temperature) ||
+        !std::isfinite(top_p) || temperature < 0.0F ||
+        (temperature > 0.0F && temperature < minimum_temperature) ||
+        temperature > maximum_temperature || top_p <= 0.0F || top_p > 1.0F ||
+        std::any_of(logits.begin(), logits.end(), [](float value) {
+            return !std::isfinite(value);
+        })) {
         throw std::invalid_argument("invalid sampling parameters");
     }
     if (temperature == 0.0F) {
@@ -30,15 +39,20 @@ std::uint32_t sample_token(
         }
         return logits[left] > logits[right];
     });
-    const float maximum = logits[indexes[0]] / temperature;
+    const double maximum = static_cast<double>(logits[indexes[0]]);
     std::vector<double> probabilities;
     probabilities.reserve(logits.size());
     double denominator = 0.0;
     for (const auto index : indexes) {
-        const double probability = std::exp(
-            static_cast<double>(logits[index] / temperature - maximum));
+        const double scaled =
+            (static_cast<double>(logits[index]) - maximum) /
+            static_cast<double>(temperature);
+        const double probability = std::exp(scaled);
         probabilities.push_back(probability);
         denominator += probability;
+    }
+    if (!std::isfinite(denominator) || denominator <= 0.0) {
+        throw std::runtime_error("sampling probability sum is invalid");
     }
     double cumulative = 0.0;
     std::size_t retained = 0;
@@ -78,9 +92,15 @@ GenerationResult generate_from_prompt(
     Tokenizer &tokenizer,
     std::string_view formatted_prompt,
     const GenerationOptions &options,
-    const TokenCallback &token_callback) {
-    if (options.max_output_tokens > model.config().context ||
-        options.temperature < 0.0F || options.top_p <= 0.0F || options.top_p > 1.0F) {
+    const TokenCallback &token_callback,
+    const CancelCallback &cancelled) {
+    if (options.max_output_tokens == 0 ||
+        options.max_output_tokens > model.config().context ||
+        !std::isfinite(options.temperature) || !std::isfinite(options.top_p) ||
+        options.temperature < 0.0F ||
+        (options.temperature > 0.0F && options.temperature < 1.0e-4F) ||
+        options.temperature > 2.0F ||
+        options.top_p <= 0.0F || options.top_p > 1.0F) {
         throw std::invalid_argument("invalid generation options");
     }
     const auto prompt_tokens = tokenizer.encode(formatted_prompt);
@@ -98,15 +118,23 @@ GenerationResult generate_from_prompt(
     DecoderScratch scratch;
     std::vector<float> logits(model.config().vocabulary);
     for (const auto token : prompt_tokens) {
+        if (cancelled && cancelled()) {
+            throw std::runtime_error("generation cancelled");
+        }
         decode_token(model, token, state, logits, scratch);
     }
     std::mt19937_64 random(options.seed);
     std::vector<std::uint32_t> output_tokens;
     output_tokens.reserve(options.max_output_tokens);
+    auto finish_reason = FinishReason::length;
     for (std::uint32_t index = 0; index < options.max_output_tokens; ++index) {
+        if (cancelled && cancelled()) {
+            throw std::runtime_error("generation cancelled");
+        }
         const auto token =
             sample_token(logits, options.temperature, options.top_p, random);
         if (token == tokenizer.eos_token() || token == im_end) {
+            finish_reason = FinishReason::stop_token;
             break;
         }
         output_tokens.push_back(token);
@@ -119,9 +147,10 @@ GenerationResult generate_from_prompt(
         }
     }
     return {
-        tokenizer.decode(output_tokens),
+        sanitize_utf8(tokenizer.decode(output_tokens)),
         static_cast<std::uint32_t>(prompt_tokens.size()),
         static_cast<std::uint32_t>(output_tokens.size()),
+        finish_reason,
     };
 }
 

@@ -1,6 +1,7 @@
 #include "adi/json.hpp"
 
 #include <cassert>
+#include <string>
 #include <stdexcept>
 
 int main() {
@@ -19,4 +20,32 @@ int main() {
         rejected = true;
     }
     assert(rejected);
+
+    for (const auto malformed : {
+             std::string{"\"\xC0\x80\"", 4},
+             std::string{"\"\xED\xA0\x80\"", 5},
+             std::string{R"("\uDC00")"},
+         }) {
+        rejected = false;
+        try {
+            (void)adi::parse_json(malformed);
+        } catch (const std::runtime_error &) {
+            rejected = true;
+        }
+        assert(rejected);
+    }
+
+    std::string nested = "0";
+    for (int index = 0; index < 129; ++index) {
+        nested = "[" + nested + "]";
+    }
+    rejected = false;
+    try {
+        (void)adi::parse_json(nested);
+    } catch (const std::runtime_error &) {
+        rejected = true;
+    }
+    assert(rejected);
+
+    assert(adi::json_string(std::string{"x\xFFy", 3}) == "\"x\xEF\xBF\xBDy\"");
 }

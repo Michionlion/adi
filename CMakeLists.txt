@@ -7,6 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_compile_options(-pipe)
 
 option(ADI_BUILD_TESTS "Build ADI tests" ON)
+set(ADI_TEST_MODEL "" CACHE FILEPATH "Mach-1 GGUF used for checkpoint tests")
 
 add_library(adi_runtime STATIC
     src/backend.cpp
@@ -18,6 +19,8 @@ add_library(adi_runtime STATIC
     src/model.cpp
     src/server.cpp
     src/tokenizer.cpp
+    src/unicode.cpp
+    src/utf8.cpp
     src/version.cpp
 )
 target_include_directories(adi_runtime PUBLIC include)
@@ -56,13 +59,30 @@ if(ADI_BUILD_TESTS)
     target_link_libraries(adi_json_test PRIVATE adi_runtime)
     add_test(NAME json COMMAND adi_json_test)
 
+    add_executable(adi_unicode_test tests/unicode_test.cpp)
+    target_link_libraries(adi_unicode_test PRIVATE adi_runtime)
+    target_include_directories(adi_unicode_test PRIVATE src)
+    add_test(NAME unicode COMMAND adi_unicode_test)
+
+    add_executable(adi_tokenizer_test tests/tokenizer_test.cpp)
+    target_link_libraries(adi_tokenizer_test PRIVATE adi_runtime)
+    add_executable(adi_model_e2e_test tests/model_e2e_test.cpp)
+    target_link_libraries(adi_model_e2e_test PRIVATE adi_runtime)
+    if(ADI_TEST_MODEL)
+        add_test(NAME tokenizer COMMAND adi_tokenizer_test ${ADI_TEST_MODEL})
+        add_test(NAME model_e2e COMMAND adi_model_e2e_test ${ADI_TEST_MODEL})
+    endif()
+
     foreach(test_target
             adi_smoke_test
             adi_gguf_test
             adi_kernels_test
             adi_executor_test
             adi_generation_test
-            adi_json_test)
+            adi_json_test
+            adi_unicode_test
+            adi_tokenizer_test
+            adi_model_e2e_test)
         target_compile_options(${test_target} PRIVATE -UNDEBUG)
     endforeach()
 

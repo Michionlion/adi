@@ -1,7 +1,8 @@
 #include "adi/tokenizer.hpp"
+#include "unicode.hpp"
+#include "utf8.hpp"
 
 #include <algorithm>
-#include <cctype>
 #include <limits>
 #include <stdexcept>
 
@@ -23,151 +24,6 @@ std::string utf8(std::uint32_t codepoint) {
     return result;
 }
 
-std::pair<std::uint32_t, std::size_t> next_codepoint(
-    std::string_view text,
-    std::size_t position) {
-    const auto first = static_cast<unsigned char>(text[position]);
-    if (first < 0x80U) {
-        return {first, 1};
-    }
-    std::size_t length = 0;
-    std::uint32_t value = 0;
-    if ((first & 0xE0U) == 0xC0U) {
-        length = 2;
-        value = first & 0x1FU;
-    } else if ((first & 0xF0U) == 0xE0U) {
-        length = 3;
-        value = first & 0x0FU;
-    } else if ((first & 0xF8U) == 0xF0U) {
-        length = 4;
-        value = first & 0x07U;
-    } else {
-        throw std::runtime_error("tokenizer: invalid UTF-8");
-    }
-    if (position + length > text.size()) {
-        throw std::runtime_error("tokenizer: truncated UTF-8");
-    }
-    for (std::size_t index = 1; index < length; ++index) {
-        const auto byte = static_cast<unsigned char>(text[position + index]);
-        if ((byte & 0xC0U) != 0x80U) {
-            throw std::runtime_error("tokenizer: invalid UTF-8 continuation");
-        }
-        value = (value << 6) | (byte & 0x3FU);
-    }
-    return {value, length};
-}
-
-bool ascii_letter(unsigned char value) {
-    return std::isalpha(value) != 0 || value >= 0x80U;
-}
-
-bool ascii_digit(unsigned char value) {
-    return std::isdigit(value) != 0;
-}
-
-bool whitespace(unsigned char value) {
-    return std::isspace(value) != 0;
-}
-
-std::vector<std::string_view> pretokenize(std::string_view text) {
-    std::vector<std::string_view> pieces;
-    std::size_t position = 0;
-    while (position < text.size()) {
-        const auto begin = position;
-        const auto current = static_cast<unsigned char>(text[position]);
-        if (current == '\'' && position + 1 < text.size()) {
-            constexpr std::string_view contractions[] = {
-                "'s", "'t", "'re", "'ve", "'m", "'ll", "'d",
-            };
-            bool matched = false;
-            for (const auto contraction : contractions) {
-                if (position + contraction.size() <= text.size()) {
-                    std::string candidate(text.substr(position, contraction.size()));
-                    std::transform(
-                        candidate.begin(), candidate.end(), candidate.begin(),
-                        [](unsigned char value) { return std::tolower(value); });
-                    if (candidate == contraction) {
-                        position += contraction.size();
-                        matched = true;
-                        break;
-                    }
-                }
-            }
-            if (matched) {
-                pieces.push_back(text.substr(begin, position - begin));
-                continue;
-            }
-        }
-
-        std::size_t letter_start = position;
-        if (!ascii_letter(current) && !ascii_digit(current) &&
-            current != '\r' && current != '\n' && !whitespace(current) &&
-            position + 1 < text.size() &&
-            ascii_letter(static_cast<unsigned char>(text[position + 1]))) {
-            ++letter_start;
-        } else if (current == ' ' && position + 1 < text.size() &&
-                   ascii_letter(static_cast<unsigned char>(text[position + 1]))) {
-            ++letter_start;
-        }
-        if (letter_start != position || ascii_letter(current)) {
-            position = letter_start;
-            while (position < text.size() &&
-                   ascii_letter(static_cast<unsigned char>(text[position]))) {
-                ++position;
-            }
-            pieces.push_back(text.substr(begin, position - begin));
-            continue;
-        }
-        if (ascii_digit(current)) {
-            ++position;
-            pieces.push_back(text.substr(begin, 1));
-            continue;
-        }
-        const bool space_before_punctuation =
-            current == ' ' && position + 1 < text.size() &&
-            !whitespace(static_cast<unsigned char>(text[position + 1])) &&
-            !ascii_letter(static_cast<unsigned char>(text[position + 1])) &&
-            !ascii_digit(static_cast<unsigned char>(text[position + 1]));
-        if (!whitespace(current) || space_before_punctuation) {
-            if (space_before_punctuation) {
-                ++position;
-            }
-            while (position < text.size()) {
-                const auto value = static_cast<unsigned char>(text[position]);
-                if (whitespace(value) || ascii_letter(value) || ascii_digit(value)) {
-                    break;
-                }
-                ++position;
-            }
-            while (position < text.size() &&
-                   (text[position] == '\r' || text[position] == '\n')) {
-                ++position;
-            }
-            pieces.push_back(text.substr(begin, position - begin));
-            continue;
-        }
-        while (position < text.size() &&
-               whitespace(static_cast<unsigned char>(text[position]))) {
-            ++position;
-            if (text[position - 1] == '\r' || text[position - 1] == '\n') {
-                while (position < text.size() &&
-                       (text[position] == '\r' || text[position] == '\n')) {
-                    ++position;
-                }
-                break;
-            }
-        }
-        if (position - begin > 1 && text[position - 1] == ' ' &&
-            position < text.size() &&
-            !ascii_letter(static_cast<unsigned char>(text[position])) &&
-            !ascii_digit(static_cast<unsigned char>(text[position]))) {
-            --position;
-        }
-        pieces.push_back(text.substr(begin, position - begin));
-    }
-    return pieces;
-}
-
 } // namespace
 
 Tokenizer::Tokenizer(const MachModel &model) {
@@ -178,14 +34,17 @@ Tokenizer::Tokenizer(const MachModel &model) {
     const auto bos = file.integer("tokenizer.ggml.bos_token_id");
     const auto eos = file.integer("tokenizer.ggml.eos_token_id");
     if (tokens_.size() != model.config().vocabulary ||
-        token_types_.size() != tokens_.size() || merges.empty() || !bos || !eos) {
+        token_types_.size() != tokens_.size() || merges.empty() || !bos || !eos ||
+        *bos >= tokens_.size() || *eos >= tokens_.size()) {
         throw std::runtime_error("tokenizer: missing GGUF tokenizer metadata");
     }
     bos_token_ = static_cast<std::uint32_t>(*bos);
     eos_token_ = static_cast<std::uint32_t>(*eos);
     token_ids_.reserve(tokens_.size());
     for (std::uint32_t index = 0; index < tokens_.size(); ++index) {
-        token_ids_.emplace(tokens_[index], index);
+        if (!token_ids_.emplace(tokens_[index], index).second) {
+            throw std::runtime_error("tokenizer: duplicate vocabulary token");
+        }
         if (token_types_[index] == 3 || token_types_[index] == 4) {
             special_tokens_.emplace_back(tokens_[index], index);
         }
@@ -197,7 +56,9 @@ Tokenizer::Tokenizer(const MachModel &model) {
         });
     merge_ranks_.reserve(merges.size());
     for (std::uint32_t rank = 0; rank < merges.size(); ++rank) {
-        merge_ranks_.emplace(std::string(merges[rank]), rank);
+        if (!merge_ranks_.emplace(std::string(merges[rank]), rank).second) {
+            throw std::runtime_error("tokenizer: duplicate BPE merge");
+        }
     }
 
     std::vector<std::uint32_t> bytes;
@@ -257,7 +118,8 @@ std::vector<std::uint32_t> Tokenizer::encode(std::string_view text) {
 void Tokenizer::encode_normal(
     std::string_view text,
     std::vector<std::uint32_t> &output) {
-    for (const auto piece : pretokenize(text)) {
+    const auto normalized = normalize_nfc(text);
+    for (const auto &piece : qwen35_pretokenize(normalized)) {
         encode_piece(piece, output);
     }
 }
@@ -270,15 +132,19 @@ void Tokenizer::encode_piece(
         encoded += byte_encoder_.at(static_cast<unsigned char>(byte));
     }
     if (const auto found = cache_.find(encoded); found != cache_.end()) {
-        output.insert(output.end(), found->second.begin(), found->second.end());
+        cache_recency_.splice(
+            cache_recency_.begin(), cache_recency_, found->second.recency);
+        output.insert(
+            output.end(),
+            found->second.tokens.begin(),
+            found->second.tokens.end());
         return;
     }
     std::vector<std::string> symbols;
-    for (std::size_t position = 0; position < encoded.size();) {
-        const auto [ignored, length] = next_codepoint(encoded, position);
-        (void)ignored;
-        symbols.emplace_back(encoded.substr(position, length));
-        position += length;
+    for (const auto codepoint : utf8_codepoints(encoded)) {
+        std::string symbol;
+        append_utf8(symbol, codepoint);
+        symbols.push_back(std::move(symbol));
     }
     while (symbols.size() > 1) {
         std::uint32_t best_rank = std::numeric_limits<std::uint32_t>::max();
@@ -318,7 +184,18 @@ void Tokenizer::encode_piece(
         }
         ids.push_back(found->second);
     }
-    cache_.emplace(encoded, ids);
+    constexpr std::size_t maximum_cache_entries = 4096;
+    constexpr std::size_t maximum_cacheable_piece_bytes = 256;
+    if (piece.size() <= maximum_cacheable_piece_bytes) {
+        if (cache_.size() == maximum_cache_entries) {
+            cache_.erase(cache_recency_.back());
+            cache_recency_.pop_back();
+        }
+        cache_recency_.push_front(encoded);
+        cache_.emplace(
+            encoded,
+            CacheEntry{ids, cache_recency_.begin()});
+    }
     output.insert(output.end(), ids.begin(), ids.end());
 }
 
@@ -331,15 +208,13 @@ std::string Tokenizer::decode(std::span<const std::uint32_t> tokens) const {
         encoded += tokens_[token];
     }
     std::string result;
-    for (std::size_t position = 0; position < encoded.size();) {
-        const auto [codepoint, length] = next_codepoint(encoded, position);
+    for (const auto codepoint : utf8_codepoints(encoded)) {
         const auto found = byte_decoder_.find(codepoint);
         if (found == byte_decoder_.end()) {
-            result.append(encoded.substr(position, length));
+            append_utf8(result, codepoint);
         } else {
             result.push_back(static_cast<char>(found->second));
         }
-        position += length;
     }
     return result;
 }

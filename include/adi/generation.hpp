@@ -18,13 +18,20 @@ struct GenerationOptions {
     std::uint64_t seed = 0;
 };
 
+enum class FinishReason {
+    stop_token,
+    length,
+};
+
 struct GenerationResult {
     std::string text;
     std::uint32_t input_tokens;
     std::uint32_t output_tokens;
+    FinishReason finish_reason;
 };
 
 using TokenCallback = std::function<void(std::string_view)>;
+using CancelCallback = std::function<bool()>;
 
 [[nodiscard]] std::uint32_t sample_token(
     std::span<const float> logits,
@@ -43,6 +50,7 @@ using TokenCallback = std::function<void(std::string_view)>;
     Tokenizer &tokenizer,
     std::string_view formatted_prompt,
     const GenerationOptions &options,
-    const TokenCallback &token_callback = {});
+    const TokenCallback &token_callback = {},
+    const CancelCallback &cancelled = {});
 
 } // namespace adi

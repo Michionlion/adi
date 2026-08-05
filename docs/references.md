@@ -12,7 +12,13 @@ were used to understand formats and execution order:
 - **DwarfStar (ds4)** — inspiration for a narrow, mmap-backed,
   model-specialized runtime with correctness-first CPU kernels. DwarfStar is
   MIT licensed.
+- **Unicode Character Database 15.0 and 16.0** — versioned NFC, general
+  category, whitespace, and case-folding data used to reproduce the
+  checkpoint tokenizer. The generated tables are derived from Unicode data
+  files under the [Unicode Data Files and Software
+  License](https://www.unicode.org/license.txt).
 
-No upstream source files are vendored. ADI's codec kernels, GGUF reader,
-packager, model executor, tokenizer, JSON parser, and HTTP server were written
-for this repository.
+No upstream source files are vendored. The generated Unicode tables are
+checked in so the runtime build remains self-contained. ADI's codec kernels,
+GGUF reader, packager, model executor, tokenizer logic, JSON parser, and HTTP
+server were written for this repository.

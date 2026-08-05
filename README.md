@@ -11,7 +11,7 @@ integer/float tensor payload types.
 Initial scope:
 
 - Linux x86-64 CPU inference.
-- Qwen3.6-35B-A3B (`qwen3_5_moe`) as used by Mach-1.
+- Qwen3.5-MoE (`qwen3_5_moe`) as used by Mach-1.
 - One OpenAI-compatible endpoint: `POST /v1/responses`.
 - Text generation only.
 
@@ -21,6 +21,16 @@ CUDA is a later backend, not part of the initial implementation.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+ctest --test-dir build
+```
+
+To include tokenizer goldens and the deterministic one-token end-to-end
+checkpoint test:
+
+```bash
+cmake -S . -B build \
+  -DADI_TEST_MODEL=/path/to/Mach-1-Additive-35B.gguf
 cmake --build build -j
 ctest --test-dir build
 ```

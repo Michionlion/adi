@@ -3,6 +3,7 @@
 #include "adi/model.hpp"
 
 #include <cstdint>
+#include <list>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -21,6 +22,11 @@ class Tokenizer {
     [[nodiscard]] std::uint32_t eos_token() const noexcept { return eos_token_; }
 
   private:
+    struct CacheEntry {
+        std::vector<std::uint32_t> tokens;
+        std::list<std::string>::iterator recency;
+    };
+
     void encode_normal(std::string_view text, std::vector<std::uint32_t> &output);
     void encode_piece(std::string_view piece, std::vector<std::uint32_t> &output);
 
@@ -31,7 +37,8 @@ class Tokenizer {
     std::vector<std::pair<std::string_view, std::uint32_t>> special_tokens_;
     std::unordered_map<unsigned char, std::string> byte_encoder_;
     std::unordered_map<std::uint32_t, unsigned char> byte_decoder_;
-    std::unordered_map<std::string, std::vector<std::uint32_t>> cache_;
+    std::list<std::string> cache_recency_;
+    std::unordered_map<std::string, CacheEntry> cache_;
     std::uint32_t bos_token_;
     std::uint32_t eos_token_;
 };

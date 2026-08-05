@@ -1,9 +1,11 @@
 #include "adi/json.hpp"
+#include "utf8.hpp"
 
 #include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace adi {
 namespace {
@@ -13,7 +15,7 @@ class Parser {
     explicit Parser(std::string_view input) : input_(input) {}
 
     Json parse() {
-        auto value = parse_value();
+        auto value = parse_value(0);
         whitespace();
         if (position_ != input_.size()) {
             fail("trailing data");
@@ -45,10 +47,14 @@ class Parser {
         return false;
     }
 
-    Json parse_value() {
+    Json parse_value(std::size_t depth) {
+        constexpr std::size_t maximum_depth = 128;
         whitespace();
         if (position_ >= input_.size()) {
             fail("expected value");
+        }
+        if (depth > maximum_depth) {
+            fail("nesting exceeds 128 levels");
         }
         switch (input_[position_]) {
         case 'n':
@@ -63,9 +69,9 @@ class Parser {
         case '"':
             return Json(parse_string());
         case '[':
-            return Json(parse_array());
+            return Json(parse_array(depth));
         case '{':
-            return Json(parse_object());
+            return Json(parse_object(depth));
         default:
             return Json(parse_number());
         }
@@ -76,24 +82,6 @@ class Parser {
             fail("invalid literal");
         }
         position_ += value.size();
-    }
-
-    static void append_utf8(std::string &output, std::uint32_t codepoint) {
-        if (codepoint <= 0x7F) {
-            output.push_back(static_cast<char>(codepoint));
-        } else if (codepoint <= 0x7FF) {
-            output.push_back(static_cast<char>(0xC0U | (codepoint >> 6)));
-            output.push_back(static_cast<char>(0x80U | (codepoint & 0x3FU)));
-        } else if (codepoint <= 0xFFFF) {
-            output.push_back(static_cast<char>(0xE0U | (codepoint >> 12)));
-            output.push_back(static_cast<char>(0x80U | ((codepoint >> 6) & 0x3FU)));
-            output.push_back(static_cast<char>(0x80U | (codepoint & 0x3FU)));
-        } else {
-            output.push_back(static_cast<char>(0xF0U | (codepoint >> 18)));
-            output.push_back(static_cast<char>(0x80U | ((codepoint >> 12) & 0x3FU)));
-            output.push_back(static_cast<char>(0x80U | ((codepoint >> 6) & 0x3FU)));
-            output.push_back(static_cast<char>(0x80U | (codepoint & 0x3FU)));
-        }
     }
 
     std::uint32_t hex4() {
@@ -125,6 +113,9 @@ class Parser {
         while (position_ < input_.size()) {
             const char value = input_[position_++];
             if (value == '"') {
+                if (!valid_utf8(result)) {
+                    fail("invalid UTF-8 in string");
+                }
                 return result;
             }
             if (static_cast<unsigned char>(value) < 0x20U) {
@@ -176,6 +167,8 @@ class Parser {
                     }
                     codepoint =
                         0x10000 + ((codepoint - 0xD800) << 10) + (low - 0xDC00);
+                } else if (codepoint >= 0xDC00 && codepoint <= 0xDFFF) {
+                    fail("unpaired low surrogate");
                 }
                 append_utf8(result, codepoint);
                 break;
@@ -242,14 +235,14 @@ class Parser {
         return result;
     }
 
-    Json::Array parse_array() {
+    Json::Array parse_array(std::size_t depth) {
         (void)take('[');
         Json::Array result;
         if (take(']')) {
             return result;
         }
         do {
-            result.push_back(parse_value());
+            result.push_back(parse_value(depth + 1));
         } while (take(','));
         if (!take(']')) {
             fail("expected ']'");
@@ -257,9 +250,10 @@ class Parser {
         return result;
     }
 
-    Json::Object parse_object() {
+    Json::Object parse_object(std::size_t depth) {
         (void)take('{');
         Json::Object result;
+        std::unordered_set<std::string> keys;
         if (take('}')) {
             return result;
         }
@@ -272,13 +266,10 @@ class Parser {
             if (!take(':')) {
                 fail("expected ':'");
             }
-            for (const auto &[existing, ignored] : result) {
-                (void)ignored;
-                if (existing == key) {
-                    fail("duplicate object key");
-                }
+            if (!keys.emplace(key).second) {
+                fail("duplicate object key");
             }
-            result.emplace_back(std::move(key), parse_value());
+            result.emplace_back(std::move(key), parse_value(depth + 1));
         } while (take(','));
         if (!take('}')) {
             fail("expected '}'");
@@ -334,9 +325,10 @@ Json parse_json(std::string_view input) {
 }
 
 std::string json_string(std::string_view input) {
+    const auto clean = sanitize_utf8(input);
     std::string result = "\"";
     constexpr char hex[] = "0123456789abcdef";
-    for (const auto raw : input) {
+    for (const auto raw : clean) {
         const auto value = static_cast<unsigned char>(raw);
         switch (value) {
         case '"':
