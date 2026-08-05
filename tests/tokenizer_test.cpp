@@ -1,8 +1,10 @@
 #include "adi/model.hpp"
 #include "adi/tokenizer.hpp"
+#include "chat.hpp"
 
 #include <cassert>
 #include <cstdint>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -11,6 +13,13 @@ int main(int argc, char **argv) {
     assert(argc == 2);
     adi::MachModel model(argv[1]);
     adi::Tokenizer tokenizer(model);
+    const auto chat_template =
+        model.gguf().string("tokenizer.chat_template");
+    assert(chat_template.has_value());
+    assert(adi::supported_qwen35_chat_template(*chat_template));
+    auto changed_template = std::string(*chat_template);
+    changed_template.back() ^= 1;
+    assert(!adi::supported_qwen35_chat_template(changed_template));
 
     const std::vector<std::pair<std::string_view, std::vector<std::uint32_t>>>
         golden{

@@ -2,6 +2,8 @@
 
 #include "adi/generation.hpp"
 #include "adi/json.hpp"
+#include "chat.hpp"
+#include "server_internal.hpp"
 #include "utf8.hpp"
 
 #include <algorithm>
@@ -17,6 +19,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -36,12 +39,6 @@ constexpr auto request_deadline = std::chrono::minutes(30);
 std::atomic<std::uint64_t> response_counter = 0;
 using TimePoint = std::chrono::steady_clock::time_point;
 
-struct ResponseIdentity {
-    std::string id;
-    std::string message_id;
-    std::time_t created_at;
-};
-
 struct Socket {
     int descriptor = -1;
     ~Socket() {
@@ -60,6 +57,10 @@ struct Connection {
     int socket;
     TimePoint deadline;
 };
+
+using server_detail::ResponseIdentity;
+using server_detail::connection_cancelled;
+using server_detail::response_json;
 
 [[noreturn]] void socket_error(std::string_view action) {
     throw SocketFailure(
@@ -267,7 +268,8 @@ std::string formatted_input(const Json &root) {
     if (messages == nullptr || messages->empty()) {
         throw std::runtime_error("'input' must be a string or non-empty message array");
     }
-    std::string prompt;
+    std::vector<ChatMessage> rendered_messages;
+    rendered_messages.reserve(messages->size());
     for (const auto &message : *messages) {
         const auto *role = message.find("role");
         const auto *content = message.find("content");
@@ -278,11 +280,10 @@ std::string formatted_input(const Json &root) {
             *role->string() != "system") {
             throw std::runtime_error("unsupported input message role");
         }
-        prompt += "<|im_start|>" + *role->string() + "\n" +
-                  content_text(*content) + "<|im_end|>\n";
+        rendered_messages.push_back(
+            {*role->string(), content_text(*content)});
     }
-    prompt += "<|im_start|>assistant\n<think>\n";
-    return prompt;
+    return qwen35_chat_prompt(rendered_messages);
 }
 
 std::uint32_t integer_option(
@@ -323,6 +324,10 @@ float float_option(
     return converted;
 }
 
+} // namespace
+
+namespace server_detail {
+
 std::string response_json(
     std::string_view model_name,
     const GenerationResult &result,
@@ -333,7 +338,7 @@ std::string response_json(
     const std::string_view item_status =
         incomplete ? "incomplete" : "completed";
     const std::string_view incomplete_details =
-        incomplete ? "{\"reason\":\"max_tokens\"}" : "null";
+        incomplete ? "{\"reason\":\"max_output_tokens\"}" : "null";
     return "{\"id\":" + json_string(identity.id) +
            ",\"object\":\"response\",\"created_at\":" +
            std::to_string(identity.created_at) +
@@ -352,6 +357,43 @@ std::string response_json(
            ",\"total_tokens\":" +
            std::to_string(result.input_tokens + result.output_tokens) + "}}";
 }
+
+bool connection_cancelled(
+    int socket,
+    std::chrono::steady_clock::time_point deadline) noexcept {
+    if (std::chrono::steady_clock::now() >= deadline) {
+        return true;
+    }
+    pollfd descriptor{
+        socket,
+        static_cast<short>(POLLIN | POLLERR | POLLHUP),
+        0,
+    };
+    const auto ready = ::poll(&descriptor, 1, 0);
+    if (ready < 0) {
+        return errno != EINTR;
+    }
+    if (ready == 0) {
+        return false;
+    }
+    if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+        return true;
+    }
+    if ((descriptor.revents & POLLIN) != 0) {
+        char byte = 0;
+        const auto received =
+            ::recv(socket, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+        // Read EOF includes a valid peer shutdown(SHUT_WR). A failed response
+        // send will detect whether the peer also stopped receiving.
+        return received < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+               errno != EINTR;
+    }
+    return false;
+}
+
+} // namespace server_detail
+
+namespace {
 
 ResponseIdentity make_identity() {
     const auto now = std::chrono::system_clock::to_time_t(
@@ -403,36 +445,6 @@ void send_event(
     std::string data) {
     send_all(connection, "event: " + std::string(event) + "\n");
     send_all(connection, "data: " + data + "\n\n");
-}
-
-bool connection_cancelled(const Connection &connection) noexcept {
-    if (std::chrono::steady_clock::now() >= connection.deadline) {
-        return true;
-    }
-    pollfd descriptor{
-        connection.socket,
-        static_cast<short>(POLLIN | POLLERR | POLLHUP),
-        0,
-    };
-    const auto ready = ::poll(&descriptor, 1, 0);
-    if (ready < 0) {
-        return errno != EINTR;
-    }
-    if (ready == 0) {
-        return false;
-    }
-    if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
-        return true;
-    }
-    if ((descriptor.revents & POLLIN) != 0) {
-        char byte = 0;
-        const auto received =
-            ::recv(connection.socket, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
-        return received == 0 ||
-               (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
-                errno != EINTR);
-    }
-    return false;
 }
 
 void stream_responses(
@@ -524,7 +536,8 @@ void stream_responses(
             if (std::chrono::steady_clock::now() >= connection.deadline) {
                 throw std::runtime_error("request deadline exceeded");
             }
-            if (connection_cancelled(connection)) {
+            if (connection_cancelled(
+                    connection.socket, connection.deadline)) {
                 throw SocketFailure("client disconnected during generation");
             }
             return false;
@@ -619,7 +632,8 @@ std::string handle_responses(
         if (std::chrono::steady_clock::now() >= connection.deadline) {
             throw std::runtime_error("request deadline exceeded");
         }
-        if (connection_cancelled(connection)) {
+        if (connection_cancelled(
+                connection.socket, connection.deadline)) {
             throw SocketFailure("client disconnected during generation");
         }
         return false;

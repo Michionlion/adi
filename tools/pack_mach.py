@@ -9,6 +9,7 @@ the contiguous dimension first.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import struct
@@ -23,6 +24,9 @@ ALIGNMENT = 32
 QWEN35_PATTERN = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|"
     r"\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+QWEN35_CHAT_TEMPLATE_SHA256 = (
+    "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259"
 )
 GGUF_TYPES = {
     "F32": 0, "F16": 1, "I8": 24, "U8": 24, "I16": 25, "U16": 25,
@@ -165,6 +169,12 @@ def checkpoint_metadata(root: Path) -> dict[str, object]:
     codec = json.loads((root / "packed/experts/codec.json").read_text())
     cb = codec["cb_params"]
     tokenizer = json.loads((root / "tokenizer.json").read_text())
+    chat_template = (root / "chat_template.jinja").read_text()
+    if (
+        hashlib.sha256(chat_template.encode()).hexdigest()
+        != QWEN35_CHAT_TEMPLATE_SHA256
+    ):
+        raise ValueError("checkpoint has an unsupported chat template")
     expected_pre_tokenizer = {
         "type": "Sequence",
         "pretokenizers": [
@@ -281,7 +291,7 @@ def checkpoint_metadata(root: Path) -> dict[str, object]:
         "tokenizer.ggml.merges": tokenizer["model"]["merges"],
         "tokenizer.ggml.bos_token_id": int(text["bos_token_id"]),
         "tokenizer.ggml.eos_token_id": int(text["eos_token_id"]),
-        "tokenizer.chat_template": (root / "chat_template.jinja").read_text(),
+        "tokenizer.chat_template": chat_template,
     }
     return metadata
 

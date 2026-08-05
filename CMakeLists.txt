@@ -11,6 +11,7 @@ set(ADI_TEST_MODEL "" CACHE FILEPATH "Mach-1 GGUF used for checkpoint tests")
 
 add_library(adi_runtime STATIC
     src/backend.cpp
+    src/chat.cpp
     src/executor.cpp
     src/generation.cpp
     src/gguf.cpp
@@ -45,6 +46,7 @@ if(ADI_BUILD_TESTS)
 
     add_executable(adi_kernels_test tests/kernels_test.cpp)
     target_link_libraries(adi_kernels_test PRIVATE adi_runtime)
+    target_include_directories(adi_kernels_test PRIVATE src)
     add_test(NAME kernels COMMAND adi_kernels_test)
 
     add_executable(adi_executor_test tests/executor_test.cpp)
@@ -64,8 +66,19 @@ if(ADI_BUILD_TESTS)
     target_include_directories(adi_unicode_test PRIVATE src)
     add_test(NAME unicode COMMAND adi_unicode_test)
 
+    add_executable(adi_chat_test tests/chat_test.cpp)
+    target_link_libraries(adi_chat_test PRIVATE adi_runtime)
+    target_include_directories(adi_chat_test PRIVATE src)
+    add_test(NAME chat COMMAND adi_chat_test)
+
+    add_executable(adi_server_test tests/server_test.cpp)
+    target_link_libraries(adi_server_test PRIVATE adi_runtime)
+    target_include_directories(adi_server_test PRIVATE src)
+    add_test(NAME server COMMAND adi_server_test)
+
     add_executable(adi_tokenizer_test tests/tokenizer_test.cpp)
     target_link_libraries(adi_tokenizer_test PRIVATE adi_runtime)
+    target_include_directories(adi_tokenizer_test PRIVATE src)
     add_executable(adi_model_e2e_test tests/model_e2e_test.cpp)
     target_link_libraries(adi_model_e2e_test PRIVATE adi_runtime)
     add_executable(adi_model_batch_test tests/model_batch_test.cpp)
@@ -84,6 +97,8 @@ if(ADI_BUILD_TESTS)
             adi_generation_test
             adi_json_test
             adi_unicode_test
+            adi_chat_test
+            adi_server_test
             adi_tokenizer_test
             adi_model_e2e_test
             adi_model_batch_test)

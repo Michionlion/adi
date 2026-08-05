@@ -22,6 +22,11 @@ Image content, tools, and other API routes are rejected explicitly. Requests
 are handled one at a time so one process never oversubscribes the CPU while a
 generation is active.
 
+Text messages are rendered with the validated checkpoint chat template's
+default thinking-enabled mode. Message content is trimmed, a system message
+must be first, and prior assistant `<think>...</think>` content is omitted from
+history according to the Qwen3.5 conversation rules.
+
 Example:
 
 ```bash
@@ -42,7 +47,8 @@ assistant `message`, one `output_text` content item, and input/output/total
 token usage. Streaming responses emit the normal lifecycle from
 `response.created` through `response.completed`, including UTF-8-safe
 `response.output_text.delta` events. Hitting `max_output_tokens` instead
-returns status `incomplete`, `incomplete_details.reason` set to `max_tokens`,
+returns status `incomplete`, `incomplete_details.reason` set to
+`max_output_tokens`,
 and a terminal `response.incomplete` event. Errors use an `error` object and
 an HTTP 4xx status, or an SSE `error` event after streaming headers have been
 sent.

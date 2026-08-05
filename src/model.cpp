@@ -1,4 +1,5 @@
 #include "adi/model.hpp"
+#include "chat.hpp"
 #include "utf8.hpp"
 
 #include <algorithm>
@@ -183,6 +184,11 @@ MachModel::MachModel(const std::filesystem::path &path) : file_(path) {
     require_string(file_, "adi.head_codec", "int5_g64");
     require_string(file_, "tokenizer.ggml.model", "gpt2");
     require_string(file_, "tokenizer.ggml.pre", "qwen2");
+    const auto chat_template = file_.string("tokenizer.chat_template");
+    if (!chat_template || !supported_qwen35_chat_template(*chat_template)) {
+        throw std::runtime_error(
+            "model: unsupported metadata 'tokenizer.chat_template'");
+    }
     // Format v1 already defines these conventions. New packs spell them out;
     // the optional reads retain compatibility with the original v1 container.
     require_optional_string(

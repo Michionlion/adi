@@ -1,4 +1,5 @@
 #include "adi/tokenizer.hpp"
+#include "chat.hpp"
 #include "unicode.hpp"
 #include "utf8.hpp"
 
@@ -225,8 +226,8 @@ std::string Tokenizer::token_text(std::uint32_t token) const {
 }
 
 std::string qwen_user_prompt(std::string_view input) {
-    return "<|im_start|>user\n" + std::string(input) +
-           "<|im_end|>\n<|im_start|>assistant\n<think>\n";
+    const ChatMessage message{"user", std::string(input)};
+    return qwen35_chat_prompt(std::span<const ChatMessage>(&message, 1));
 }
 
 } // namespace adi

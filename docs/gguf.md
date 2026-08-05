@@ -39,6 +39,9 @@ followed by its Unicode 16.0 Qwen3.5 regex split and byte-level BPE. The
 versions differ because that is the pipeline implemented by the checkpoint's
 `tokenizers` release. The packer rejects a
 checkpoint whose `tokenizer.json` pipeline differs from that contract.
+The checkpoint's `tokenizer.chat_template` is also required to match the
+supported Qwen3.5 template fingerprint. ADI implements that template's
+text-only, thinking-enabled specialization and rejects other templates.
 
 The initial Mach-1 expert codec is identified by these values:
 
