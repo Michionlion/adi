@@ -4,6 +4,7 @@
 #include "adi/tokenizer.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <random>
 #include <span>
 #include <string>
@@ -23,6 +24,8 @@ struct GenerationResult {
     std::uint32_t output_tokens;
 };
 
+using TokenCallback = std::function<void(std::string_view)>;
+
 [[nodiscard]] std::uint32_t sample_token(
     std::span<const float> logits,
     float temperature,
@@ -39,6 +42,7 @@ struct GenerationResult {
     const MachModel &model,
     Tokenizer &tokenizer,
     std::string_view formatted_prompt,
-    const GenerationOptions &options);
+    const GenerationOptions &options,
+    const TokenCallback &token_callback = {});
 
 } // namespace adi

@@ -77,7 +77,8 @@ GenerationResult generate_from_prompt(
     const MachModel &model,
     Tokenizer &tokenizer,
     std::string_view formatted_prompt,
-    const GenerationOptions &options) {
+    const GenerationOptions &options,
+    const TokenCallback &token_callback) {
     if (options.max_output_tokens > model.config().context ||
         options.temperature < 0.0F || options.top_p <= 0.0F || options.top_p > 1.0F) {
         throw std::invalid_argument("invalid generation options");
@@ -109,6 +110,10 @@ GenerationResult generate_from_prompt(
             break;
         }
         output_tokens.push_back(token);
+        if (token_callback) {
+            const auto piece = tokenizer.token_text(token);
+            token_callback(piece);
+        }
         if (index + 1 < options.max_output_tokens) {
             decode_token(model, token, state, logits, scratch);
         }

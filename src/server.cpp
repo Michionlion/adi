@@ -29,6 +29,12 @@ constexpr std::size_t maximum_headers = 64 * 1024;
 constexpr std::size_t maximum_body = 1024 * 1024;
 std::atomic<std::uint64_t> response_counter = 0;
 
+struct ResponseIdentity {
+    std::string id;
+    std::string message_id;
+    std::time_t created_at;
+};
+
 struct Socket {
     int descriptor = -1;
     ~Socket() {
@@ -230,17 +236,14 @@ float float_option(
 
 std::string response_json(
     std::string_view model_name,
-    const GenerationResult &result) {
-    const auto now = std::chrono::system_clock::to_time_t(
-        std::chrono::system_clock::now());
-    const auto sequence = response_counter.fetch_add(1);
-    const auto id = "resp_" + std::to_string(now) + "_" + std::to_string(sequence);
-    const auto message_id = "msg_" + std::to_string(now) + "_" + std::to_string(sequence);
-    return "{\"id\":" + json_string(id) +
-           ",\"object\":\"response\",\"created_at\":" + std::to_string(now) +
+    const GenerationResult &result,
+    const ResponseIdentity &identity) {
+    return "{\"id\":" + json_string(identity.id) +
+           ",\"object\":\"response\",\"created_at\":" +
+           std::to_string(identity.created_at) +
            ",\"status\":\"completed\",\"error\":null,\"incomplete_details\":null"
            ",\"model\":" + json_string(model_name) +
-           ",\"output\":[{\"id\":" + json_string(message_id) +
+           ",\"output\":[{\"id\":" + json_string(identity.message_id) +
            ",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\""
            ",\"content\":[{\"type\":\"output_text\",\"text\":" +
            json_string(result.text) +
@@ -251,6 +254,198 @@ std::string response_json(
            std::to_string(result.input_tokens + result.output_tokens) + "}}";
 }
 
+ResponseIdentity make_identity() {
+    const auto now = std::chrono::system_clock::to_time_t(
+        std::chrono::system_clock::now());
+    const auto sequence = response_counter.fetch_add(1);
+    return {
+        "resp_" + std::to_string(now) + "_" + std::to_string(sequence),
+        "msg_" + std::to_string(now) + "_" + std::to_string(sequence),
+        now,
+    };
+}
+
+GenerationOptions request_options(const Json &request) {
+    GenerationOptions options;
+    options.max_output_tokens =
+        integer_option(request, "max_output_tokens", options.max_output_tokens);
+    options.temperature = float_option(request, "temperature", options.temperature);
+    options.top_p = float_option(request, "top_p", options.top_p);
+    options.seed = integer_option(request, "seed", 0);
+    return options;
+}
+
+std::string_view request_model(const Json &request) {
+    if (const auto *requested = request.find("model");
+        requested != nullptr && requested->string() != nullptr) {
+        return *requested->string();
+    }
+    return "Mach-1-Additive-35B";
+}
+
+void validate_features(const Json &request) {
+    if (const auto *tools = request.find("tools");
+        tools != nullptr && (!tools->is_null() &&
+                             (tools->array() == nullptr || !tools->array()->empty()))) {
+        throw std::runtime_error("tools are not supported");
+    }
+}
+
+void send_event(int socket, std::string_view event, std::string data) {
+    send_all(socket, "event: " + std::string(event) + "\n");
+    send_all(socket, "data: " + data + "\n\n");
+}
+
+std::size_t complete_utf8_prefix(std::string_view value) {
+    std::size_t position = 0;
+    while (position < value.size()) {
+        const auto first = static_cast<unsigned char>(value[position]);
+        std::size_t length = 1;
+        if ((first & 0x80U) == 0) {
+            length = 1;
+        } else if ((first & 0xE0U) == 0xC0U) {
+            length = 2;
+        } else if ((first & 0xF0U) == 0xE0U) {
+            length = 3;
+        } else if ((first & 0xF8U) == 0xF0U) {
+            length = 4;
+        }
+        if (position + length > value.size()) {
+            break;
+        }
+        position += length;
+    }
+    return position;
+}
+
+void stream_responses(
+    int socket,
+    const Json &request,
+    const MachModel &model,
+    Tokenizer &tokenizer) {
+    const auto headers =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/event-stream\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: close\r\n\r\n";
+    send_all(socket, headers);
+    try {
+        validate_features(request);
+        const auto identity = make_identity();
+        const std::string model_name(request_model(request));
+        std::uint32_t sequence = 0;
+        const auto response_stub =
+            "{\"id\":" + json_string(identity.id) +
+            ",\"object\":\"response\",\"created_at\":" +
+            std::to_string(identity.created_at) +
+            ",\"status\":\"in_progress\",\"model\":" +
+            json_string(model_name) + ",\"output\":[]}";
+        send_event(
+            socket,
+            "response.created",
+            "{\"type\":\"response.created\",\"sequence_number\":" +
+                std::to_string(sequence++) + ",\"response\":" + response_stub + "}");
+        send_event(
+            socket,
+            "response.in_progress",
+            "{\"type\":\"response.in_progress\",\"sequence_number\":" +
+                std::to_string(sequence++) + ",\"response\":" + response_stub + "}");
+        send_event(
+            socket,
+            "response.output_item.added",
+            "{\"type\":\"response.output_item.added\",\"sequence_number\":" +
+                std::to_string(sequence++) +
+                ",\"output_index\":0,\"item\":{\"id\":" +
+                json_string(identity.message_id) +
+                ",\"type\":\"message\",\"status\":\"in_progress\","
+                "\"role\":\"assistant\",\"content\":[]}}");
+        send_event(
+            socket,
+            "response.content_part.added",
+            "{\"type\":\"response.content_part.added\",\"sequence_number\":" +
+                std::to_string(sequence++) +
+                ",\"item_id\":" + json_string(identity.message_id) +
+                ",\"output_index\":0,\"content_index\":0,\"part\":"
+                "{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}}");
+
+        std::string pending;
+        const auto result = generate_from_prompt(
+            model,
+            tokenizer,
+            formatted_input(request),
+            request_options(request),
+            [&](std::string_view piece) {
+                pending.append(piece);
+                const auto complete = complete_utf8_prefix(pending);
+                if (complete == 0) {
+                    return;
+                }
+                const auto delta = pending.substr(0, complete);
+                pending.erase(0, complete);
+                send_event(
+                    socket,
+                    "response.output_text.delta",
+                    "{\"type\":\"response.output_text.delta\",\"sequence_number\":" +
+                        std::to_string(sequence++) +
+                        ",\"item_id\":" + json_string(identity.message_id) +
+                        ",\"output_index\":0,\"content_index\":0,\"delta\":" +
+                        json_string(delta) + "}");
+            });
+        if (!pending.empty()) {
+            send_event(
+                socket,
+                "response.output_text.delta",
+                "{\"type\":\"response.output_text.delta\",\"sequence_number\":" +
+                    std::to_string(sequence++) +
+                    ",\"item_id\":" + json_string(identity.message_id) +
+                    ",\"output_index\":0,\"content_index\":0,\"delta\":" +
+                    json_string(pending) + "}");
+        }
+        send_event(
+            socket,
+            "response.output_text.done",
+            "{\"type\":\"response.output_text.done\",\"sequence_number\":" +
+                std::to_string(sequence++) +
+                ",\"item_id\":" + json_string(identity.message_id) +
+                ",\"output_index\":0,\"content_index\":0,\"text\":" +
+                json_string(result.text) + "}");
+        send_event(
+            socket,
+            "response.content_part.done",
+            "{\"type\":\"response.content_part.done\",\"sequence_number\":" +
+                std::to_string(sequence++) +
+                ",\"item_id\":" + json_string(identity.message_id) +
+                ",\"output_index\":0,\"content_index\":0,\"part\":"
+                "{\"type\":\"output_text\",\"text\":" +
+                json_string(result.text) + ",\"annotations\":[]}}");
+        send_event(
+            socket,
+            "response.output_item.done",
+            "{\"type\":\"response.output_item.done\",\"sequence_number\":" +
+                std::to_string(sequence++) +
+                ",\"output_index\":0,\"item\":{\"id\":" +
+                json_string(identity.message_id) +
+                ",\"type\":\"message\",\"status\":\"completed\","
+                "\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\","
+                "\"text\":" + json_string(result.text) +
+                ",\"annotations\":[]}]}}");
+        send_event(
+            socket,
+            "response.completed",
+            "{\"type\":\"response.completed\",\"sequence_number\":" +
+                std::to_string(sequence++) +
+                ",\"response\":" +
+                response_json(model_name, result, identity) + "}");
+    } catch (const std::exception &error) {
+        send_event(
+            socket,
+            "error",
+            "{\"type\":\"error\",\"error\":{\"message\":" +
+                json_string(error.what()) +
+                ",\"type\":\"invalid_request_error\"}}");
+    }
+}
+
 std::string handle_responses(
     const Json &request,
     const MachModel &model,
@@ -259,29 +454,15 @@ std::string handle_responses(
         throw std::runtime_error("request body must be a JSON object");
     }
     if (const auto *stream = request.find("stream");
-        stream != nullptr && (stream->boolean() == nullptr || *stream->boolean())) {
-        throw std::runtime_error("streaming is not supported yet");
+        stream != nullptr && stream->boolean() == nullptr) {
+        throw std::runtime_error("'stream' must be a boolean");
     }
-    if (const auto *tools = request.find("tools");
-        tools != nullptr && (!tools->is_null() &&
-                             (tools->array() == nullptr || !tools->array()->empty()))) {
-        throw std::runtime_error("tools are not supported");
-    }
-    GenerationOptions options;
-    options.max_output_tokens =
-        integer_option(request, "max_output_tokens", options.max_output_tokens);
-    options.temperature = float_option(request, "temperature", options.temperature);
-    options.top_p = float_option(request, "top_p", options.top_p);
-    options.seed = integer_option(request, "seed", 0);
+    validate_features(request);
     const auto prompt = formatted_input(request);
     const auto result =
-        generate_from_prompt(model, tokenizer, prompt, options);
-    std::string_view model_name = "Mach-1-Additive-35B";
-    if (const auto *requested = request.find("model");
-        requested != nullptr && requested->string() != nullptr) {
-        model_name = *requested->string();
-    }
-    return response_json(model_name, result);
+        generate_from_prompt(model, tokenizer, prompt, request_options(request));
+    const auto identity = make_identity();
+    return response_json(request_model(request), result, identity);
 }
 
 void handle_client(int socket, const MachModel &model, Tokenizer &tokenizer) {
@@ -304,11 +485,17 @@ void handle_client(int socket, const MachModel &model, Tokenizer &tokenizer) {
         }
         const auto body_position = request.find("\r\n\r\n") + 4;
         const auto body = std::string_view(request).substr(body_position);
-        send_response(
-            socket,
-            200,
-            "OK",
-            handle_responses(parse_json(body), model, tokenizer));
+        const auto parsed = parse_json(body);
+        if (const auto *stream = parsed.find("stream");
+            stream != nullptr && stream->boolean() != nullptr && *stream->boolean()) {
+            stream_responses(socket, parsed, model, tokenizer);
+        } else {
+            send_response(
+                socket,
+                200,
+                "OK",
+                handle_responses(parsed, model, tokenizer));
+        }
     } catch (const std::exception &error) {
         send_response(socket, 400, "Bad Request", error_body(error.what()));
     }
