@@ -59,6 +59,11 @@ if(ADI_BUILD_TESTS)
     target_include_directories(adi_kernels_test PRIVATE src)
     add_test(NAME kernels COMMAND adi_kernels_test)
 
+    add_executable(adi_int5_batch_test tests/int5_batch_test.cpp)
+    target_link_libraries(adi_int5_batch_test PRIVATE adi_runtime)
+    target_include_directories(adi_int5_batch_test PRIVATE src)
+    add_test(NAME int5_batch COMMAND adi_int5_batch_test)
+
     add_executable(adi_executor_test tests/executor_test.cpp)
     target_link_libraries(adi_executor_test PRIVATE adi_runtime)
     target_include_directories(adi_executor_test PRIVATE src)
@@ -109,6 +114,7 @@ if(ADI_BUILD_TESTS)
             adi_smoke_test
             adi_gguf_test
             adi_kernels_test
+            adi_int5_batch_test
             adi_executor_test
             adi_generation_test
             adi_json_test

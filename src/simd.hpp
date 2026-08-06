@@ -26,6 +26,14 @@ void hadamard_transform(std::span<float> values);
     std::span<const std::uint16_t> scales_f16,
     std::span<const float> input);
 
+void int5_scaled_dot_batch(
+    std::span<const std::uint8_t> packed,
+    std::span<const std::uint16_t> scales_f16,
+    std::span<const float> inputs,
+    std::uint32_t batch,
+    std::span<float> outputs,
+    std::span<float> weight_scratch);
+
 [[nodiscard]] float bf16_dot(
     std::span<const std::uint16_t> weights,
     std::span<const float> input);

@@ -4,12 +4,13 @@
 #include "simd.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <stdexcept>
-#include <array>
+#include <vector>
 
 namespace adi {
 namespace {
@@ -801,6 +802,8 @@ void mach_head_matmul(
     const auto bytes_per_row = head.columns / 8 * 5;
     const auto groups_per_row = head.columns / group;
     parallel_ranges(head.rows, 512, [&](std::uint32_t row_begin, std::uint32_t row_end) {
+        std::vector<float> weight_scratch(head.columns);
+        std::vector<float> row_outputs(batch);
         for (std::uint32_t row = row_begin; row < row_end; ++row) {
             const auto packed_row =
                 head.packed.subspan(static_cast<std::size_t>(row) * bytes_per_row,
@@ -808,18 +811,19 @@ void mach_head_matmul(
             const auto scales = head.group_scale_f16.subspan(
                 static_cast<std::size_t>(row) * groups_per_row,
                 groups_per_row);
+            detail::int5_scaled_dot_batch(
+                packed_row,
+                scales,
+                inputs,
+                batch,
+                row_outputs,
+                weight_scratch);
             for (std::uint32_t batch_index = 0;
                  batch_index < batch;
                  ++batch_index) {
                 outputs[
                     static_cast<std::size_t>(batch_index) * head.rows + row] =
-                    detail::int5_scaled_dot(
-                        packed_row,
-                        scales,
-                        inputs.subspan(
-                            static_cast<std::size_t>(batch_index) *
-                                head.columns,
-                            head.columns));
+                    row_outputs[batch_index];
             }
         }
     });
@@ -892,22 +896,35 @@ void bf16_matmul(
     detail::KernelTimer timer(
         KernelKind::bf16_projection,
         static_cast<std::uint64_t>(matrix.rows) * matrix.columns * batch);
-    for (std::uint32_t row = 0; row < matrix.rows; ++row) {
-        const auto weights = matrix.values.subspan(
-            static_cast<std::size_t>(row) * matrix.columns,
-            matrix.columns);
-        for (std::uint32_t batch_index = 0;
-             batch_index < batch;
-             ++batch_index) {
-            outputs[
-                static_cast<std::size_t>(batch_index) * matrix.rows + row] =
-                detail::bf16_dot(
-                    weights,
-                    inputs.subspan(
-                        static_cast<std::size_t>(batch_index) *
-                            matrix.columns,
-                        matrix.columns));
-        }
+    const auto multiply_rows = [&](
+        std::uint32_t row_begin,
+        std::uint32_t row_end) {
+            for (std::uint32_t row = row_begin; row < row_end; ++row) {
+                const auto weights = matrix.values.subspan(
+                    static_cast<std::size_t>(row) * matrix.columns,
+                    matrix.columns);
+                for (std::uint32_t batch_index = 0;
+                     batch_index < batch;
+                     ++batch_index) {
+                    outputs[
+                        static_cast<std::size_t>(batch_index) * matrix.rows +
+                        row] =
+                        detail::bf16_dot(
+                            weights,
+                            inputs.subspan(
+                                static_cast<std::size_t>(batch_index) *
+                                    matrix.columns,
+                                matrix.columns));
+                }
+            }
+        };
+    constexpr std::uint64_t minimum_parallel_work = 2 * 1024 * 1024;
+    const auto work = static_cast<std::uint64_t>(matrix.rows) *
+                      matrix.columns * batch;
+    if (work < minimum_parallel_work) {
+        multiply_rows(0, matrix.rows);
+    } else {
+        parallel_ranges(matrix.rows, 64, multiply_rows);
     }
 }
 

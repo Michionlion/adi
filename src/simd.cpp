@@ -200,6 +200,71 @@ float int5_scaled_dot(
     return scalar_int5_scaled_dot(packed, scales, input);
 }
 
+void int5_scaled_dot_batch(
+    std::span<const std::uint8_t> packed,
+    std::span<const std::uint16_t> scales,
+    std::span<const float> inputs,
+    std::uint32_t batch,
+    std::span<float> outputs,
+    std::span<float> weight_scratch) {
+    constexpr std::size_t group = 64;
+    constexpr std::size_t bytes_per_group = 40;
+    const auto columns = scales.size() * group;
+    if (batch == 0 || scales.empty() ||
+        packed.size() != scales.size() * bytes_per_group ||
+        inputs.size() != static_cast<std::size_t>(batch) * columns ||
+        outputs.size() != batch || weight_scratch.size() != columns) {
+        throw std::invalid_argument("int5 batch dot shape mismatch");
+    }
+
+    for (std::size_t scale_index = 0;
+         scale_index < scales.size();
+         ++scale_index) {
+        const float scale = f16_to_f32(scales[scale_index]);
+        for (std::size_t block = 0; block < group / 8; ++block) {
+            std::uint64_t word = 0;
+            for (std::size_t byte = 0; byte < 5; ++byte) {
+                word |= static_cast<std::uint64_t>(
+                            packed[scale_index * bytes_per_group +
+                                   block * 5 + byte])
+                        << (byte * 8);
+            }
+            for (std::size_t index = 0; index < 8; ++index) {
+                weight_scratch[scale_index * group + block * 8 + index] =
+                    static_cast<float>(
+                        static_cast<std::int32_t>(
+                            (word >> (index * 5)) & 0x1FU) -
+                        16) *
+                    scale;
+            }
+        }
+    }
+    const auto isa = selected_cpu_isa();
+    for (std::uint32_t batch_index = 0;
+         batch_index < batch;
+         ++batch_index) {
+        const auto input = inputs.subspan(
+            static_cast<std::size_t>(batch_index) * columns,
+            columns);
+        if (isa == CpuIsa::avx2 || isa == CpuIsa::avx512) {
+            outputs[batch_index] = x86_f32_dot(weight_scratch, input, isa);
+        } else if (isa == CpuIsa::neon || isa == CpuIsa::sve) {
+            float result = 0.0F;
+            for (std::size_t group_index = 0;
+                 group_index < scales.size();
+                 ++group_index) {
+                result += arm_f32_dot(
+                    weight_scratch.subspan(group_index * group, group),
+                    input.subspan(group_index * group, group),
+                    isa);
+            }
+            outputs[batch_index] = result;
+        } else {
+            outputs[batch_index] = scalar_f32_dot(weight_scratch, input);
+        }
+    }
+}
+
 float bf16_dot(
     std::span<const std::uint16_t> weights,
     std::span<const float> input) {
