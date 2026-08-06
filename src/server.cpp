@@ -45,6 +45,7 @@ constexpr auto header_deadline = std::chrono::seconds(15);
 constexpr auto body_deadline = std::chrono::seconds(30);
 constexpr auto send_idle_deadline = std::chrono::seconds(15);
 constexpr auto request_deadline = std::chrono::minutes(30);
+constexpr std::uint32_t maximum_connections = 64;
 std::atomic<std::uint64_t> response_counter = 0;
 using TimePoint = std::chrono::steady_clock::time_point;
 using server_detail::SocketHandle;
@@ -179,6 +180,20 @@ struct Connection {
     SocketHandle socket;
     TimePoint deadline;
 };
+
+bool try_acquire_connection(
+    std::atomic<std::uint32_t> &active_connections) noexcept {
+    auto active = active_connections.load(std::memory_order_relaxed);
+    while (active < maximum_connections) {
+        if (active_connections.compare_exchange_weak(
+                active,
+                active + 1,
+                std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 using server_detail::ResponseIdentity;
 using server_detail::connection_cancelled;
@@ -380,6 +395,21 @@ void send_response(
         "Connection: close\r\n\r\n";
     send_all(connection, headers);
     send_all(connection, body);
+}
+
+void reject_busy(SocketHandle socket) noexcept {
+    Connection connection{
+        socket,
+        std::chrono::steady_clock::now() + std::chrono::seconds(1),
+    };
+    try {
+        send_response(
+            connection,
+            503,
+            "Service Unavailable",
+            error_body("server is at connection capacity"));
+    } catch (...) {
+    }
 }
 
 std::string content_text(const Json &content) {
@@ -890,6 +920,7 @@ void handle_client(
     const MachModel model(options.model);
     Tokenizer tokenizer(model);
     ContinuousBatcher batcher(model, tokenizer);
+    std::atomic<std::uint32_t> active_connections = 0;
     const auto raw_listener = ::socket(
         AF_INET,
         SOCK_STREAM
@@ -927,7 +958,9 @@ void handle_client(
             sizeof(address)) != 0) {
         socket_error("bind");
     }
-    if (::listen(native_socket(listener.descriptor), 16) != 0) {
+    if (::listen(
+            native_socket(listener.descriptor),
+            static_cast<int>(maximum_connections)) != 0) {
         socket_error("listen");
     }
     std::cout << "adi: listening on http://" << options.host << ':' << options.port
@@ -995,15 +1028,31 @@ void handle_client(
                       << "socket error " << socket_error_code() << '\n';
             continue;
         }
-        std::thread(
-            [client = std::move(client), &model, &batcher]() mutable {
-                try {
-                    handle_client(client.descriptor, model, batcher);
-                } catch (...) {
-                    std::cerr << "adi: unexpected connection failure\n";
-                }
-            })
-            .detach();
+        if (!try_acquire_connection(active_connections)) {
+            reject_busy(client.descriptor);
+            continue;
+        }
+        try {
+            std::thread(
+                [client = std::move(client),
+                 &model,
+                 &batcher,
+                 &active_connections]() mutable {
+                    try {
+                        handle_client(client.descriptor, model, batcher);
+                    } catch (...) {
+                        std::cerr << "adi: unexpected connection failure\n";
+                    }
+                    active_connections.fetch_sub(
+                        1,
+                        std::memory_order_relaxed);
+                })
+                .detach();
+        } catch (const std::exception &error) {
+            active_connections.fetch_sub(1, std::memory_order_relaxed);
+            std::cerr << "adi: cannot start connection worker: "
+                      << error.what() << '\n';
+        }
     }
 }
 
