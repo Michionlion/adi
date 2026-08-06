@@ -260,6 +260,7 @@ MachModel::MachModel(const std::filesystem::path &path) : file_(path) {
         throw std::runtime_error("model: unsupported Mach-1 vocabulary");
     }
     validate_manifest();
+    cache_descriptors();
 }
 
 MachNeMatrix MachModel::non_expert(
@@ -312,6 +313,9 @@ MachNeMatrix MachModel::non_expert(
 }
 
 MachEmbedding MachModel::embedding() const {
+    if (descriptors_ready_) {
+        return embedding_;
+    }
     const auto &packed_tensor =
         required_tensor(file_, "mach.embedding.q_packed", GgmlType::i8);
     const auto &minimum_tensor =
@@ -363,6 +367,9 @@ MachHeadChunk MachModel::head_chunk(std::uint32_t chunk) const {
     constexpr std::uint32_t chunk_count = 8;
     if (chunk >= chunk_count || config_.vocabulary % chunk_count != 0) {
         throw std::out_of_range("model: output chunk index is out of range");
+    }
+    if (descriptors_ready_) {
+        return head_chunks_[chunk];
     }
     const auto rows = config_.vocabulary / chunk_count;
     const auto row_begin = chunk * rows;
@@ -468,6 +475,10 @@ MachExpertMatrix MachModel::expert(
     if (layer >= config_.layers || expert_index >= config_.experts) {
         throw std::out_of_range("model: expert index is out of range");
     }
+    if (descriptors_ready_) {
+        return layers_[layer]
+            .moe.experts[expert_index][static_cast<std::size_t>(projection)];
+    }
     const auto chunk = (expert_index / 32) * 32;
     const auto offset = expert_index % 32;
     const auto projection_string = projection_name(projection);
@@ -518,6 +529,104 @@ MachExpertMatrix MachModel::expert(
         gamma_all.subspan(static_cast<std::size_t>(offset) * gamma_values, gamma_values),
         tlut,
     };
+}
+
+const LayerDescriptor &MachModel::layer(std::uint32_t index) const {
+    if (index >= layers_.size()) {
+        throw std::out_of_range("model: layer index is out of range");
+    }
+    return layers_[index];
+}
+
+void MachModel::cache_descriptors() {
+    embedding_ = embedding();
+    for (std::uint32_t chunk = 0; chunk < head_chunks_.size(); ++chunk) {
+        head_chunks_[chunk] = head_chunk(chunk);
+    }
+    final_norm_ = bf16_vector("model.language_model.norm.weight");
+
+    constexpr float theta_base = 10000000.0F;
+    constexpr float rotary_dimensions = 64.0F;
+    for (std::size_t index = 0; index < rope_inverse_frequencies_.size(); ++index) {
+        rope_theta_divisors_[index] =
+            std::pow(
+                theta_base,
+                2.0F * static_cast<float>(index) / rotary_dimensions);
+        rope_inverse_frequencies_[index] =
+            1.0F / rope_theta_divisors_[index];
+    }
+
+    layers_.reserve(config_.layers);
+    for (std::uint32_t layer_index = 0;
+         layer_index < config_.layers;
+         ++layer_index) {
+        const auto prefix =
+            "model.language_model.layers." + std::to_string(layer_index) + ".";
+        LayerDescriptor descriptor;
+        descriptor.input_norm =
+            bf16_vector(prefix + "input_layernorm.weight");
+        descriptor.post_attention_norm =
+            bf16_vector(prefix + "post_attention_layernorm.weight");
+        descriptor.moe.router = bf16_matrix(prefix + "mlp.gate.weight");
+        descriptor.moe.shared_expert_gate =
+            bf16_matrix(prefix + "mlp.shared_expert_gate.weight");
+        const auto shared = prefix + "mlp.shared_expert.";
+        descriptor.moe.shared_gate =
+            non_expert(layer_index, shared + "gate_proj.weight");
+        descriptor.moe.shared_up =
+            non_expert(layer_index, shared + "up_proj.weight");
+        descriptor.moe.shared_down =
+            non_expert(layer_index, shared + "down_proj.weight");
+        for (std::uint32_t expert_index = 0;
+             expert_index < config_.experts;
+             ++expert_index) {
+            descriptor.moe.experts[expert_index][0] =
+                expert(layer_index, expert_index, ExpertProjection::gate);
+            descriptor.moe.experts[expert_index][1] =
+                expert(layer_index, expert_index, ExpertProjection::up);
+            descriptor.moe.experts[expert_index][2] =
+                expert(layer_index, expert_index, ExpertProjection::down);
+        }
+
+        descriptor.full_attention = (layer_index + 1) % 4 == 0;
+        if (descriptor.full_attention) {
+            const auto attention = prefix + "self_attn.";
+            descriptor.full.query =
+                non_expert(layer_index, attention + "q_proj.weight");
+            descriptor.full.key =
+                non_expert(layer_index, attention + "k_proj.weight");
+            descriptor.full.value =
+                non_expert(layer_index, attention + "v_proj.weight");
+            descriptor.full.output =
+                non_expert(layer_index, attention + "o_proj.weight");
+            descriptor.full.query_norm =
+                bf16_vector(attention + "q_norm.weight");
+            descriptor.full.key_norm =
+                bf16_vector(attention + "k_norm.weight");
+        } else {
+            const auto attention = prefix + "linear_attn.";
+            descriptor.linear.qkv =
+                non_expert(layer_index, attention + "in_proj_qkv.weight");
+            descriptor.linear.gate =
+                non_expert(layer_index, attention + "in_proj_z.weight");
+            descriptor.linear.output =
+                non_expert(layer_index, attention + "out_proj.weight");
+            descriptor.linear.alpha =
+                bf16_matrix(attention + "in_proj_a.weight");
+            descriptor.linear.beta =
+                bf16_matrix(attention + "in_proj_b.weight");
+            descriptor.linear.convolution =
+                bf16_data(attention + "conv1d.weight");
+            descriptor.linear.alpha_bias =
+                bf16_vector(attention + "dt_bias");
+            descriptor.linear.a_log =
+                bf16_vector(attention + "A_log");
+            descriptor.linear.norm =
+                bf16_vector(attention + "norm.weight");
+        }
+        layers_.push_back(std::move(descriptor));
+    }
+    descriptors_ready_ = true;
 }
 
 void MachModel::validate_manifest() const {
