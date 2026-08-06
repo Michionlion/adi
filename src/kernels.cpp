@@ -1,5 +1,7 @@
 #include "adi/kernels.hpp"
 #include "parallel.hpp"
+#include "profiling_internal.hpp"
+#include "simd.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -7,6 +9,7 @@
 #include <cstddef>
 #include <cstring>
 #include <stdexcept>
+#include <array>
 
 namespace adi {
 namespace {
@@ -25,36 +28,42 @@ bool is_power_of_two(std::uint32_t value) {
     return value != 0 && (value & (value - 1)) == 0;
 }
 
-void hadamard(std::span<float> values) {
-    for (std::size_t stride = 1; stride < values.size(); stride *= 2) {
-        for (std::size_t block = 0; block < values.size(); block += 2 * stride) {
-            for (std::size_t index = 0; index < stride; ++index) {
-                const float left = values[block + index];
-                const float right = values[block + stride + index];
-                values[block + index] = left + right;
-                values[block + stride + index] = left - right;
-            }
+std::uint32_t extract_stream_bits(
+    const std::uint16_t *words,
+    std::uint32_t word_count,
+    std::uint32_t bit_count,
+    std::uint32_t position,
+    std::uint32_t width) {
+    position %= bit_count;
+    const auto word = position / 16;
+    const auto offset = position % 16;
+    const std::uint32_t window =
+        (static_cast<std::uint32_t>(words[word]) << 16) |
+        words[(word + 1) % word_count];
+    return (window >> (32 - offset - width)) & ((1U << width) - 1U);
+}
+
+struct StateMetadata {
+    std::uint16_t expert_row;
+    std::uint16_t ne_row;
+    bool negative;
+};
+
+const std::array<StateMetadata, 65536> &state_metadata() {
+    static const auto metadata = [] {
+        std::array<StateMetadata, 65536> result;
+        for (std::uint32_t state = 0; state < result.size(); ++state) {
+            const std::uint64_t product =
+                static_cast<std::uint64_t>(state) * (state + 1);
+            result[state] = {
+                static_cast<std::uint16_t>(product & 0x7FFFU),
+                static_cast<std::uint16_t>((product >> 6) & 0x1FFU),
+                ((product >> 15) & 1U) != 0,
+            };
         }
-    }
-    const float scale = 1.0F / std::sqrt(static_cast<float>(values.size()));
-    for (auto &value : values) {
-        value *= scale;
-    }
-}
-
-std::uint32_t stream_bit(const std::uint16_t *words, std::uint32_t position) {
-    if (position >= stream_bits) {
-        position -= stream_bits;
-    }
-    return (words[position / 16] >> (15 - position % 16)) & 1U;
-}
-
-std::uint32_t fresh_value(const std::uint16_t *words, std::uint32_t position) {
-    std::uint32_t value = 0;
-    for (std::uint32_t bit = 0; bit < fresh_bits; ++bit) {
-        value = (value << 1) | stream_bit(words, position + bit);
-    }
-    return value;
+        return result;
+    }();
+    return metadata;
 }
 
 void build_wave_indexes(
@@ -87,11 +96,11 @@ float lattice_value(
     std::span<const float> tlut,
     std::uint32_t state,
     std::uint32_t component) {
-    const std::uint64_t product =
-        static_cast<std::uint64_t>(state) * (static_cast<std::uint64_t>(state) + 1);
-    const auto row = static_cast<std::uint32_t>(product) & 0x7FFFU;
-    float value = tlut[static_cast<std::size_t>(row) * values_per_state + component];
-    if (component == 0 && ((product >> 15) & 1U) != 0) {
+    const auto metadata = state_metadata()[state];
+    float value =
+        tlut[static_cast<std::size_t>(metadata.expert_row) * values_per_state +
+             component];
+    if (component == 0 && metadata.negative) {
         value = -value;
     }
     return f16_to_f32(f32_to_f16(value));
@@ -101,11 +110,9 @@ float ne_lattice_value(
     std::span<const float> tlut,
     std::uint32_t state,
     std::uint32_t component) {
-    const std::uint64_t product =
-        static_cast<std::uint64_t>(state) * (static_cast<std::uint64_t>(state) + 1);
-    const auto row = static_cast<std::uint32_t>((product >> 6) & 0x1FFU);
-    float value = tlut[static_cast<std::size_t>(row) * 2 + component];
-    if (component == 0 && ((product >> 15) & 1U) != 0) {
+    const auto metadata = state_metadata()[state];
+    float value = tlut[static_cast<std::size_t>(metadata.ne_row) * 2 + component];
+    if (component == 0 && metadata.negative) {
         value = -value;
     }
     return f16_to_f32(f32_to_f16(value));
@@ -194,6 +201,9 @@ void mach_expert_matvec(
     std::span<const float> input,
     std::span<float> output,
     ExpertScratch &scratch) {
+    detail::KernelTimer timer(
+        KernelKind::expert,
+        static_cast<std::uint64_t>(matrix.rows) * matrix.columns);
     if (!is_power_of_two(matrix.rows) || !is_power_of_two(matrix.columns) ||
         matrix.rows % tile_size != 0 || matrix.columns % tile_size != 0) {
         throw std::invalid_argument("Mach expert dimensions must be tiled powers of two");
@@ -216,7 +226,7 @@ void mach_expert_matvec(
     for (std::size_t index = 0; index < input.size(); ++index) {
         scratch.input[index] = input[index] * f16_to_f32(matrix.su_f16[index]);
     }
-    hadamard(scratch.input);
+    detail::hadamard_transform(scratch.input);
     build_wave_indexes(tile_rows, tile_columns, scratch.wave_indexes);
 
     for (std::uint32_t tile_row = 0; tile_row < tile_rows; ++tile_row) {
@@ -232,7 +242,12 @@ void mach_expert_matvec(
                 if (state_index != 0) {
                     const auto position = register_bits + (state_index - 1) * fresh_bits;
                     state = ((state << fresh_bits) & 0xFFFFU) |
-                            fresh_value(words, position);
+                            extract_stream_bits(
+                                words,
+                                words_per_tile,
+                                stream_bits,
+                                position,
+                                fresh_bits);
                 }
                 for (std::uint32_t component = 0; component < values_per_state;
                      ++component) {
@@ -292,7 +307,7 @@ void mach_ne_matvec(
     for (std::size_t index = 0; index < input.size(); ++index) {
         scratch.input[index] = input[index] * static_cast<float>(matrix.su[index]);
     }
-    hadamard(scratch.input);
+    detail::hadamard_transform(scratch.input);
 
     parallel_ranges(tile_rows, 4, [&](std::uint32_t row_begin, std::uint32_t row_end) {
         for (std::uint32_t tile_row = row_begin; tile_row < row_end; ++tile_row) {
@@ -309,16 +324,12 @@ void mach_ne_matvec(
                     if (state_index != 0) {
                         const auto position =
                             register_bits + (state_index - 1) * ne_fresh_bits;
-                        std::uint32_t fresh = 0;
-                        for (std::uint32_t bit = 0; bit < ne_fresh_bits; ++bit) {
-                            auto stream_position = position + bit;
-                            if (stream_position >= ne_stream_bits) {
-                                stream_position -= ne_stream_bits;
-                            }
-                            fresh = (fresh << 1) |
-                                    ((words[stream_position / 16] >>
-                                      (15 - stream_position % 16)) & 1U);
-                        }
+                        const auto fresh = extract_stream_bits(
+                            words,
+                            ne_words_per_tile,
+                            ne_stream_bits,
+                            position,
+                            ne_fresh_bits);
                         state = ((state << ne_fresh_bits) & 0xFFFFU) | fresh;
                     }
                     for (std::uint32_t component = 0;
@@ -340,7 +351,7 @@ void mach_ne_matvec(
                 scratch.output.begin() + tile_row * tile_size);
         }
     });
-    hadamard(scratch.output);
+    detail::hadamard_transform(scratch.output);
     for (std::size_t index = 0; index < output.size(); ++index) {
         output[index] = scratch.output[index] * static_cast<float>(matrix.sv[index]);
     }
@@ -356,6 +367,9 @@ void mach_ne_matmul(
         mach_ne_matvec(matrix, inputs, outputs, scratch);
         return;
     }
+    detail::KernelTimer timer(
+        KernelKind::non_expert_batch,
+        static_cast<std::uint64_t>(matrix.rows) * matrix.columns * batch);
     constexpr std::uint32_t ne_values_per_state = 2;
     constexpr std::uint32_t ne_fresh_bits = 8;
     constexpr std::uint32_t ne_states_per_tile =
@@ -403,7 +417,7 @@ void mach_ne_matmul(
             transformed[column] =
                 source[column] * static_cast<float>(matrix.su[column]);
         }
-        hadamard(transformed);
+        detail::hadamard_transform(transformed);
     }
 
     parallel_ranges(
@@ -433,20 +447,12 @@ void mach_ne_matmul(
                             const auto position =
                                 register_bits +
                                 (state_index - 1) * ne_fresh_bits;
-                            std::uint32_t fresh = 0;
-                            for (std::uint32_t bit = 0;
-                                 bit < ne_fresh_bits;
-                                 ++bit) {
-                                auto stream_position = position + bit;
-                                if (stream_position >= ne_stream_bits) {
-                                    stream_position -= ne_stream_bits;
-                                }
-                                fresh =
-                                    (fresh << 1) |
-                                    ((words[stream_position / 16] >>
-                                      (15 - stream_position % 16)) &
-                                     1U);
-                            }
+                            const auto fresh = extract_stream_bits(
+                                words,
+                                ne_words_per_tile,
+                                ne_stream_bits,
+                                position,
+                                ne_fresh_bits);
                             state =
                                 ((state << ne_fresh_bits) & 0xFFFFU) |
                                 fresh;
@@ -508,7 +514,7 @@ void mach_ne_matmul(
                                    static_cast<std::size_t>(batch_index) *
                                        matrix.rows,
                                    matrix.rows);
-        hadamard(transformed);
+        detail::hadamard_transform(transformed);
         auto destination = outputs.subspan(
             static_cast<std::size_t>(batch_index) * matrix.rows,
             matrix.rows);
@@ -523,6 +529,7 @@ void mach_embedding_row(
     const MachEmbedding &embedding,
     std::uint32_t token,
     std::span<float> output) {
+    detail::KernelTimer timer(KernelKind::embedding, embedding.columns);
     constexpr std::uint32_t group = 64;
     if (token >= embedding.rows || output.size() != embedding.columns ||
         embedding.columns % group != 0 ||
@@ -753,6 +760,7 @@ void rms_norm(
     float weight_offset,
     float epsilon,
     std::span<float> output) {
+    detail::KernelTimer timer(KernelKind::rms_norm, input.size());
     if (input.size() != weight_bf16.size() || output.size() != input.size() ||
         input.empty()) {
         throw std::invalid_argument("RMS norm shape mismatch");
