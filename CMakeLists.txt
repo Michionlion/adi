@@ -18,6 +18,7 @@ add_library(adi_runtime STATIC
     src/json.cpp
     src/kernels.cpp
     src/model.cpp
+    src/parallel.cpp
     src/profiling.cpp
     src/server.cpp
     src/tokenizer.cpp
