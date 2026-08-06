@@ -1,6 +1,7 @@
 #include "adi/gguf.hpp"
 
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -9,8 +10,6 @@
 #include <stdexcept>
 #include <string_view>
 #include <vector>
-
-#include <unistd.h>
 
 namespace {
 
@@ -73,7 +72,8 @@ std::filesystem::path write_fixture(bool truncate = false) {
     }
 
     const auto path = std::filesystem::temp_directory_path() /
-                      ("adi-gguf-test-" + std::to_string(::getpid()) +
+                      ("adi-gguf-test-" + std::to_string(
+                           std::chrono::steady_clock::now().time_since_epoch().count()) +
                        (truncate ? "-bad.gguf" : ".gguf"));
     std::ofstream output(path, std::ios::binary);
     output.write(reinterpret_cast<const char *>(bytes.data()),

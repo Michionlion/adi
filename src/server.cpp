@@ -21,11 +21,18 @@
 #include <string_view>
 #include <vector>
 
+#ifdef _WIN32
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
 
 namespace adi {
 namespace {
@@ -38,12 +45,83 @@ constexpr auto send_idle_deadline = std::chrono::seconds(15);
 constexpr auto request_deadline = std::chrono::minutes(30);
 std::atomic<std::uint64_t> response_counter = 0;
 using TimePoint = std::chrono::steady_clock::time_point;
+using server_detail::SocketHandle;
+
+#ifdef _WIN32
+using NativeSocket = SOCKET;
+constexpr SocketHandle invalid_socket = -1;
+
+NativeSocket native_socket(SocketHandle socket) noexcept {
+    return static_cast<NativeSocket>(socket);
+}
+
+SocketHandle adi_socket(NativeSocket socket) noexcept {
+    return static_cast<SocketHandle>(socket);
+}
+
+void close_socket(SocketHandle socket) noexcept {
+    ::closesocket(native_socket(socket));
+}
+
+int socket_error_code() noexcept {
+    return ::WSAGetLastError();
+}
+
+bool socket_interrupted(int error) noexcept {
+    return error == WSAEINTR;
+}
+
+bool socket_would_block(int error) noexcept {
+    return error == WSAEWOULDBLOCK;
+}
+
+int poll_socket(SocketHandle socket, short events, short &revents, int timeout) noexcept {
+    WSAPOLLFD descriptor{native_socket(socket), events, 0};
+    const auto result = ::WSAPoll(&descriptor, 1, timeout);
+    revents = descriptor.revents;
+    return result;
+}
+#else
+using NativeSocket = int;
+constexpr SocketHandle invalid_socket = -1;
+
+NativeSocket native_socket(SocketHandle socket) noexcept {
+    return static_cast<NativeSocket>(socket);
+}
+
+SocketHandle adi_socket(NativeSocket socket) noexcept {
+    return static_cast<SocketHandle>(socket);
+}
+
+void close_socket(SocketHandle socket) noexcept {
+    ::close(native_socket(socket));
+}
+
+int socket_error_code() noexcept {
+    return errno;
+}
+
+bool socket_interrupted(int error) noexcept {
+    return error == EINTR;
+}
+
+bool socket_would_block(int error) noexcept {
+    return error == EAGAIN || error == EWOULDBLOCK;
+}
+
+int poll_socket(SocketHandle socket, short events, short &revents, int timeout) noexcept {
+    pollfd descriptor{native_socket(socket), events, 0};
+    const auto result = ::poll(&descriptor, 1, timeout);
+    revents = descriptor.revents;
+    return result;
+}
+#endif
 
 struct Socket {
-    int descriptor = -1;
+    SocketHandle descriptor = invalid_socket;
     ~Socket() {
-        if (descriptor >= 0) {
-            ::close(descriptor);
+        if (descriptor != invalid_socket) {
+            close_socket(descriptor);
         }
     }
 };
@@ -54,7 +132,7 @@ class SocketFailure : public std::runtime_error {
 };
 
 struct Connection {
-    int socket;
+    SocketHandle socket;
     TimePoint deadline;
 };
 
@@ -63,11 +141,17 @@ using server_detail::connection_cancelled;
 using server_detail::response_json;
 
 [[noreturn]] void socket_error(std::string_view action) {
+#ifdef _WIN32
+    throw SocketFailure(
+        std::string(action) + ": Winsock error " +
+        std::to_string(socket_error_code()));
+#else
     throw SocketFailure(
         std::string(action) + ": " + std::strerror(errno));
+#endif
 }
 
-void wait_for_socket(int socket, short events, TimePoint deadline) {
+void wait_for_socket(SocketHandle socket, short events, TimePoint deadline) {
     for (;;) {
         const auto now = std::chrono::steady_clock::now();
         if (now >= deadline) {
@@ -77,18 +161,18 @@ void wait_for_socket(int socket, short events, TimePoint deadline) {
             std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
         const auto timeout = static_cast<int>(std::clamp<std::int64_t>(
             remaining.count(), 1, std::numeric_limits<int>::max()));
-        pollfd descriptor{socket, events, 0};
-        const auto result = ::poll(&descriptor, 1, timeout);
+        short revents = 0;
+        const auto result = poll_socket(socket, events, revents, timeout);
         if (result > 0) {
-            if ((descriptor.revents & events) != 0) {
+            if ((revents & events) != 0) {
                 return;
             }
-            if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            if ((revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
                 throw SocketFailure("socket disconnected");
             }
         } else if (result == 0) {
             throw SocketFailure("socket deadline exceeded");
-        } else if (errno != EINTR) {
+        } else if (!socket_interrupted(socket_error_code())) {
             socket_error("poll");
         }
     }
@@ -100,13 +184,23 @@ void send_all(Connection &connection, std::string_view data) {
         std::chrono::steady_clock::now() + send_idle_deadline);
     while (!data.empty()) {
         wait_for_socket(connection.socket, POLLOUT, idle);
-        const auto sent = ::send(
-            connection.socket,
-            data.data(),
-            data.size(),
-            MSG_NOSIGNAL | MSG_DONTWAIT);
+        const auto sent =
+#ifdef _WIN32
+            ::send(
+                native_socket(connection.socket),
+                data.data(),
+                static_cast<int>(data.size()),
+                0);
+#else
+            ::send(
+                native_socket(connection.socket),
+                data.data(),
+                data.size(),
+                MSG_NOSIGNAL | MSG_DONTWAIT);
+#endif
         if (sent < 0) {
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+            const auto error = socket_error_code();
+            if (socket_interrupted(error) || socket_would_block(error)) {
                 continue;
             }
             socket_error("send");
@@ -125,7 +219,9 @@ std::string lower(std::string_view value) {
     std::string result(value);
     std::transform(
         result.begin(), result.end(), result.begin(),
-        [](unsigned char character) { return std::tolower(character); });
+        [](unsigned char character) {
+            return static_cast<char>(std::tolower(character));
+        });
     return result;
 }
 
@@ -158,23 +254,28 @@ std::size_t content_length(std::string_view headers) {
 }
 
 std::size_t receive_some(
-    int socket,
+    SocketHandle socket,
     std::span<char> buffer,
     TimePoint deadline) {
     wait_for_socket(socket, POLLIN, deadline);
     for (;;) {
         const auto received =
-            ::recv(socket, buffer.data(), buffer.size(), MSG_DONTWAIT);
+#ifdef _WIN32
+            ::recv(native_socket(socket), buffer.data(), static_cast<int>(buffer.size()), 0);
+#else
+            ::recv(native_socket(socket), buffer.data(), buffer.size(), MSG_DONTWAIT);
+#endif
         if (received > 0) {
             return static_cast<std::size_t>(received);
         }
         if (received == 0) {
             throw SocketFailure("client disconnected while sending request");
         }
-        if (errno == EINTR) {
+        const auto error = socket_error_code();
+        if (socket_interrupted(error)) {
             continue;
         }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (socket_would_block(error)) {
             wait_for_socket(socket, POLLIN, deadline);
             continue;
         }
@@ -182,7 +283,7 @@ std::size_t receive_some(
     }
 }
 
-std::string receive_request(int socket, TimePoint overall_deadline) {
+std::string receive_request(SocketHandle socket, TimePoint overall_deadline) {
     std::string request;
     char buffer[8192];
     std::size_t header_end = std::string::npos;
@@ -359,34 +460,46 @@ std::string response_json(
 }
 
 bool connection_cancelled(
-    int socket,
+    SocketHandle socket,
     std::chrono::steady_clock::time_point deadline) noexcept {
     if (std::chrono::steady_clock::now() >= deadline) {
         return true;
     }
-    pollfd descriptor{
+    short revents = 0;
+    const auto ready = poll_socket(
         socket,
+#ifdef _WIN32
+        POLLIN,
+#else
         static_cast<short>(POLLIN | POLLERR | POLLHUP),
-        0,
-    };
-    const auto ready = ::poll(&descriptor, 1, 0);
+#endif
+        revents,
+        0);
     if (ready < 0) {
-        return errno != EINTR;
+        return !socket_interrupted(socket_error_code());
     }
     if (ready == 0) {
         return false;
     }
-    if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+    if ((revents & (POLLERR | POLLNVAL)) != 0) {
         return true;
     }
-    if ((descriptor.revents & POLLIN) != 0) {
+    if ((revents & (POLLIN | POLLHUP)) != 0) {
         char byte = 0;
+#ifdef _WIN32
         const auto received =
-            ::recv(socket, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+            ::recv(native_socket(socket), &byte, 1, MSG_PEEK);
+#else
+        const auto received =
+            ::recv(native_socket(socket), &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+#endif
         // Read EOF includes a valid peer shutdown(SHUT_WR). A failed response
         // send will detect whether the peer also stopped receiving.
-        return received < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
-               errno != EINTR;
+        if (received >= 0) {
+            return false;
+        }
+        const auto error = socket_error_code();
+        return !socket_would_block(error) && !socket_interrupted(error);
     }
     return false;
 }
@@ -650,7 +763,7 @@ std::string handle_responses(
 }
 
 void handle_client(
-    int socket,
+    SocketHandle socket,
     const MachModel &model,
     Tokenizer &tokenizer) noexcept {
     Connection connection{
@@ -713,15 +826,33 @@ void handle_client(
 } // namespace
 
 [[noreturn]] void serve(const ServerOptions &options) {
+#ifdef _WIN32
+    WSADATA winsock{};
+    if (::WSAStartup(MAKEWORD(2, 2), &winsock) != 0) {
+        throw SocketFailure("WSAStartup failed");
+    }
+#endif
     const MachModel model(options.model);
     Tokenizer tokenizer(model);
-    Socket listener{::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)};
-    if (listener.descriptor < 0) {
+    const auto raw_listener = ::socket(
+        AF_INET,
+        SOCK_STREAM
+#ifndef _WIN32
+        | SOCK_CLOEXEC
+#endif
+        ,
+        0);
+    Socket listener{adi_socket(raw_listener)};
+    if (listener.descriptor == invalid_socket) {
         socket_error("socket");
     }
     int reuse = 1;
     if (::setsockopt(
-            listener.descriptor, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) != 0) {
+            native_socket(listener.descriptor),
+            SOL_SOCKET,
+            SO_REUSEADDR,
+            reinterpret_cast<const char *>(&reuse),
+            static_cast<int>(sizeof(reuse))) != 0) {
         socket_error("setsockopt");
     }
     sockaddr_in address{};
@@ -731,43 +862,77 @@ void handle_client(
         throw std::runtime_error("server: host must be an IPv4 address");
     }
     if (::bind(
-            listener.descriptor,
+            native_socket(listener.descriptor),
             reinterpret_cast<const sockaddr *>(&address),
             sizeof(address)) != 0) {
         socket_error("bind");
     }
-    if (::listen(listener.descriptor, 16) != 0) {
+    if (::listen(native_socket(listener.descriptor), 16) != 0) {
         socket_error("listen");
     }
     std::cout << "adi: listening on http://" << options.host << ':' << options.port
               << "/v1/responses\n";
     std::cout.flush();
     for (;;) {
-        Socket client{::accept4(listener.descriptor, nullptr, nullptr, SOCK_CLOEXEC)};
-        if (client.descriptor < 0) {
-            if (errno == EINTR) {
+#ifdef _WIN32
+        const auto raw_client = ::accept(
+            native_socket(listener.descriptor), nullptr, nullptr);
+#else
+        const auto raw_client = ::accept4(
+            native_socket(listener.descriptor), nullptr, nullptr, SOCK_CLOEXEC);
+#endif
+        Socket client{adi_socket(raw_client)};
+        if (client.descriptor == invalid_socket) {
+            if (socket_interrupted(socket_error_code())) {
                 continue;
             }
             socket_error("accept");
         }
+#ifdef _WIN32
+        u_long nonblocking = 1;
+        if (::ioctlsocket(
+                native_socket(client.descriptor), FIONBIO, &nonblocking) != 0) {
+            std::cerr << "adi: cannot configure client socket: socket error "
+                      << socket_error_code() << '\n';
+            continue;
+        }
+#endif
+#ifdef _WIN32
+        const DWORD io_timeout = static_cast<DWORD>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                send_idle_deadline).count());
+        if (::setsockopt(
+                native_socket(client.descriptor),
+                SOL_SOCKET,
+                SO_RCVTIMEO,
+                reinterpret_cast<const char *>(&io_timeout),
+                static_cast<int>(sizeof(io_timeout))) != 0 ||
+            ::setsockopt(
+                native_socket(client.descriptor),
+                SOL_SOCKET,
+                SO_SNDTIMEO,
+                reinterpret_cast<const char *>(&io_timeout),
+                static_cast<int>(sizeof(io_timeout))) != 0) {
+#else
         const timeval io_timeout{
             static_cast<time_t>(send_idle_deadline.count()),
             0,
         };
         if (::setsockopt(
-                client.descriptor,
+                native_socket(client.descriptor),
                 SOL_SOCKET,
                 SO_RCVTIMEO,
-                &io_timeout,
-                sizeof(io_timeout)) != 0 ||
+                reinterpret_cast<const char *>(&io_timeout),
+                static_cast<int>(sizeof(io_timeout))) != 0 ||
             ::setsockopt(
-                client.descriptor,
+                native_socket(client.descriptor),
                 SOL_SOCKET,
                 SO_SNDTIMEO,
-                &io_timeout,
-                sizeof(io_timeout)) != 0) {
+                reinterpret_cast<const char *>(&io_timeout),
+                static_cast<int>(sizeof(io_timeout))) != 0) {
+#endif
             std::cerr << "adi: cannot configure client socket: "
-                      << std::strerror(errno) << '\n';
+                      << "socket error " << socket_error_code() << '\n';
             continue;
         }
         try {

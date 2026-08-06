@@ -9,10 +9,15 @@
 #include <type_traits>
 #include <utility>
 
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace adi {
 namespace {
@@ -25,10 +30,23 @@ constexpr std::uint32_t max_dimensions = 4;
     throw std::runtime_error("GGUF: " + std::string(message));
 }
 
+#ifndef _WIN32
 [[noreturn]] void fail_errno(std::string_view action, const std::filesystem::path &path) {
     throw std::runtime_error(
         std::string(action) + " '" + path.string() + "': " + std::strerror(errno));
 }
+#endif
+
+#ifdef _WIN32
+[[noreturn]] void fail_windows(
+    std::string_view action,
+    const std::filesystem::path &path,
+    unsigned long error) {
+    throw std::runtime_error(
+        std::string(action) + " '" + path.string() + "' (Windows error " +
+        std::to_string(error) + ")");
+}
+#endif
 
 class Cursor {
   public:
@@ -184,6 +202,46 @@ T load_scalar(const std::byte *data) {
 } // namespace
 
 GgufFile::GgufFile(const std::filesystem::path &path) {
+#ifdef _WIN32
+    file_handle_ = ::CreateFileW(
+        path.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file_handle_ == INVALID_HANDLE_VALUE) {
+        file_handle_ = nullptr;
+        fail_windows("cannot open", path, ::GetLastError());
+    }
+
+    LARGE_INTEGER status{};
+    if (!::GetFileSizeEx(static_cast<HANDLE>(file_handle_), &status)) {
+        const auto error = ::GetLastError();
+        close();
+        fail_windows("cannot stat", path, error);
+    }
+    if (status.QuadPart < 24) {
+        close();
+        fail("file is too small");
+    }
+    file_size_ = static_cast<std::uint64_t>(status.QuadPart);
+    mapping_handle_ = ::CreateFileMappingW(
+        static_cast<HANDLE>(file_handle_), nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (mapping_handle_ == nullptr) {
+        const auto error = ::GetLastError();
+        close();
+        fail_windows("cannot create file mapping", path, error);
+    }
+    mapping_ = static_cast<const std::byte *>(::MapViewOfFile(
+        static_cast<HANDLE>(mapping_handle_), FILE_MAP_READ, 0, 0, 0));
+    if (mapping_ == nullptr) {
+        const auto error = ::GetLastError();
+        close();
+        fail_windows("cannot map file", path, error);
+    }
+#else
     fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd_ < 0) {
         fail_errno("cannot open", path);
@@ -210,6 +268,7 @@ GgufFile::GgufFile(const std::filesystem::path &path) {
         fail_errno("cannot mmap", path);
     }
     mapping_ = static_cast<const std::byte *>(mapping);
+#endif
 
     try {
         Cursor cursor(mapping_, file_size_);
@@ -300,7 +359,12 @@ GgufFile &GgufFile::operator=(GgufFile &&other) noexcept {
         return *this;
     }
     close();
+#ifdef _WIN32
+    file_handle_ = std::exchange(other.file_handle_, nullptr);
+    mapping_handle_ = std::exchange(other.mapping_handle_, nullptr);
+#else
     fd_ = std::exchange(other.fd_, -1);
+#endif
     mapping_ = std::exchange(other.mapping_, nullptr);
     file_size_ = std::exchange(other.file_size_, 0);
     version_ = std::exchange(other.version_, 0);
@@ -472,6 +536,20 @@ const std::byte *GgufFile::at(std::uint64_t offset, std::uint64_t size) const {
 void GgufFile::close() noexcept {
     metadata_.clear();
     tensors_.clear();
+#ifdef _WIN32
+    if (mapping_ != nullptr) {
+        ::UnmapViewOfFile(mapping_);
+        mapping_ = nullptr;
+    }
+    if (mapping_handle_ != nullptr) {
+        ::CloseHandle(static_cast<HANDLE>(mapping_handle_));
+        mapping_handle_ = nullptr;
+    }
+    if (file_handle_ != nullptr) {
+        ::CloseHandle(static_cast<HANDLE>(file_handle_));
+        file_handle_ = nullptr;
+    }
+#else
     if (mapping_ != nullptr) {
         ::munmap(const_cast<std::byte *>(mapping_), file_size_);
         mapping_ = nullptr;
@@ -480,6 +558,7 @@ void GgufFile::close() noexcept {
         ::close(fd_);
         fd_ = -1;
     }
+#endif
     file_size_ = 0;
 }
 

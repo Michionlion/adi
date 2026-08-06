@@ -10,20 +10,35 @@ integer/float tensor payload types.
 
 Initial scope:
 
-- Linux x86-64 CPU inference.
+- Linux x86-64 and native Windows x64 CPU inference.
 - Qwen3.5-MoE (`qwen3_5_moe`) as used by Mach-1.
 - One OpenAI-compatible endpoint: `POST /v1/responses`.
 - Text generation only.
 
 CUDA is a later backend, not part of the initial implementation.
 
-## Build
+## Build on Linux
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ctest --test-dir build
 ```
+
+## Build on native Windows
+
+Open a *Developer PowerShell for VS 2022* or another shell with the MSVC
+toolchain available. The Visual Studio generator produces the executable under
+`build/Release/`:
+
+```powershell
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release --parallel
+ctest --test-dir build -C Release --output-on-failure
+```
+
+The same CMake project remains usable from WSL/Linux; use a separate build
+directory when switching generators.
 
 To include tokenizer goldens plus deterministic end-to-end and batch-equivalence
 checkpoint tests:
@@ -34,6 +49,9 @@ cmake -S . -B build \
 cmake --build build -j
 ctest --test-dir build
 ```
+
+On Windows, use `-DADI_TEST_MODEL=S:/path/to/Mach-1-Additive-35B.gguf`, build
+with `--config Release`, and pass `-C Release` to `ctest`.
 
 Validate a native Mach-1 checkpoint and show the planned GGUF size:
 
@@ -49,6 +67,8 @@ python3 tools/pack_mach.py /path/to/Mach-1-Additive-35B \
 ./build/adi inspect models/Mach-1-Additive-35B.gguf
 ```
 
+On Windows, run `build/Release/adi.exe` instead of `./build/adi`.
+
 The CPU benchmark command also accepts a batch size for packed non-expert and
 output-head projections:
 
@@ -61,6 +81,13 @@ Start the Responses API:
 
 ```bash
 ./build/adi serve --model models/Mach-1-Additive-35B.gguf \
+  --host 127.0.0.1 --port 8080
+```
+
+On Windows:
+
+```powershell
+build/Release/adi.exe serve --model models/Mach-1-Additive-35B.gguf `
   --host 127.0.0.1 --port 8080
 ```
 
