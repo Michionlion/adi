@@ -49,6 +49,48 @@ int main(int argc, char **argv) {
         assert(state.position == 1);
     }
 
+    adi::DecoderState serial_sequence_state;
+    adi::DecoderScratch serial_sequence_scratch;
+    std::vector<float> serial_sequence_logits(model.config().vocabulary);
+    adi::decode_token(
+        model,
+        tokens[0],
+        serial_sequence_state,
+        {},
+        serial_sequence_scratch);
+    adi::decode_token(
+        model,
+        tokens[1],
+        serial_sequence_state,
+        serial_sequence_logits,
+        serial_sequence_scratch);
+
+    adi::DecoderState prefill_state;
+    adi::PrefillScratch prefill_scratch;
+    std::vector<float> prefill_logits(model.config().vocabulary);
+    adi::prefill(
+        model,
+        tokens,
+        prefill_state,
+        prefill_logits,
+        prefill_scratch);
+    assert(prefill_logits == serial_sequence_logits);
+    assert(prefill_state.position == serial_sequence_state.position);
+    for (std::size_t layer = 0; layer < model.config().layers; ++layer) {
+        assert(
+            prefill_state.full_attention[layer].keys ==
+            serial_sequence_state.full_attention[layer].keys);
+        assert(
+            prefill_state.full_attention[layer].values ==
+            serial_sequence_state.full_attention[layer].values);
+        assert(
+            prefill_state.linear_attention[layer].convolution ==
+            serial_sequence_state.linear_attention[layer].convolution);
+        assert(
+            prefill_state.linear_attention[layer].recurrent ==
+            serial_sequence_state.linear_attention[layer].recurrent);
+    }
+
     adi::DecoderState exhausted;
     exhausted.position = model.config().context;
     adi::DecoderScratch exhausted_scratch;

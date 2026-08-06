@@ -19,6 +19,8 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -125,6 +127,21 @@ int poll_socket(SocketHandle socket, short events, short &revents, int timeout) 
 
 struct Socket {
     SocketHandle descriptor = invalid_socket;
+    Socket() = default;
+    explicit Socket(SocketHandle value) : descriptor(value) {}
+    Socket(const Socket &) = delete;
+    Socket &operator=(const Socket &) = delete;
+    Socket(Socket &&other) noexcept
+        : descriptor(std::exchange(other.descriptor, invalid_socket)) {}
+    Socket &operator=(Socket &&other) noexcept {
+        if (this != &other) {
+            if (descriptor != invalid_socket) {
+                close_socket(descriptor);
+            }
+            descriptor = std::exchange(other.descriptor, invalid_socket);
+        }
+        return *this;
+    }
     ~Socket() {
         if (descriptor != invalid_socket) {
             close_socket(descriptor);
@@ -608,7 +625,7 @@ void stream_responses(
     Connection &connection,
     const Json &request,
     const MachModel &model,
-    Tokenizer &tokenizer) {
+    ContinuousBatcher &batcher) {
     const auto headers =
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/event-stream\r\n"
@@ -702,9 +719,7 @@ void stream_responses(
             }
             return false;
         };
-        const auto result = generate_from_prompt(
-            model,
-            tokenizer,
+        const auto result = batcher.generate_from_prompt(
             formatted_input(request),
             request_options(request),
             [&](std::string_view piece) {
@@ -774,7 +789,7 @@ void stream_responses(
 std::string handle_responses(
     const Json &request,
     const MachModel &model,
-    Tokenizer &tokenizer,
+    ContinuousBatcher &batcher,
     Connection &connection) {
     if (request.object() == nullptr) {
         throw std::runtime_error("request body must be a JSON object");
@@ -796,9 +811,7 @@ std::string handle_responses(
         }
         return false;
     };
-    const auto result = generate_from_prompt(
-        model,
-        tokenizer,
+    const auto result = batcher.generate_from_prompt(
         prompt,
         request_options(request),
         {},
@@ -810,7 +823,7 @@ std::string handle_responses(
 void handle_client(
     SocketHandle socket,
     const MachModel &model,
-    Tokenizer &tokenizer) noexcept {
+    ContinuousBatcher &batcher) noexcept {
     Connection connection{
         socket,
         std::chrono::steady_clock::now() + request_deadline,
@@ -847,13 +860,13 @@ void handle_client(
         (void)request_model(parsed, model);
         if (const auto *stream = parsed.find("stream");
             stream != nullptr && stream->boolean() != nullptr && *stream->boolean()) {
-            stream_responses(connection, parsed, model, tokenizer);
+            stream_responses(connection, parsed, model, batcher);
         } else {
             send_response(
                 connection,
                 200,
                 "OK",
-                handle_responses(parsed, model, tokenizer, connection));
+                handle_responses(parsed, model, batcher, connection));
         }
     } catch (const SocketFailure &) {
         return;
@@ -876,6 +889,7 @@ void handle_client(
 #endif
     const MachModel model(options.model);
     Tokenizer tokenizer(model);
+    ContinuousBatcher batcher(model, tokenizer);
     const auto raw_listener = ::socket(
         AF_INET,
         SOCK_STREAM
@@ -981,11 +995,15 @@ void handle_client(
                       << "socket error " << socket_error_code() << '\n';
             continue;
         }
-        try {
-            handle_client(client.descriptor, model, tokenizer);
-        } catch (...) {
-            std::cerr << "adi: unexpected connection failure\n";
-        }
+        std::thread(
+            [client = std::move(client), &model, &batcher]() mutable {
+                try {
+                    handle_client(client.descriptor, model, batcher);
+                } catch (...) {
+                    std::cerr << "adi: unexpected connection failure\n";
+                }
+            })
+            .detach();
     }
 }
 

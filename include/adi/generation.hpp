@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <random>
 #include <span>
 #include <string>
@@ -51,5 +52,24 @@ using TokenCallback = std::function<void(std::string_view)>;
     const GenerationOptions &options,
     const TokenCallback &token_callback = {},
     const CancelCallback &cancelled = {});
+
+class ContinuousBatcher {
+  public:
+    ContinuousBatcher(const MachModel &model, Tokenizer &tokenizer);
+    ~ContinuousBatcher();
+
+    ContinuousBatcher(const ContinuousBatcher &) = delete;
+    ContinuousBatcher &operator=(const ContinuousBatcher &) = delete;
+
+    [[nodiscard]] GenerationResult generate_from_prompt(
+        std::string_view formatted_prompt,
+        const GenerationOptions &options,
+        const TokenCallback &token_callback = {},
+        const CancelCallback &cancelled = {});
+
+  private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 
 } // namespace adi

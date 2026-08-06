@@ -12,7 +12,10 @@ int main(int argc, char **argv) {
     options.max_output_tokens = 1;
     options.temperature = 0.0F;
     options.top_p = 1.0F;
-    const auto result = adi::generate(model, tokenizer, "Hi", options);
+    adi::ContinuousBatcher batcher(model, tokenizer);
+    const auto result = batcher.generate_from_prompt(
+        adi::qwen_user_prompt("Hi"),
+        options);
     assert(result.text == "Here");
     assert(result.input_tokens == 11);
     assert(result.output_tokens == 1);
