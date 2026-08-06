@@ -11,7 +11,7 @@ int main() {
     assert(*value.find("max")->number() == 2.0);
     assert(*value.find("stream")->boolean() == false);
     assert(value.find("items")->array()->size() == 2);
-    assert(adi::json_string("a\n\"b") == R"("a\n\"b")");
+    assert(adi::json_string("a\n\"b") == "\"a\\n\\\"b\"");
 
     bool rejected = false;
     try {

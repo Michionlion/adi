@@ -3,11 +3,14 @@
 #include "adi/generation.hpp"
 
 #include <chrono>
+#include <cstdint>
 #include <ctime>
 #include <string>
 #include <string_view>
 
 namespace adi::server_detail {
+
+using SocketHandle = std::intptr_t;
 
 struct ResponseIdentity {
     std::string id;
@@ -25,7 +28,7 @@ struct ResponseIdentity {
     const ResponseIdentity &identity);
 
 [[nodiscard]] bool connection_cancelled(
-    int socket,
+    SocketHandle socket,
     std::chrono::steady_clock::time_point deadline) noexcept;
 
 } // namespace adi::server_detail

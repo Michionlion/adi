@@ -81,7 +81,12 @@ class GgufFile {
     void close() noexcept;
     [[nodiscard]] const std::byte *at(std::uint64_t offset, std::uint64_t size) const;
 
+#ifdef _WIN32
+    void *file_handle_ = nullptr;
+    void *mapping_handle_ = nullptr;
+#else
     int fd_ = -1;
+#endif
     const std::byte *mapping_ = nullptr;
     std::uint64_t file_size_ = 0;
     std::uint32_t version_ = 0;

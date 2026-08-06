@@ -4,7 +4,6 @@ project(adi VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-add_compile_options(-pipe)
 
 option(ADI_BUILD_TESTS "Build ADI tests" ON)
 set(ADI_TEST_MODEL "" CACHE FILEPATH "Mach-1 GGUF used for checkpoint tests")
@@ -26,14 +25,18 @@ add_library(adi_runtime STATIC
     src/version.cpp
 )
 target_include_directories(adi_runtime PUBLIC include)
-target_compile_options(adi_runtime PRIVATE
-    -Wall
-    -Wextra
-    -Wpedantic
-)
+if(MSVC)
+    target_compile_options(adi_runtime PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(adi_runtime PRIVATE -Wall -Wextra -Wpedantic)
+endif()
 
 add_executable(adi src/main.cpp)
 target_link_libraries(adi PRIVATE adi_runtime)
+
+if(WIN32)
+    target_link_libraries(adi_runtime PUBLIC ws2_32)
+endif()
 
 if(ADI_BUILD_TESTS)
     enable_testing()
@@ -109,7 +112,11 @@ if(ADI_BUILD_TESTS)
             adi_tokenizer_test
             adi_model_e2e_test
             adi_model_batch_test)
-        target_compile_options(${test_target} PRIVATE -UNDEBUG)
+        if(MSVC)
+            target_compile_options(${test_target} PRIVATE /UNDEBUG)
+        else()
+            target_compile_options(${test_target} PRIVATE -UNDEBUG)
+        endif()
     endforeach()
 
     find_package(Python3 COMPONENTS Interpreter)
