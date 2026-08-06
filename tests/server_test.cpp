@@ -33,6 +33,10 @@ int receive_some(TestSocket socket, char *data, std::size_t size) {
 void close_test_socket(TestSocket socket) {
     assert(::closesocket(socket) == 0);
 }
+
+void shutdown_send(TestSocket socket) {
+    assert(::shutdown(socket, SD_SEND) == 0);
+}
 #else
 using TestSocket = int;
 
@@ -46,6 +50,10 @@ ssize_t receive_some(TestSocket socket, char *data, std::size_t size) {
 
 void close_test_socket(TestSocket socket) {
     assert(::close(socket) == 0);
+}
+
+void shutdown_send(TestSocket socket) {
+    assert(::shutdown(socket, SHUT_WR) == 0);
 }
 #endif
 
@@ -129,11 +137,11 @@ int main() {
 #else
     int sockets[2];
     assert(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
-    assert(::shutdown(sockets[1], SHUT_WR) == 0);
     server = sockets[0];
     client = sockets[1];
 #endif
 
+    shutdown_send(client);
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(1);
     assert(!adi::server_detail::connection_cancelled(

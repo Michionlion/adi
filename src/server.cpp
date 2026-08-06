@@ -75,6 +75,12 @@ bool socket_would_block(int error) noexcept {
     return error == WSAEWOULDBLOCK;
 }
 
+constexpr int winsock_io_size(std::size_t size) noexcept {
+    return static_cast<int>(std::min(
+        size,
+        static_cast<std::size_t>(std::numeric_limits<int>::max())));
+}
+
 int poll_socket(SocketHandle socket, short events, short &revents, int timeout) noexcept {
     WSAPOLLFD descriptor{native_socket(socket), events, 0};
     const auto result = ::WSAPoll(&descriptor, 1, timeout);
@@ -130,6 +136,27 @@ class SocketFailure : public std::runtime_error {
   public:
     using std::runtime_error::runtime_error;
 };
+
+#ifdef _WIN32
+class Winsock {
+  public:
+    Winsock() {
+        WSADATA data{};
+        const auto error = ::WSAStartup(MAKEWORD(2, 2), &data);
+        if (error != 0) {
+            throw SocketFailure(
+                "WSAStartup failed: Winsock error " + std::to_string(error));
+        }
+    }
+
+    ~Winsock() {
+        ::WSACleanup();
+    }
+
+    Winsock(const Winsock &) = delete;
+    Winsock &operator=(const Winsock &) = delete;
+};
+#endif
 
 struct Connection {
     SocketHandle socket;
@@ -189,7 +216,7 @@ void send_all(Connection &connection, std::string_view data) {
             ::send(
                 native_socket(connection.socket),
                 data.data(),
-                static_cast<int>(data.size()),
+                winsock_io_size(data.size()),
                 0);
 #else
             ::send(
@@ -261,7 +288,11 @@ std::size_t receive_some(
     for (;;) {
         const auto received =
 #ifdef _WIN32
-            ::recv(native_socket(socket), buffer.data(), static_cast<int>(buffer.size()), 0);
+            ::recv(
+                native_socket(socket),
+                buffer.data(),
+                winsock_io_size(buffer.size()),
+                0);
 #else
             ::recv(native_socket(socket), buffer.data(), buffer.size(), MSG_DONTWAIT);
 #endif
@@ -827,10 +858,7 @@ void handle_client(
 
 [[noreturn]] void serve(const ServerOptions &options) {
 #ifdef _WIN32
-    WSADATA winsock{};
-    if (::WSAStartup(MAKEWORD(2, 2), &winsock) != 0) {
-        throw SocketFailure("WSAStartup failed");
-    }
+    [[maybe_unused]] Winsock winsock;
 #endif
     const MachModel model(options.model);
     Tokenizer tokenizer(model);
