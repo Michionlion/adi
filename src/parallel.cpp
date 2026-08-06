@@ -1,7 +1,6 @@
 #include "parallel.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <charconv>
 #include <condition_variable>
 #include <cstdlib>
@@ -40,13 +39,15 @@ struct TaskGroup {
     explicit TaskGroup(std::uint32_t task_count) : remaining(task_count) {}
 
     void finish(std::exception_ptr failure) noexcept {
-        if (failure) {
+        bool complete = false;
+        {
             std::lock_guard lock(mutex);
-            if (!exception) {
+            if (failure && !exception) {
                 exception = failure;
             }
+            complete = --remaining == 0;
         }
-        if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        if (complete) {
             condition.notify_one();
         }
     }
@@ -54,14 +55,14 @@ struct TaskGroup {
     void wait() {
         std::unique_lock lock(mutex);
         condition.wait(lock, [&] {
-            return remaining.load(std::memory_order_acquire) == 0;
+            return remaining == 0;
         });
         if (exception) {
             std::rethrow_exception(exception);
         }
     }
 
-    std::atomic<std::uint32_t> remaining;
+    std::uint32_t remaining;
     std::mutex mutex;
     std::condition_variable condition;
     std::exception_ptr exception;
