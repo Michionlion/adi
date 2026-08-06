@@ -3,6 +3,7 @@
 #include "adi/generation.hpp"
 #include "adi/gguf.hpp"
 #include "adi/model.hpp"
+#include "adi/profiling.hpp"
 #include "adi/server.hpp"
 #include "adi/tokenizer.hpp"
 
@@ -19,6 +20,47 @@
 #include <vector>
 
 namespace {
+
+float stable_benchmark_input(
+    std::uint64_t index,
+    std::uint64_t stream = 0) noexcept {
+    std::uint64_t value =
+        index + 0x9E3779B97F4A7C15ULL * (stream + 1);
+    value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    value = (value ^ (value >> 27)) * 0x94D049BB133111EBULL;
+    value ^= value >> 31;
+    const auto centered =
+        static_cast<std::int32_t>((value >> 40) & 0xFFFFFFU) - 0x800000;
+    return static_cast<float>(centered) / 8388608.0F;
+}
+
+template <typename Function>
+int profiled_benchmark(Function &&function) {
+    adi::reset_kernel_profiles();
+    adi::set_kernel_profiling_enabled(true);
+    try {
+        const int result = function();
+        adi::set_kernel_profiling_enabled(false);
+        std::cout << "kernel_profile:\n";
+        const auto profiles = adi::kernel_profiles();
+        for (std::size_t index = 0; index < profiles.size(); ++index) {
+            const auto &profile = profiles[index];
+            if (profile.calls == 0) {
+                continue;
+            }
+            const auto kind = static_cast<adi::KernelKind>(index);
+            std::cout << "  " << adi::kernel_name(kind)
+                      << " calls=" << profile.calls
+                      << " milliseconds="
+                      << static_cast<double>(profile.nanoseconds) / 1.0e6
+                      << " work_items=" << profile.work_items << '\n';
+        }
+        return result;
+    } catch (...) {
+        adi::set_kernel_profiling_enabled(false);
+        throw;
+    }
+}
 
 int inspect(const char *path) {
     const adi::GgufFile file(path);
@@ -83,6 +125,7 @@ int validate(const char *path) {
     const adi::MachModel model(path);
     const auto &config = model.config();
     std::cout << "valid Mach additive model\n"
+              << "cpu backend: " << adi::cpu_backend().name << '\n'
               << "layers: " << config.layers << '\n'
               << "hidden: " << config.hidden << '\n'
               << "experts: " << config.experts << '\n'
@@ -105,7 +148,7 @@ int bench_expert(int argc, char **argv) {
     const auto matrix = model.expert(layer, expert, projection);
     std::vector<float> input(matrix.columns);
     for (std::size_t index = 0; index < input.size(); ++index) {
-        input[index] = std::sin(static_cast<float>(index) * 0.01F);
+        input[index] = stable_benchmark_input(index);
     }
     std::vector<float> output(matrix.rows);
     adi::ExpertScratch scratch;
@@ -171,8 +214,7 @@ int bench_ne(int argc, char **argv) {
             inputs[
                 static_cast<std::size_t>(batch_index) * matrix.columns +
                 column] =
-                std::sin(
-                    static_cast<float>(column + batch_index) * 0.01F);
+                stable_benchmark_input(column, batch_index);
         }
     }
     std::vector<float> outputs(
@@ -216,8 +258,7 @@ int bench_head(int argc, char **argv) {
             inputs[
                 static_cast<std::size_t>(batch_index) * head.columns +
                 column] =
-                std::sin(
-                    static_cast<float>(column + batch_index) * 0.01F);
+                stable_benchmark_input(column, batch_index);
         }
     }
     std::vector<float> outputs(
@@ -271,7 +312,7 @@ int bench_moe(int argc, char **argv) {
     }
     std::vector<float> input(model.config().hidden);
     for (std::size_t index = 0; index < input.size(); ++index) {
-        input[index] = std::sin(static_cast<float>(index) * 0.01F);
+        input[index] = stable_benchmark_input(index);
     }
     std::vector<float> output(model.config().hidden);
     adi::MoeScratch scratch;
@@ -310,8 +351,7 @@ int bench_attention(int argc, char **argv) {
     const auto start = std::chrono::steady_clock::now();
     for (std::uint32_t position = 0; position < tokens; ++position) {
         for (std::size_t index = 0; index < input.size(); ++index) {
-            input[index] =
-                std::sin(static_cast<float>(index + position) * 0.01F);
+            input[index] = stable_benchmark_input(index, position);
         }
         adi::full_attention_forward(
             model, layer, position, input, output, state, scratch);
@@ -342,8 +382,7 @@ int bench_linear_attention(int argc, char **argv) {
     const auto start = std::chrono::steady_clock::now();
     for (std::uint32_t position = 0; position < tokens; ++position) {
         for (std::size_t index = 0; index < input.size(); ++index) {
-            input[index] =
-                std::sin(static_cast<float>(index + position) * 0.01F);
+            input[index] = stable_benchmark_input(index, position);
         }
         adi::linear_attention_forward(
             model, layer, input, output, state, scratch);
@@ -519,7 +558,7 @@ int main(int argc, char **argv) {
     }
     if ((argc == 6 || argc == 7) && std::string_view(argv[1]) == "bench-expert") {
         try {
-            return bench_expert(argc, argv);
+            return profiled_benchmark([&] { return bench_expert(argc, argv); });
         } catch (const std::exception &error) {
             std::cerr << "adi: " << error.what() << '\n';
             return 1;
@@ -528,7 +567,7 @@ int main(int argc, char **argv) {
     if ((argc == 5 || argc == 6 || argc == 7) &&
         std::string_view(argv[1]) == "bench-ne") {
         try {
-            return bench_ne(argc, argv);
+            return profiled_benchmark([&] { return bench_ne(argc, argv); });
         } catch (const std::exception &error) {
             std::cerr << "adi: " << error.what() << '\n';
             return 1;
@@ -537,7 +576,7 @@ int main(int argc, char **argv) {
     if ((argc == 4 || argc == 5 || argc == 6) &&
         std::string_view(argv[1]) == "bench-head") {
         try {
-            return bench_head(argc, argv);
+            return profiled_benchmark([&] { return bench_head(argc, argv); });
         } catch (const std::exception &error) {
             std::cerr << "adi: " << error.what() << '\n';
             return 1;
@@ -553,7 +592,7 @@ int main(int argc, char **argv) {
     }
     if ((argc == 4 || argc == 5) && std::string_view(argv[1]) == "bench-moe") {
         try {
-            return bench_moe(argc, argv);
+            return profiled_benchmark([&] { return bench_moe(argc, argv); });
         } catch (const std::exception &error) {
             std::cerr << "adi: " << error.what() << '\n';
             return 1;
@@ -562,7 +601,8 @@ int main(int argc, char **argv) {
     if ((argc == 4 || argc == 5) &&
         std::string_view(argv[1]) == "bench-attention") {
         try {
-            return bench_attention(argc, argv);
+            return profiled_benchmark(
+                [&] { return bench_attention(argc, argv); });
         } catch (const std::exception &error) {
             std::cerr << "adi: " << error.what() << '\n';
             return 1;
@@ -570,7 +610,8 @@ int main(int argc, char **argv) {
     }
     if ((argc == 4 || argc == 5) && std::string_view(argv[1]) == "bench-linear") {
         try {
-            return bench_linear_attention(argc, argv);
+            return profiled_benchmark(
+                [&] { return bench_linear_attention(argc, argv); });
         } catch (const std::exception &error) {
             std::cerr << "adi: " << error.what() << '\n';
             return 1;
@@ -578,7 +619,8 @@ int main(int argc, char **argv) {
     }
     if (argc == 4 && std::string_view(argv[1]) == "decode-token") {
         try {
-            return decode_one(argv[2], argv[3]);
+            return profiled_benchmark(
+                [&] { return decode_one(argv[2], argv[3]); });
         } catch (const std::exception &error) {
             std::cerr << "adi: " << error.what() << '\n';
             return 1;
@@ -586,7 +628,8 @@ int main(int argc, char **argv) {
     }
     if (argc == 5 && std::string_view(argv[1]) == "decode-batch") {
         try {
-            return decode_batch(argv[2], argv[3], argv[4]);
+            return profiled_benchmark(
+                [&] { return decode_batch(argv[2], argv[3], argv[4]); });
         } catch (const std::exception &error) {
             std::cerr << "adi: " << error.what() << '\n';
             return 1;

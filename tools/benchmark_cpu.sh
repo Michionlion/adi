@@ -25,6 +25,10 @@ lscpu | sed -n \
     -e '/^CPU(s):/p' \
     -e '/^Model name:/p' \
     -e '/^Thread(s) per core:/p'
+echo "Compiler"
+c++ --version | sed -n '1p'
+echo "ADI_THREADS: ${ADI_THREADS:-auto}"
+echo "ADI_CPU_ISA: ${ADI_CPU_ISA:-auto}"
 echo
 
 "$binary" validate "$model_path"

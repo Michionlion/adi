@@ -18,6 +18,7 @@ add_library(adi_runtime STATIC
     src/json.cpp
     src/kernels.cpp
     src/model.cpp
+    src/profiling.cpp
     src/server.cpp
     src/tokenizer.cpp
     src/unicode.cpp
@@ -55,6 +56,7 @@ if(ADI_BUILD_TESTS)
 
     add_executable(adi_executor_test tests/executor_test.cpp)
     target_link_libraries(adi_executor_test PRIVATE adi_runtime)
+    target_include_directories(adi_executor_test PRIVATE src)
     add_test(NAME executor COMMAND adi_executor_test)
 
     add_executable(adi_generation_test tests/generation_test.cpp)
