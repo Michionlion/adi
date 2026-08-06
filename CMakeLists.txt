@@ -21,6 +21,9 @@ add_library(adi_runtime STATIC
     src/parallel.cpp
     src/profiling.cpp
     src/server.cpp
+    src/simd.cpp
+    src/simd_arm.cpp
+    src/simd_x86.cpp
     src/tokenizer.cpp
     src/unicode.cpp
     src/utf8.cpp
