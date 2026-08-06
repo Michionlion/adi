@@ -269,9 +269,160 @@ void mach_expert_matvec(
         std::copy_n(row_sums, tile_size, scratch.output.begin() + tile_row * tile_size);
     }
 
-    hadamard(scratch.output);
+    detail::hadamard_transform(scratch.output);
     for (std::size_t index = 0; index < output.size(); ++index) {
         output[index] = scratch.output[index] * f16_to_f32(matrix.sv_f16[index]);
+    }
+}
+
+void mach_expert_matmul(
+    const MachExpertMatrix &matrix,
+    std::span<const float> inputs,
+    std::uint32_t batch,
+    std::span<float> outputs,
+    ExpertScratch &scratch) {
+    if (batch == 1) {
+        mach_expert_matvec(matrix, inputs, outputs, scratch);
+        return;
+    }
+    detail::KernelTimer timer(
+        KernelKind::expert_batch,
+        static_cast<std::uint64_t>(matrix.rows) * matrix.columns * batch);
+    if (batch == 0 || !is_power_of_two(matrix.rows) ||
+        !is_power_of_two(matrix.columns) || matrix.rows % tile_size != 0 ||
+        matrix.columns % tile_size != 0 ||
+        inputs.size() != static_cast<std::size_t>(batch) * matrix.columns ||
+        outputs.size() != static_cast<std::size_t>(batch) * matrix.rows ||
+        matrix.su_f16.size() != matrix.columns ||
+        matrix.sv_f16.size() != matrix.rows) {
+        throw std::invalid_argument("Mach expert batch shape mismatch");
+    }
+    const auto tile_rows = matrix.rows / tile_size;
+    const auto tile_columns = matrix.columns / tile_size;
+    const auto tile_count =
+        static_cast<std::size_t>(tile_rows) * tile_columns;
+    if (matrix.trellis.size() != tile_count * words_per_tile ||
+        matrix.wave_gamma_f16.size() != tile_rows + tile_columns ||
+        matrix.tlut.size() != 32768 * values_per_state) {
+        throw std::invalid_argument("Mach expert codec tensor shape mismatch");
+    }
+
+    scratch.input.resize(
+        static_cast<std::size_t>(batch) * matrix.columns);
+    scratch.output.assign(
+        static_cast<std::size_t>(batch) * matrix.rows,
+        0.0F);
+    for (std::uint32_t batch_index = 0;
+         batch_index < batch;
+         ++batch_index) {
+        auto transformed = std::span<float>(scratch.input).subspan(
+            static_cast<std::size_t>(batch_index) * matrix.columns,
+            matrix.columns);
+        const auto source = inputs.subspan(
+            static_cast<std::size_t>(batch_index) * matrix.columns,
+            matrix.columns);
+        for (std::uint32_t column = 0;
+             column < matrix.columns;
+             ++column) {
+            transformed[column] =
+                source[column] * f16_to_f32(matrix.su_f16[column]);
+        }
+        detail::hadamard_transform(transformed);
+    }
+    build_wave_indexes(tile_rows, tile_columns, scratch.wave_indexes);
+
+    std::vector<float> row_sums(
+        static_cast<std::size_t>(batch) * tile_size);
+    std::vector<float> partial(
+        static_cast<std::size_t>(batch) * tile_size);
+    for (std::uint32_t tile_row = 0;
+         tile_row < tile_rows;
+         ++tile_row) {
+        std::fill(row_sums.begin(), row_sums.end(), 0.0F);
+        for (std::uint32_t tile_column = 0;
+             tile_column < tile_columns;
+             ++tile_column) {
+            std::fill(partial.begin(), partial.end(), 0.0F);
+            const auto tile_index =
+                static_cast<std::size_t>(tile_row) * tile_columns +
+                tile_column;
+            const auto *words =
+                matrix.trellis.data() + tile_index * words_per_tile;
+            std::uint32_t state = words[0];
+            for (std::uint32_t state_index = 0;
+                 state_index < states_per_tile;
+                 ++state_index) {
+                if (state_index != 0) {
+                    const auto position =
+                        register_bits + (state_index - 1) * fresh_bits;
+                    state =
+                        ((state << fresh_bits) & 0xFFFFU) |
+                        extract_stream_bits(
+                            words,
+                            words_per_tile,
+                            stream_bits,
+                            position,
+                            fresh_bits);
+                }
+                for (std::uint32_t component = 0;
+                     component < values_per_state;
+                     ++component) {
+                    const auto element =
+                        state_index * values_per_state + component;
+                    const auto local_row = element / tile_size;
+                    const auto local_column = element % tile_size;
+                    const auto column =
+                        tile_column * tile_size + local_column;
+                    const float weight =
+                        lattice_value(matrix.tlut, state, component);
+                    for (std::uint32_t batch_index = 0;
+                         batch_index < batch;
+                         ++batch_index) {
+                        partial[
+                            static_cast<std::size_t>(batch_index) *
+                                tile_size +
+                            local_row] +=
+                            weight *
+                            scratch.input[
+                                static_cast<std::size_t>(batch_index) *
+                                    matrix.columns +
+                                column];
+                    }
+                }
+            }
+            const float gamma = f16_to_f32(
+                matrix.wave_gamma_f16[scratch.wave_indexes[tile_index]]);
+            for (std::size_t index = 0; index < row_sums.size(); ++index) {
+                row_sums[index] += partial[index] * gamma;
+            }
+        }
+        for (std::uint32_t batch_index = 0;
+             batch_index < batch;
+             ++batch_index) {
+            std::copy_n(
+                row_sums.begin() +
+                    static_cast<std::size_t>(batch_index) * tile_size,
+                tile_size,
+                scratch.output.begin() +
+                    static_cast<std::size_t>(batch_index) * matrix.rows +
+                    tile_row * tile_size);
+        }
+    }
+
+    for (std::uint32_t batch_index = 0;
+         batch_index < batch;
+         ++batch_index) {
+        auto transformed = std::span<float>(scratch.output).subspan(
+            static_cast<std::size_t>(batch_index) * matrix.rows,
+            matrix.rows);
+        detail::hadamard_transform(transformed);
+        auto destination = outputs.subspan(
+            static_cast<std::size_t>(batch_index) * matrix.rows,
+            matrix.rows);
+        for (std::uint32_t row = 0; row < matrix.rows; ++row) {
+            destination[row] =
+                transformed[row] * f16_to_f32(matrix.sv_f16[row]);
+        }
     }
 }
 
@@ -280,6 +431,9 @@ void mach_ne_matvec(
     std::span<const float> input,
     std::span<float> output,
     ExpertScratch &scratch) {
+    detail::KernelTimer timer(
+        KernelKind::non_expert,
+        static_cast<std::uint64_t>(matrix.rows) * matrix.columns);
     constexpr std::uint32_t ne_values_per_state = 2;
     constexpr std::uint32_t ne_fresh_bits = 8;
     constexpr std::uint32_t ne_states_per_tile = tile_values / ne_values_per_state;
@@ -574,6 +728,9 @@ void mach_head_matvec(
     const MachHeadChunk &head,
     std::span<const float> input,
     std::span<float> output) {
+    detail::KernelTimer timer(
+        KernelKind::output_head,
+        static_cast<std::uint64_t>(head.rows) * head.columns);
     constexpr std::uint32_t group = 64;
     if (head.columns % group != 0 || input.size() != head.columns ||
         output.size() != head.rows ||
@@ -590,26 +747,11 @@ void mach_head_matvec(
             const auto packed_row =
                 head.packed.subspan(static_cast<std::size_t>(row) * bytes_per_row,
                                     bytes_per_row);
-            float sum = 0.0F;
-            for (std::uint32_t block = 0; block < head.columns / 8; ++block) {
-                std::uint64_t word = 0;
-                for (std::uint32_t byte = 0; byte < 5; ++byte) {
-                    word |= static_cast<std::uint64_t>(
-                                packed_row[block * 5 + byte])
-                            << (byte * 8);
-                }
-                for (std::uint32_t index = 0; index < 8; ++index) {
-                    const auto column = block * 8 + index;
-                    const auto code = static_cast<std::int32_t>(
-                        (word >> (index * 5)) & 0x1FU) - 16;
-                    const float scale = f16_to_f32(
-                        head.group_scale_f16[
-                            static_cast<std::size_t>(row) * groups_per_row +
-                            column / group]);
-                    sum += static_cast<float>(code) * scale * input[column];
-                }
-            }
-            output[row] = sum;
+            const auto scales = head.group_scale_f16.subspan(
+                static_cast<std::size_t>(row) * groups_per_row,
+                groups_per_row);
+            output[row] =
+                detail::int5_scaled_dot(packed_row, scales, input);
         }
     });
 
@@ -626,14 +768,11 @@ void mach_head_matvec(
         if (row >= head.rows) {
             throw std::invalid_argument("Mach protected output row is out of range");
         }
-        float sum = 0.0F;
-        for (std::uint32_t column = 0; column < head.columns; ++column) {
-            sum += bf16_to_f32(
-                       head.protected_bf16[
-                           protected_index * head.columns + column]) *
-                   input[column];
-        }
-        output[row] = sum;
+        output[row] = detail::bf16_dot(
+            head.protected_bf16.subspan(
+                protected_index * head.columns,
+                head.columns),
+            input);
     }
 }
 
@@ -646,6 +785,9 @@ void mach_head_matmul(
         mach_head_matvec(head, inputs, outputs);
         return;
     }
+    detail::KernelTimer timer(
+        KernelKind::output_head_batch,
+        static_cast<std::uint64_t>(head.rows) * head.columns * batch);
     constexpr std::uint32_t group = 64;
     if (batch == 0 || head.columns % group != 0 ||
         inputs.size() != static_cast<std::size_t>(batch) * head.columns ||
@@ -659,45 +801,25 @@ void mach_head_matmul(
     const auto bytes_per_row = head.columns / 8 * 5;
     const auto groups_per_row = head.columns / group;
     parallel_ranges(head.rows, 512, [&](std::uint32_t row_begin, std::uint32_t row_end) {
-        std::vector<float> sums(batch);
         for (std::uint32_t row = row_begin; row < row_end; ++row) {
-            std::fill(sums.begin(), sums.end(), 0.0F);
             const auto packed_row =
                 head.packed.subspan(static_cast<std::size_t>(row) * bytes_per_row,
                                     bytes_per_row);
-            for (std::uint32_t block = 0; block < head.columns / 8; ++block) {
-                std::uint64_t word = 0;
-                for (std::uint32_t byte = 0; byte < 5; ++byte) {
-                    word |= static_cast<std::uint64_t>(packed_row[block * 5 + byte])
-                            << (byte * 8);
-                }
-                for (std::uint32_t index = 0; index < 8; ++index) {
-                    const auto column = block * 8 + index;
-                    const auto code = static_cast<std::int32_t>(
-                        (word >> (index * 5)) & 0x1FU) - 16;
-                    const float scale = f16_to_f32(
-                        head.group_scale_f16[
-                            static_cast<std::size_t>(row) * groups_per_row +
-                            column / group]);
-                    const float weight = static_cast<float>(code) * scale;
-                    for (std::uint32_t batch_index = 0;
-                         batch_index < batch;
-                         ++batch_index) {
-                        sums[batch_index] +=
-                            weight *
-                            inputs[
-                                static_cast<std::size_t>(batch_index) *
-                                    head.columns +
-                                column];
-                    }
-                }
-            }
+            const auto scales = head.group_scale_f16.subspan(
+                static_cast<std::size_t>(row) * groups_per_row,
+                groups_per_row);
             for (std::uint32_t batch_index = 0;
                  batch_index < batch;
                  ++batch_index) {
                 outputs[
                     static_cast<std::size_t>(batch_index) * head.rows + row] =
-                    sums[batch_index];
+                    detail::int5_scaled_dot(
+                        packed_row,
+                        scales,
+                        inputs.subspan(
+                            static_cast<std::size_t>(batch_index) *
+                                head.columns,
+                            head.columns));
             }
         }
     });
@@ -718,19 +840,15 @@ void mach_head_matmul(
         for (std::uint32_t batch_index = 0;
              batch_index < batch;
              ++batch_index) {
-            float sum = 0.0F;
-            for (std::uint32_t column = 0; column < head.columns; ++column) {
-                sum +=
-                    bf16_to_f32(
-                        head.protected_bf16[
-                            protected_index * head.columns + column]) *
-                    inputs[
-                        static_cast<std::size_t>(batch_index) * head.columns +
-                        column];
-            }
             outputs[
                 static_cast<std::size_t>(batch_index) * head.rows + row] =
-                sum;
+                detail::bf16_dot(
+                    head.protected_bf16.subspan(
+                        protected_index * head.columns,
+                        head.columns),
+                    inputs.subspan(
+                        static_cast<std::size_t>(batch_index) * head.columns,
+                        head.columns));
         }
     }
 }
@@ -739,18 +857,57 @@ void bf16_matvec(
     const Bf16Matrix &matrix,
     std::span<const float> input,
     std::span<float> output) {
+    detail::KernelTimer timer(
+        KernelKind::bf16_projection,
+        static_cast<std::uint64_t>(matrix.rows) * matrix.columns);
     if (input.size() != matrix.columns || output.size() != matrix.rows ||
         matrix.values.size() !=
             static_cast<std::size_t>(matrix.rows) * matrix.columns) {
         throw std::invalid_argument("BF16 matrix-vector shape mismatch");
     }
     for (std::uint32_t row = 0; row < matrix.rows; ++row) {
-        float sum = 0.0F;
         const auto offset = static_cast<std::size_t>(row) * matrix.columns;
-        for (std::uint32_t column = 0; column < matrix.columns; ++column) {
-            sum += bf16_to_f32(matrix.values[offset + column]) * input[column];
+        output[row] = detail::bf16_dot(
+            matrix.values.subspan(offset, matrix.columns),
+            input);
+    }
+}
+
+void bf16_matmul(
+    const Bf16Matrix &matrix,
+    std::span<const float> inputs,
+    std::uint32_t batch,
+    std::span<float> outputs) {
+    if (batch == 1) {
+        bf16_matvec(matrix, inputs, outputs);
+        return;
+    }
+    if (batch == 0 ||
+        inputs.size() != static_cast<std::size_t>(batch) * matrix.columns ||
+        outputs.size() != static_cast<std::size_t>(batch) * matrix.rows ||
+        matrix.values.size() !=
+            static_cast<std::size_t>(matrix.rows) * matrix.columns) {
+        throw std::invalid_argument("BF16 matrix batch shape mismatch");
+    }
+    detail::KernelTimer timer(
+        KernelKind::bf16_projection,
+        static_cast<std::uint64_t>(matrix.rows) * matrix.columns * batch);
+    for (std::uint32_t row = 0; row < matrix.rows; ++row) {
+        const auto weights = matrix.values.subspan(
+            static_cast<std::size_t>(row) * matrix.columns,
+            matrix.columns);
+        for (std::uint32_t batch_index = 0;
+             batch_index < batch;
+             ++batch_index) {
+            outputs[
+                static_cast<std::size_t>(batch_index) * matrix.rows + row] =
+                detail::bf16_dot(
+                    weights,
+                    inputs.subspan(
+                        static_cast<std::size_t>(batch_index) *
+                            matrix.columns,
+                        matrix.columns));
         }
-        output[row] = sum;
     }
 }
 

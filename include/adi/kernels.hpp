@@ -65,6 +65,13 @@ void mach_expert_matvec(
     std::span<float> output,
     ExpertScratch &scratch);
 
+void mach_expert_matmul(
+    const MachExpertMatrix &matrix,
+    std::span<const float> inputs,
+    std::uint32_t batch,
+    std::span<float> outputs,
+    ExpertScratch &scratch);
+
 // Computes y = W*x from the canonical K=4/V=2 non-expert stream.
 void mach_ne_matvec(
     const MachNeMatrix &matrix,
@@ -103,6 +110,12 @@ void bf16_matvec(
     const Bf16Matrix &matrix,
     std::span<const float> input,
     std::span<float> output);
+
+void bf16_matmul(
+    const Bf16Matrix &matrix,
+    std::span<const float> inputs,
+    std::uint32_t batch,
+    std::span<float> outputs);
 
 void rms_norm(
     std::span<const float> input,
