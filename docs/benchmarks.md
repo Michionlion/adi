@@ -45,3 +45,29 @@ tools/benchmark_cpu.sh models/Mach-1-Additive-35B.gguf
 ```
 
 Add `--full` to include the slower full-token measurement.
+
+## Runtime-dispatch and layer-major increment
+
+Benchmark commands now use deterministic integer-hash inputs rather than
+libm-generated vectors. They also print per-kernel call, elapsed-nanosecond,
+and work-item counters. `tools/benchmark_cpu.sh` records the CPU, compiler,
+`ADI_THREADS`, and `ADI_CPU_ISA` settings.
+
+The following single-run Release measurements used GCC 14.2, eight workers,
+and the same EPYC 9645 machine:
+
+| Operation | Scalar | AVX-512 | Result |
+| --- | ---: | ---: | --- |
+| Int5 output-head chunk, 31,040 × 2,048 | 26.77 ms | 4.17 ms | 6.4× |
+| Non-expert projection, 512 × 2,048 | 1.69 ms | 2.05 ms | no measured SIMD gain |
+
+The AVX-512 and scalar output-head runs have the same deterministic checksum.
+Random kernel tests bound BF16/int5 lane-reduction differences. Trellis
+extraction, SIMD Hadamard stages, batch decoding, prompt logits, KV state, and
+recurrent state remain bit-exact against their scalar or serial references.
+
+A warmed complete token measured 3.64 seconds (0.274 token/s), versus the prior
+recorded 4.13 seconds. The 11-token prompt plus one greedy output-token
+checkpoint completes in roughly 12.5 seconds through layer-major prefill.
+These are regression observations, not final throughput claims; repeat runs
+and report variance before publishing tuned numbers.
