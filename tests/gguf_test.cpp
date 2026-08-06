@@ -1,5 +1,6 @@
 #include "adi/gguf.hpp"
 
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
@@ -26,6 +27,7 @@ void append_string(std::vector<std::byte> &bytes, std::string_view value) {
 }
 
 std::filesystem::path write_fixture(bool truncate = false) {
+    static std::atomic<std::uint64_t> fixture_counter = 0;
     std::vector<std::byte> bytes;
     append(bytes, std::uint32_t{0x46554747});
     append(bytes, std::uint32_t{3});
@@ -71,10 +73,16 @@ std::filesystem::path write_fixture(bool truncate = false) {
         bytes.resize(bytes.size() - 1);
     }
 
-    const auto path = std::filesystem::temp_directory_path() /
-                      ("adi-gguf-test-" + std::to_string(
-                           std::chrono::steady_clock::now().time_since_epoch().count()) +
-                       (truncate ? "-bad.gguf" : ".gguf"));
+    const auto clock_nonce =
+        std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto process_nonce =
+        reinterpret_cast<std::uintptr_t>(&fixture_counter);
+    const auto instance_nonce = fixture_counter.fetch_add(1);
+    const auto path =
+        std::filesystem::temp_directory_path() /
+        ("adi-gguf-test-" + std::to_string(clock_nonce) + "-" +
+         std::to_string(process_nonce) + "-" + std::to_string(instance_nonce) +
+         (truncate ? "-bad.gguf" : ".gguf"));
     std::ofstream output(path, std::ios::binary);
     output.write(reinterpret_cast<const char *>(bytes.data()),
                  static_cast<std::streamsize>(bytes.size()));

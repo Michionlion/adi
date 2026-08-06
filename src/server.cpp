@@ -846,13 +846,17 @@ void handle_client(
     if (listener.descriptor == invalid_socket) {
         socket_error("socket");
     }
-    int reuse = 1;
+    int address_option = 1;
     if (::setsockopt(
             native_socket(listener.descriptor),
             SOL_SOCKET,
+#ifdef _WIN32
+            SO_EXCLUSIVEADDRUSE,
+#else
             SO_REUSEADDR,
-            reinterpret_cast<const char *>(&reuse),
-            static_cast<int>(sizeof(reuse))) != 0) {
+#endif
+            reinterpret_cast<const char *>(&address_option),
+            static_cast<int>(sizeof(address_option))) != 0) {
         socket_error("setsockopt");
     }
     sockaddr_in address{};
