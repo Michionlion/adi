@@ -211,6 +211,19 @@ int main() {
         std::abs(head_scalar[0] - head_native[0]) <=
         1.0e-5F * std::max(1.0F, std::abs(head_scalar[0])));
 
+    auto invalid_head_input = head_input;
+    invalid_head_input.push_back(1.0F);
+    bool invalid_int5_shape = false;
+    adi::detail::force_cpu_isa_for_testing(adi::detail::CpuIsa::scalar);
+    try {
+        (void)adi::detail::int5_scaled_dot(
+            packed_head, head_scales, invalid_head_input);
+    } catch (const std::invalid_argument &) {
+        invalid_int5_shape = true;
+    }
+    assert(invalid_int5_shape);
+    adi::detail::force_cpu_isa_for_testing(native_isa);
+
     std::vector<float> head_inputs(2 * 64);
     std::fill_n(head_inputs.begin(), 64, 1.0F);
     std::fill_n(head_inputs.begin() + 64, 64, 2.0F);

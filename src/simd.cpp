@@ -190,6 +190,13 @@ float int5_scaled_dot(
     std::span<const std::uint8_t> packed,
     std::span<const std::uint16_t> scales,
     std::span<const float> input) {
+    constexpr std::size_t group = 64;
+    constexpr std::size_t bytes_per_group = 40;
+    if (scales.empty() ||
+        packed.size() != scales.size() * bytes_per_group ||
+        input.size() != scales.size() * group) {
+        throw std::invalid_argument("int5 dot shape mismatch");
+    }
     const auto isa = selected_cpu_isa();
     if (isa == CpuIsa::avx2 || isa == CpuIsa::avx512) {
         return x86_int5_scaled_dot(packed, scales, input, isa);

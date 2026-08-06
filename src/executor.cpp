@@ -1269,6 +1269,7 @@ void decode_batch(
                 {},
                 {},
                 backend);
+            batch_scratch.head_inputs.resize(batch * config.hidden);
             for (std::size_t batch_index = 0;
                  batch_index < batch;
                  ++batch_index) {
@@ -1289,7 +1290,6 @@ void decode_batch(
                     1.0F,
                     1.0e-6F,
                     scratch.normalized);
-                batch_scratch.head_inputs.resize(batch * config.hidden);
                 std::copy(
                     scratch.normalized.begin(),
                     scratch.normalized.end(),
@@ -1517,6 +1517,7 @@ void prefill(
                 scratch.rope_cosine,
                 scratch.rope_sine,
                 backend);
+            scratch.batch.head_inputs.resize(count * config.hidden);
             for (std::size_t token_index = 0;
                  token_index < count;
                  ++token_index) {
@@ -1540,7 +1541,6 @@ void prefill(
                     1.0F,
                     1.0e-6F,
                     scratch.token.normalized);
-                scratch.batch.head_inputs.resize(count * config.hidden);
                 std::copy(
                     scratch.token.normalized.begin(),
                     scratch.token.normalized.end(),
