@@ -9,6 +9,7 @@ option(ADI_BUILD_TESTS "Build ADI tests" ON)
 set(ADI_TEST_MODEL "" CACHE FILEPATH "Mach-1 GGUF used for checkpoint tests")
 
 add_library(adi_runtime STATIC
+    src/attention.cpp
     src/backend.cpp
     src/bpe.cpp
     src/chat.cpp
