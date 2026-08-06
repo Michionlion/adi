@@ -76,6 +76,21 @@ int main(int argc, char **argv) {
         prefill_scratch);
     assert(prefill_logits == serial_sequence_logits);
     assert(prefill_state.position == serial_sequence_state.position);
+
+    adi::DecoderState chunked_prefill_state;
+    adi::PrefillScratch chunked_prefill_scratch;
+    std::vector<float> chunked_prefill_logits(model.config().vocabulary);
+    for (std::size_t index = 0; index < tokens.size(); ++index) {
+        adi::prefill(
+            model,
+            std::span<const std::uint32_t>(tokens).subspan(index, 1),
+            chunked_prefill_state,
+            chunked_prefill_logits,
+            chunked_prefill_scratch);
+    }
+    assert(chunked_prefill_logits == prefill_logits);
+    assert(chunked_prefill_state.position == prefill_state.position);
+
     for (std::size_t layer = 0; layer < model.config().layers; ++layer) {
         assert(
             prefill_state.full_attention[layer].keys ==
@@ -89,6 +104,18 @@ int main(int argc, char **argv) {
         assert(
             prefill_state.linear_attention[layer].recurrent ==
             serial_sequence_state.linear_attention[layer].recurrent);
+        assert(
+            chunked_prefill_state.full_attention[layer].keys ==
+            prefill_state.full_attention[layer].keys);
+        assert(
+            chunked_prefill_state.full_attention[layer].values ==
+            prefill_state.full_attention[layer].values);
+        assert(
+            chunked_prefill_state.linear_attention[layer].convolution ==
+            prefill_state.linear_attention[layer].convolution);
+        assert(
+            chunked_prefill_state.linear_attention[layer].recurrent ==
+            prefill_state.linear_attention[layer].recurrent);
     }
 
     adi::DecoderState exhausted;

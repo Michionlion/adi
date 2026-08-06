@@ -2,6 +2,7 @@
 #include "utf8.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cmath>
 #include <deque>
@@ -30,6 +31,37 @@ void validate_generation_options(
         options.top_p <= 0.0F || options.top_p > 1.0F) {
         throw std::invalid_argument("invalid generation options");
     }
+}
+
+constexpr std::size_t prefill_chunk_tokens = 64;
+
+void throw_if_cancelled(const CancelCallback &cancelled) {
+    if (cancelled && cancelled()) {
+        throw std::runtime_error("generation cancelled");
+    }
+}
+
+void prefill_prompt(
+    const MachModel &model,
+    std::span<const std::uint32_t> tokens,
+    DecoderState &state,
+    std::span<float> logits,
+    PrefillScratch &scratch,
+    const CancelCallback &cancelled) {
+    for (std::size_t offset = 0; offset < tokens.size();
+         offset += prefill_chunk_tokens) {
+        throw_if_cancelled(cancelled);
+        const auto count = std::min(
+            prefill_chunk_tokens,
+            tokens.size() - offset);
+        prefill(
+            model,
+            tokens.subspan(offset, count),
+            state,
+            logits,
+            scratch);
+    }
+    throw_if_cancelled(cancelled);
 }
 
 } // namespace
@@ -134,10 +166,13 @@ GenerationResult generate_from_prompt(
     DecoderScratch scratch;
     PrefillScratch prefill_scratch;
     std::vector<float> logits(model.config().vocabulary);
-    if (cancelled && cancelled()) {
-        throw std::runtime_error("generation cancelled");
-    }
-    prefill(model, prompt_tokens, state, logits, prefill_scratch);
+    prefill_prompt(
+        model,
+        prompt_tokens,
+        state,
+        logits,
+        prefill_scratch,
+        cancelled);
     tokenizer.mask_unused_logits(logits);
     std::mt19937_64 random(options.seed);
     std::vector<std::uint32_t> output_tokens;
@@ -173,11 +208,43 @@ GenerationResult generate_from_prompt(
 
 struct ContinuousBatcher::Impl {
     struct Request {
+        [[nodiscard]] bool is_cancelled() const {
+            if (callback_failed.load(std::memory_order_acquire)) {
+                return true;
+            }
+            return cancelled && cancelled();
+        }
+
+        void publish(std::string piece) {
+            if (!stream_tokens) {
+                return;
+            }
+            {
+                std::lock_guard lock(stream_mutex);
+                stream_pieces.push_back(std::move(piece));
+            }
+            stream_condition.notify_one();
+        }
+
+        void complete_stream() noexcept {
+            try {
+                std::lock_guard lock(stream_mutex);
+                stream_finished = true;
+            } catch (...) {
+            }
+            stream_condition.notify_all();
+        }
+
         std::string prompt;
         GenerationOptions options;
-        TokenCallback token_callback;
         CancelCallback cancelled;
         std::promise<GenerationResult> promise;
+        std::mutex stream_mutex;
+        std::condition_variable stream_condition;
+        std::deque<std::string> stream_pieces;
+        std::atomic<bool> callback_failed = false;
+        bool stream_tokens = false;
+        bool stream_finished = false;
     };
 
     struct Active {
@@ -206,15 +273,44 @@ struct ContinuousBatcher::Impl {
         auto request = std::make_shared<Request>();
         request->prompt = prompt;
         request->options = options;
-        request->token_callback = token_callback;
         request->cancelled = cancelled;
+        request->stream_tokens = static_cast<bool>(token_callback);
         auto result = request->promise.get_future();
         {
             std::lock_guard lock(mutex);
             pending.push_back(request);
         }
         condition.notify_one();
-        return result.get();
+        if (!token_callback) {
+            return result.get();
+        }
+
+        for (;;) {
+            std::deque<std::string> pieces;
+            bool finished = false;
+            {
+                std::unique_lock lock(request->stream_mutex);
+                request->stream_condition.wait(lock, [&] {
+                    return !request->stream_pieces.empty() ||
+                           request->stream_finished;
+                });
+                pieces.swap(request->stream_pieces);
+                finished = request->stream_finished;
+            }
+            try {
+                for (const auto &piece : pieces) {
+                    token_callback(piece);
+                }
+            } catch (...) {
+                request->callback_failed.store(
+                    true,
+                    std::memory_order_release);
+                throw;
+            }
+            if (finished) {
+                return result.get();
+            }
+        }
     }
 
     void fail(
@@ -224,15 +320,22 @@ struct ContinuousBatcher::Impl {
             request->promise.set_exception(exception);
         } catch (...) {
         }
+        request->complete_stream();
     }
 
     void finish(Active &active, FinishReason reason) {
-        active.request->promise.set_value({
-            sanitize_utf8(tokenizer.decode(active.output_tokens)),
-            active.input_tokens,
-            static_cast<std::uint32_t>(active.output_tokens.size()),
-            reason,
-        });
+        try {
+            active.request->promise.set_value({
+                sanitize_utf8(tokenizer.decode(active.output_tokens)),
+                active.input_tokens,
+                static_cast<std::uint32_t>(active.output_tokens.size()),
+                reason,
+            });
+        } catch (...) {
+            active.request->complete_stream();
+            throw;
+        }
+        active.request->complete_stream();
     }
 
     void admit(
@@ -241,11 +344,12 @@ struct ContinuousBatcher::Impl {
         std::vector<DecoderState> &states,
         std::vector<DecoderScratch> &scratches,
         std::vector<float> &logits) {
-        if (request->cancelled && request->cancelled()) {
-            throw std::runtime_error("generation cancelled");
-        }
+        const CancelCallback request_cancelled = [request] {
+            return request->is_cancelled();
+        };
+        throw_if_cancelled(request_cancelled);
         auto prompt_tokens =
-            tokenizer.encode(request->prompt, request->cancelled);
+            tokenizer.encode(request->prompt, request_cancelled);
         if (prompt_tokens.empty() ||
             prompt_tokens.size() + request->options.max_output_tokens >
                 model.config().context) {
@@ -254,12 +358,13 @@ struct ContinuousBatcher::Impl {
         DecoderState state;
         PrefillScratch prefill_scratch;
         std::vector<float> prompt_logits(model.config().vocabulary);
-        prefill(
+        prefill_prompt(
             model,
             prompt_tokens,
             state,
             prompt_logits,
-            prefill_scratch);
+            prefill_scratch,
+            request_cancelled);
         tokenizer.mask_unused_logits(prompt_logits);
         Active admitted{
             request,
@@ -285,29 +390,29 @@ struct ContinuousBatcher::Impl {
             prompt_logits.end());
     }
 
-    void drain_pending(
+    void admit_pending(
         std::vector<Active> &active,
         std::vector<DecoderState> &states,
         std::vector<DecoderScratch> &scratches,
         std::vector<float> &logits) {
-        std::deque<std::shared_ptr<Request>> requests;
+        std::shared_ptr<Request> request;
         {
             std::lock_guard lock(mutex);
-            requests.swap(pending);
-        }
-        while (!requests.empty()) {
-            auto request = std::move(requests.front());
-            requests.pop_front();
-            try {
-                admit(
-                    request,
-                    active,
-                    states,
-                    scratches,
-                    logits);
-            } catch (...) {
-                fail(request, std::current_exception());
+            if (pending.empty()) {
+                return;
             }
+            request = std::move(pending.front());
+            pending.pop_front();
+        }
+        try {
+            admit(
+                request,
+                active,
+                states,
+                scratches,
+                logits);
+        } catch (...) {
+            fail(request, std::current_exception());
         }
     }
 
@@ -342,7 +447,7 @@ struct ContinuousBatcher::Impl {
                         std::chrono::milliseconds(2),
                         [] { return false; });
                 }
-                drain_pending(active, states, scratches, logits);
+                admit_pending(active, states, scratches, logits);
                 if (active.empty()) {
                     continue;
                 }
@@ -359,8 +464,7 @@ struct ContinuousBatcher::Impl {
                 for (std::size_t index = 0; index < active.size(); ++index) {
                     try {
                         auto &item = active[index];
-                        if (item.request->cancelled &&
-                            item.request->cancelled()) {
+                        if (item.request->is_cancelled()) {
                             throw std::runtime_error("generation cancelled");
                         }
                         const auto row = std::span<const float>(logits).subspan(
@@ -376,8 +480,8 @@ struct ContinuousBatcher::Impl {
                             continue;
                         }
                         item.output_tokens.push_back(token);
-                        if (item.request->token_callback) {
-                            item.request->token_callback(
+                        if (item.request->stream_tokens) {
+                            item.request->publish(
                                 tokenizer.token_text(token));
                         }
                         if (item.output_tokens.size() ==
