@@ -81,14 +81,14 @@ Start the Responses API:
 
 ```bash
 ./build/adi serve --model models/Mach-1-Additive-35B.gguf \
-  --host 127.0.0.1 --port 8080
+  --host 127.0.0.1 --port 9932
 ```
 
 On Windows:
 
 ```powershell
 build/Release/adi.exe serve --model models/Mach-1-Additive-35B.gguf `
-  --host 127.0.0.1 --port 8080
+  --host 127.0.0.1 --port 9932
 ```
 
 See [`docs/api.md`](docs/api.md) for the request shape and a curl example.

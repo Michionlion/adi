@@ -16,6 +16,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -482,6 +483,23 @@ std::uint32_t integer_option(
     return static_cast<std::uint32_t>(*number);
 }
 
+std::optional<std::uint32_t> optional_u32_option(
+    const Json &root,
+    std::string_view key) {
+    const auto *value = root.find(key);
+    if (value == nullptr) {
+        return std::nullopt;
+    }
+    const auto *number = value->number();
+    if (number == nullptr || *number <= 0.0 ||
+        *number > std::numeric_limits<std::uint32_t>::max() ||
+        std::floor(*number) != *number) {
+        throw std::runtime_error(
+            "'" + std::string(key) + "' must be a positive integer");
+    }
+    return static_cast<std::uint32_t>(*number);
+}
+
 float float_option(
     const Json &root,
     std::string_view key,
@@ -550,6 +568,22 @@ std::string response_json(
            std::to_string(result.input_tokens + result.output_tokens) + "}}";
 }
 
+std::uint16_t bound_port(SocketHandle socket) {
+    sockaddr_in bound_address{};
+#ifdef _WIN32
+    int address_length = static_cast<int>(sizeof(bound_address));
+#else
+    socklen_t address_length = sizeof(bound_address);
+#endif
+    if (::getsockname(
+            native_socket(socket),
+            reinterpret_cast<sockaddr *>(&bound_address),
+            &address_length) != 0) {
+        socket_error("getsockname");
+    }
+    return ntohs(bound_address.sin_port);
+}
+
 bool connection_cancelled(
     SocketHandle socket,
     std::chrono::steady_clock::time_point deadline) noexcept {
@@ -612,8 +646,7 @@ ResponseIdentity make_identity() {
 
 GenerationOptions request_options(const Json &request) {
     GenerationOptions options;
-    options.max_output_tokens =
-        integer_option(request, "max_output_tokens", options.max_output_tokens);
+    options.max_output_tokens = optional_u32_option(request, "max_output_tokens");
     options.temperature = float_option(request, "temperature", options.temperature);
     options.top_p = float_option(request, "top_p", options.top_p);
     options.seed = integer_option(request, "seed", 0);
@@ -963,7 +996,10 @@ void handle_client(
             static_cast<int>(maximum_connections)) != 0) {
         socket_error("listen");
     }
-    std::cout << "adi: listening on http://" << options.host << ':' << options.port
+    const auto listening_port =
+        server_detail::bound_port(listener.descriptor);
+    std::cout << "adi: listening on http://" << options.host << ':'
+              << listening_port
               << "/v1/responses\n";
     std::cout.flush();
     for (;;) {

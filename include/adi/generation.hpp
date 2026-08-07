@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <random>
 #include <span>
 #include <string>
@@ -13,7 +14,7 @@
 namespace adi {
 
 struct GenerationOptions {
-    std::uint32_t max_output_tokens = 64;
+    std::optional<std::uint32_t> max_output_tokens;
     float temperature = 0.7F;
     float top_p = 0.9F;
     std::uint64_t seed = 0;

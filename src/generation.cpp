@@ -1,4 +1,5 @@
 #include "adi/generation.hpp"
+#include "generation_internal.hpp"
 #include "utf8.hpp"
 
 #include <algorithm>
@@ -16,15 +17,44 @@
 #include <thread>
 #include <vector>
 
+namespace adi::generation_detail {
+
+std::uint32_t resolved_output_limit(
+    std::uint32_t context,
+    std::size_t prompt_tokens,
+    std::optional<std::uint32_t> requested_limit) {
+    if (prompt_tokens >= context) {
+        throw std::invalid_argument("prompt exceeds model context");
+    }
+    const auto remaining_context =
+        static_cast<std::uint32_t>(context - prompt_tokens);
+    if (!requested_limit) {
+        return remaining_context;
+    }
+    if (*requested_limit == 0) {
+        throw std::invalid_argument("max_output_tokens must be positive");
+    }
+    if (*requested_limit > remaining_context) {
+        throw std::invalid_argument("prompt exceeds model context");
+    }
+    return *requested_limit;
+}
+
+} // namespace adi::generation_detail
 namespace adi {
 namespace {
 
 void validate_generation_options(
     const MachModel &model,
     const GenerationOptions &options) {
-    if (options.max_output_tokens == 0 ||
-        options.max_output_tokens > model.config().context ||
-        !std::isfinite(options.temperature) || !std::isfinite(options.top_p) ||
+    if (options.max_output_tokens && *options.max_output_tokens == 0) {
+        throw std::invalid_argument("max_output_tokens must be positive");
+    }
+    if (options.max_output_tokens &&
+        *options.max_output_tokens > model.config().context) {
+        throw std::invalid_argument("max_output_tokens exceeds model context");
+    }
+    if (!std::isfinite(options.temperature) || !std::isfinite(options.top_p) ||
         options.temperature < 0.0F ||
         (options.temperature > 0.0F && options.temperature < 1.0e-4F) ||
         options.temperature > 2.0F ||
@@ -152,10 +182,13 @@ GenerationResult generate_from_prompt(
     const CancelCallback &cancelled) {
     validate_generation_options(model, options);
     const auto prompt_tokens = tokenizer.encode(formatted_prompt, cancelled);
-    if (prompt_tokens.empty() ||
-        prompt_tokens.size() + options.max_output_tokens > model.config().context) {
+    if (prompt_tokens.empty()) {
         throw std::invalid_argument("prompt exceeds model context");
     }
+    const auto max_output_tokens = generation_detail::resolved_output_limit(
+        model.config().context,
+        prompt_tokens.size(),
+        options.max_output_tokens);
     const auto im_end_tokens = tokenizer.encode("<|im_end|>");
     if (im_end_tokens.size() != 1) {
         throw std::runtime_error("tokenizer: invalid im_end token");
@@ -176,9 +209,9 @@ GenerationResult generate_from_prompt(
     tokenizer.mask_unused_logits(logits);
     std::mt19937_64 random(options.seed);
     std::vector<std::uint32_t> output_tokens;
-    output_tokens.reserve(options.max_output_tokens);
+    output_tokens.reserve(max_output_tokens);
     auto finish_reason = FinishReason::length;
-    for (std::uint32_t index = 0; index < options.max_output_tokens; ++index) {
+    for (std::uint32_t index = 0; index < max_output_tokens; ++index) {
         if (cancelled && cancelled()) {
             throw std::runtime_error("generation cancelled");
         }
@@ -193,7 +226,7 @@ GenerationResult generate_from_prompt(
             const auto piece = tokenizer.token_text(token);
             token_callback(piece);
         }
-        if (index + 1 < options.max_output_tokens) {
+        if (index + 1 < max_output_tokens) {
             decode_token(model, token, state, logits, scratch);
             tokenizer.mask_unused_logits(logits);
         }
@@ -250,6 +283,7 @@ struct ContinuousBatcher::Impl {
     struct Active {
         std::shared_ptr<Request> request;
         std::uint32_t input_tokens = 0;
+        std::uint32_t max_output_tokens = 0;
         std::vector<std::uint32_t> output_tokens;
         std::mt19937_64 random;
     };
@@ -350,11 +384,13 @@ struct ContinuousBatcher::Impl {
         throw_if_cancelled(request_cancelled);
         auto prompt_tokens =
             tokenizer.encode(request->prompt, request_cancelled);
-        if (prompt_tokens.empty() ||
-            prompt_tokens.size() + request->options.max_output_tokens >
-                model.config().context) {
+        if (prompt_tokens.empty()) {
             throw std::invalid_argument("prompt exceeds model context");
         }
+        const auto max_output_tokens = generation_detail::resolved_output_limit(
+            model.config().context,
+            prompt_tokens.size(),
+            request->options.max_output_tokens);
         DecoderState state;
         PrefillScratch prefill_scratch;
         std::vector<float> prompt_logits(model.config().vocabulary);
@@ -369,10 +405,11 @@ struct ContinuousBatcher::Impl {
         Active admitted{
             request,
             static_cast<std::uint32_t>(prompt_tokens.size()),
+            max_output_tokens,
             {},
             std::mt19937_64(request->options.seed),
         };
-        admitted.output_tokens.reserve(request->options.max_output_tokens);
+        admitted.output_tokens.reserve(max_output_tokens);
 
         // Reserve every structure before mutating any of them so an allocation
         // failure cannot leave the structure-of-arrays batch out of sync.
@@ -484,8 +521,7 @@ struct ContinuousBatcher::Impl {
                             item.request->publish(
                                 tokenizer.token_text(token));
                         }
-                        if (item.output_tokens.size() ==
-                            item.request->options.max_output_tokens) {
+                        if (item.output_tokens.size() == item.max_output_tokens) {
                             finish(item, FinishReason::length);
                             continue;
                         }

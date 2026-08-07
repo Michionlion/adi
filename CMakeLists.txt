@@ -132,6 +132,7 @@ if(ADI_BUILD_TESTS)
 
     add_executable(adi_generation_test tests/generation_test.cpp)
     target_link_libraries(adi_generation_test PRIVATE adi_runtime)
+    target_include_directories(adi_generation_test PRIVATE src)
     add_test(NAME generation COMMAND adi_generation_test)
 
     add_executable(adi_json_test tests/json_test.cpp)
@@ -200,6 +201,10 @@ if(ADI_BUILD_TESTS)
 
     find_package(Python3 COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
+        add_test(
+            NAME adi_chat_client
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/adi_chat_test.py
+        )
         add_test(
             NAME pack_mach
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/pack_mach.py --self-test

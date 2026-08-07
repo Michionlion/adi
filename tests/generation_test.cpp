@@ -1,7 +1,10 @@
 #include "adi/generation.hpp"
+#include "generation_internal.hpp"
 
 #include <cassert>
 #include <cmath>
+#include <cstdint>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <vector>
@@ -31,4 +34,24 @@ int main() {
         rejected = true;
     }
     assert(rejected);
+
+    using adi::generation_detail::resolved_output_limit;
+    assert(resolved_output_limit(16, 4, std::nullopt) == 12);
+    assert(resolved_output_limit(16, 4, std::uint32_t{12}) == 12);
+    assert(resolved_output_limit(16, 15, std::nullopt) == 1);
+    assert(resolved_output_limit(16, 15, std::uint32_t{1}) == 1);
+
+    const auto rejects_limit = [](
+        std::size_t prompt_tokens,
+        std::optional<std::uint32_t> limit) {
+        try {
+            (void)resolved_output_limit(16, prompt_tokens, limit);
+            return false;
+        } catch (const std::invalid_argument &) {
+            return true;
+        }
+    };
+    assert(rejects_limit(16, std::nullopt));
+    assert(rejects_limit(4, std::uint32_t{0}));
+    assert(rejects_limit(15, std::uint32_t{2}));
 }

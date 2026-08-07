@@ -477,7 +477,9 @@ int generate_text(int argc, char **argv) {
     const adi::MachModel model(argv[2]);
     adi::Tokenizer tokenizer(model);
     adi::GenerationOptions options;
-    options.max_output_tokens = argc == 5 ? parse_u32(argv[4], "max tokens") : 16;
+    if (argc == 5) {
+        options.max_output_tokens = parse_u32(argv[4], "max tokens");
+    }
     options.temperature = 0.0F;
     const auto start = std::chrono::steady_clock::now();
     const auto result = adi::generate(model, tokenizer, argv[3], options);
@@ -500,7 +502,7 @@ int serve_command(int argc, char **argv) {
             options.host = argv[++index];
         } else if (argument == "--port" && index + 1 < argc) {
             const auto port = parse_u32(argv[++index], "port");
-            if (port == 0 || port > 65535) {
+            if (port > 65535) {
                 throw std::invalid_argument("port is out of range");
             }
             options.port = static_cast<std::uint16_t>(port);

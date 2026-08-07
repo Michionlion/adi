@@ -9,7 +9,7 @@ CTEST ?= ctest
 UV ?= uv
 
 CMAKE_ARGS ?=
-BUILD_ARGS ?=
+BUILD_ARGS ?= -j8
 TEST_ARGS ?=
 RUN_ARGS ?=
 

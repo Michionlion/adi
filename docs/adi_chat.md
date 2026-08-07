@@ -42,7 +42,7 @@ py tools/adi_chat.py --adi build/Release/adi.exe --model MODEL.gguf
 ## Connect to an existing server
 
 ```bash
-uv run tools/adi_chat.py --connect http://127.0.0.1:8080
+uv run tools/adi_chat.py --connect http://127.0.0.1:9932
 ```
 
 `--connect` also accepts a base ending in `/v1` or the complete
@@ -51,7 +51,7 @@ uv run tools/adi_chat.py --connect http://127.0.0.1:8080
 ## Useful options
 
 ```text
---port 0                 choose an unused local port
+--port 0                 choose an unused local port (default)
 --threads 8              set ADI_THREADS for the child process
 --isa scalar             set ADI_CPU_ISA
 --system "..."           install a system prompt

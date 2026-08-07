@@ -1,4 +1,5 @@
 #include "adi/json.hpp"
+#include "adi/server.hpp"
 #include "server_internal.hpp"
 
 #include <cassert>
@@ -13,6 +14,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #else
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -79,6 +81,8 @@ void receive_all(TestSocket socket, std::span<char> data) {
 } // namespace
 
 int main() {
+    assert(adi::ServerOptions{}.port == 9932);
+
     const adi::server_detail::ResponseIdentity identity{
         "resp_test",
         "msg_test",
@@ -163,6 +167,24 @@ int main() {
     server = sockets[0];
     client = sockets[1];
 #endif
+
+    const auto ephemeral = ::socket(AF_INET, SOCK_STREAM, 0);
+#ifdef _WIN32
+    assert(ephemeral != INVALID_SOCKET);
+#else
+    assert(ephemeral >= 0);
+#endif
+    sockaddr_in ephemeral_address{};
+    ephemeral_address.sin_family = AF_INET;
+    ephemeral_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ephemeral_address.sin_port = 0;
+    assert(::bind(
+               ephemeral,
+               reinterpret_cast<const sockaddr *>(&ephemeral_address),
+               sizeof(ephemeral_address)) == 0);
+    assert(adi::server_detail::bound_port(
+               static_cast<adi::server_detail::SocketHandle>(ephemeral)) != 0);
+    close_test_socket(ephemeral);
 
     shutdown_send(client);
     const auto deadline =

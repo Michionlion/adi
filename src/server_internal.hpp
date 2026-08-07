@@ -27,6 +27,9 @@ struct ResponseIdentity {
     const GenerationResult &result,
     const ResponseIdentity &identity);
 
+[[nodiscard]] std::uint16_t bound_port(
+    SocketHandle socket);
+
 [[nodiscard]] bool connection_cancelled(
     SocketHandle socket,
     std::chrono::steady_clock::time_point deadline) noexcept;

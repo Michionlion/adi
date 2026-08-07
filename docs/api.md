@@ -12,7 +12,8 @@ The initial server accepts JSON bodies with:
   messages;
 - `model`: optional; when present it must equal the loaded model's
   `general.name`;
-- `max_output_tokens`: positive integer;
+- `max_output_tokens`: optional positive integer; omitted defaults to the remaining
+  context budget after the input prompt (`context_length - input_tokens`).
 - `temperature`: `0` for greedy decoding or a number in `[0.0001, 2]`;
 - `top_p`: number in `(0, 1]`;
 - `seed`: non-negative integer;
@@ -30,7 +31,7 @@ history according to the Qwen3.5 conversation rules.
 Example:
 
 ```bash
-curl http://127.0.0.1:8080/v1/responses \
+curl http://127.0.0.1:9932/v1/responses \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "Mach-1-Additive-35B",

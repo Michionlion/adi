@@ -38,6 +38,11 @@ except ImportError as error:  # pragma: no cover - exercised only before install
     )
     raise SystemExit(2) from error
 
+try:
+    import readline  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency for better editing
+    readline = None  # type: ignore[assignment]
+
 
 app = typer.Typer(
     add_completion=False,
@@ -48,6 +53,12 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 console = Console()
+
+THINK_OPEN_TAG = "<think>"
+THINK_CLOSE_TAG = "</think>"
+THINK_SUFFIX_GUARD = max(len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG)) - 1
+DIM_REASONING_STYLE = "dim"
+READLINE_PROMPT = "\x01\x1b[32m\x02user\x01\x1b[0m\x02 > "
 
 
 class ClientError(RuntimeError):
@@ -60,7 +71,7 @@ class ApiError(ClientError):
 
 @dataclass(frozen=True)
 class GenerationSettings:
-    max_output_tokens: int
+    max_output_tokens: Optional[int]
     temperature: float
     top_p: float
     seed: int
@@ -69,12 +80,13 @@ class GenerationSettings:
     def payload(self, messages: list[dict[str, str]], stream: bool) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "input": messages,
-            "max_output_tokens": self.max_output_tokens,
             "temperature": self.temperature,
             "top_p": self.top_p,
             "seed": self.seed,
             "stream": stream,
         }
+        if self.max_output_tokens is not None:
+            payload["max_output_tokens"] = self.max_output_tokens
         if self.model_id:
             payload["model"] = self.model_id
         return payload
@@ -339,11 +351,19 @@ class ManagedAdiServer:
         self,
         process: subprocess.Popen[str],
         log_tail: deque[str],
-        log_thread: threading.Thread,
+        host: str,
+        port: int,
     ) -> None:
         self.process = process
         self.log_tail = log_tail
-        self.log_thread = log_thread
+        self.host = host
+        self.port = port
+        self.listening = False
+        self.log_thread: Optional[threading.Thread] = None
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{host_for_connect(self.host)}:{self.port}"
 
     @classmethod
     def start(
@@ -358,7 +378,7 @@ class ManagedAdiServer:
         startup_timeout: float,
         show_log: bool,
     ) -> "ManagedAdiServer":
-        if port_is_open(host_for_connect(host), port):
+        if port != 0 and port_is_open(host_for_connect(host), port):
             raise ClientError(
                 f"{host}:{port} is already accepting connections; use --connect "
                 "or choose another --port"
@@ -402,39 +422,42 @@ class ManagedAdiServer:
             raise ClientError(f"cannot start ADI: {error}") from error
 
         log_tail: deque[str] = deque(maxlen=40)
+        server = cls(process, log_tail, host, port)
 
         def drain_output() -> None:
             assert process.stdout is not None
             for line in process.stdout:
                 stripped = line.rstrip("\r\n")
                 log_tail.append(stripped)
+                detected_port = parse_listening_port(stripped)
+                if detected_port is not None:
+                    server.port = detected_port
+                    server.listening = True
                 if show_log:
                     console.print(f"[adi] {stripped}", style="dim", markup=False)
 
-        log_thread = threading.Thread(
+        server.log_thread = threading.Thread(
             target=drain_output,
             name="adi-log-reader",
             daemon=True,
         )
-        log_thread.start()
-        server = cls(process, log_tail, log_thread)
+        server.log_thread.start()
         try:
-            server.wait_until_ready(host, port, startup_timeout)
+            server.wait_until_ready(startup_timeout)
         except BaseException:
             server.stop()
             raise
         return server
 
-    def wait_until_ready(self, host: str, port: int, timeout: float) -> None:
+    def wait_until_ready(self, timeout: float) -> None:
         deadline = time.monotonic() + timeout
-        connect_host = host_for_connect(host)
         while time.monotonic() < deadline:
             return_code = self.process.poll()
             if return_code is not None:
                 tail = "\n".join(self.log_tail)
                 detail = f"\n{tail}" if tail else ""
                 raise ClientError(f"ADI exited with status {return_code}{detail}")
-            if port_is_open(connect_host, port):
+            if self.listening:
                 return
             time.sleep(0.1)
         tail = "\n".join(self.log_tail)
@@ -449,7 +472,8 @@ class ManagedAdiServer:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait(timeout=5.0)
-        self.log_thread.join(timeout=1.0)
+        if self.log_thread is not None:
+            self.log_thread.join(timeout=1.0)
 
     def __enter__(self) -> "ManagedAdiServer":
         return self
@@ -504,6 +528,76 @@ def parse_response_object(body: dict[str, Any]) -> ResponseResult:
     )
 
 
+class ReasoningRenderer:
+    def __init__(self) -> None:
+        # ADI prompts assistant responses from "<think>\\n", so the first streamed
+        # characters are reasoning content unless a prior close token is received.
+        self.in_reasoning = True
+        self.pending = ""
+
+    def feed(self, text: str, *, final: bool = False) -> None:
+        buffered = self.pending + text
+        self.pending = ""
+        while buffered:
+            if self.in_reasoning:
+                close_index = buffered.lower().find(THINK_CLOSE_TAG)
+                if close_index == -1:
+                    carry = THINK_SUFFIX_GUARD
+                    if not final and len(buffered) > carry:
+                        emit = buffered[:-carry]
+                        self._print_dim(emit)
+                        buffered = buffered[-carry:]
+                        continue
+                    if final:
+                        self._print_dim(buffered)
+                    else:
+                        self.pending = buffered
+                    break
+                self._print_dim(buffered[:close_index])
+                buffered = buffered[close_index + len(THINK_CLOSE_TAG):]
+                self.in_reasoning = False
+                continue
+
+            open_index = buffered.lower().find(THINK_OPEN_TAG)
+            if open_index == -1:
+                carry = THINK_SUFFIX_GUARD
+                if not final and len(buffered) > carry:
+                    emit = buffered[:-carry]
+                    self._print(emit)
+                    buffered = buffered[-carry:]
+                    continue
+                if final:
+                    self._print(buffered)
+                else:
+                    self.pending = buffered
+                break
+
+            self._print(buffered[:open_index])
+            self.in_reasoning = True
+            buffered = buffered[open_index + len(THINK_OPEN_TAG):]
+
+    def _print(self, text: str) -> None:
+        if text:
+            console.print(
+                text,
+                end="",
+                markup=False,
+                highlight=False,
+                soft_wrap=True,
+            )
+
+    def _print_dim(self, text: str) -> None:
+        if text:
+            console.print(
+                text,
+                end="",
+                style=DIM_REASONING_STYLE,
+                markup=False,
+                highlight=False,
+                soft_wrap=True,
+            )
+
+
 def integer_or_zero(value: object) -> int:
     return value if type(value) is int and value >= 0 else 0
 
@@ -512,19 +606,25 @@ def host_for_connect(host: str) -> str:
     return "127.0.0.1" if host == "0.0.0.0" else host
 
 
+def parse_listening_port(line: str) -> Optional[int]:
+    prefix = "adi: listening on http://"
+    suffix = "/v1/responses"
+    if not line.startswith(prefix) or not line.endswith(suffix):
+        return None
+    authority = line[len(prefix):-len(suffix)]
+    _, separator, port_text = authority.rpartition(":")
+    if not separator or not port_text.isdigit():
+        return None
+    port = int(port_text)
+    return port if 1 <= port <= 65535 else None
+
+
 def port_is_open(host: str, port: int) -> bool:
     try:
         with socket.create_connection((host, port), timeout=0.2):
             return True
     except OSError:
         return False
-
-
-def choose_free_port(host: str) -> int:
-    bind_host = host_for_connect(host)
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.bind((bind_host, 0))
-        return int(listener.getsockname()[1])
 
 
 def resolve_adi_executable(requested: Optional[str]) -> Path:
@@ -625,6 +725,11 @@ def read_pasted_message() -> str:
     return "\n".join(lines).strip()
 
 
+def read_user_input_line() -> str:
+    if readline is None or not sys.stdin.isatty() or not sys.stdout.isatty():
+        return console.input("[bold green]user[/bold green] > ").strip()
+    return input(READLINE_PROMPT).strip()
+
 
 def save_automatic_session(
     conversation: Conversation,
@@ -663,12 +768,13 @@ def send_turn(
     totals: UsageTotals,
 ) -> ResponseResult:
     console.print("[bold cyan]assistant[/bold cyan]")
+    renderer = ReasoningRenderer()
     printed_delta = False
 
     def on_delta(delta: str) -> None:
         nonlocal printed_delta
         printed_delta = printed_delta or bool(delta)
-        console.print(delta, end="", markup=False, highlight=False, soft_wrap=True)
+        renderer.feed(delta)
 
     try:
         result = client.create(
@@ -683,9 +789,14 @@ def send_turn(
         console.print("[yellow]Generation interrupted; the turn was not saved.[/yellow]")
         raise
     if stream:
+        if not printed_delta and result.text:
+            renderer.feed(result.text, final=True)
+        else:
+            renderer.feed("", final=True)
         console.print()
     else:
-        console.print(result.text, markup=False, highlight=False, soft_wrap=True)
+        renderer.feed(result.text, final=True)
+        console.print()
     if not result.text:
         console.print("[yellow]ADI returned no output text.[/yellow]")
     conversation.commit(user_text, result.text)
@@ -708,7 +819,7 @@ def interactive_loop(
     )
     while True:
         try:
-            line = console.input("[bold green]you[/bold green] > ").strip()
+            line = read_user_input_line()
         except EOFError:
             console.print()
             return
@@ -821,10 +932,10 @@ def chat(
     ),
     host: str = typer.Option("127.0.0.1", help="Host passed to `adi serve`."),
     port: int = typer.Option(
-        8080,
+        0,
         min=0,
         max=65535,
-        help="Port passed to ADI. Use 0 to choose a free local port.",
+        help="Port passed to ADI. The default 0 lets OS choose a free local port.",
     ),
     threads: Optional[int] = typer.Option(
         None,
@@ -863,11 +974,14 @@ def chat(
         None,
         help="Send one prompt and exit instead of entering the REPL.",
     ),
-    max_tokens: int = typer.Option(
-        256,
+    max_tokens: Optional[int] = typer.Option(
+        None,
         "--max-tokens",
         min=1,
-        help="Maximum output tokens per turn.",
+        help=(
+            "Optional max output tokens per turn. Omit to use the full remaining "
+            "context budget."
+        ),
     ),
     temperature: float = typer.Option(
         0.7,
@@ -919,22 +1033,22 @@ def chat(
             if not model.is_file():
                 raise ClientError(f"model does not exist: {model}")
             executable = resolve_adi_executable(adi)
-            selected_port = choose_free_port(host) if port == 0 else port
+            endpoint = f"{host}:automatic" if port == 0 else f"{host}:{port}"
             console.print(
-                f"[dim]Starting {executable} on {host}:{selected_port}; "
+                f"[dim]Starting {executable} on {endpoint}; "
                 "model loading may take a while.[/dim]"
             )
             managed_server = ManagedAdiServer.start(
                 executable,
                 model,
                 host,
-                selected_port,
+                port,
                 threads=threads,
                 isa=isa,
                 startup_timeout=startup_timeout,
                 show_log=server_log,
             )
-            base_url = f"http://{host_for_connect(host)}:{selected_port}"
+            base_url = managed_server.base_url
             console.print(f"ADI is listening at {base_url}.", style="dim", markup=False)
 
         with AdiResponsesClient(base_url) as client:
