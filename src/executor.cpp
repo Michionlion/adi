@@ -1092,9 +1092,9 @@ void moe_forward_batch(
     const Backend &backend) {
     constexpr std::uint32_t routes_per_token = 8;
     // Measured optimum for mach_expert_matmul on this codec; see the task
-    // construction below. Re-measure if that kernel gains a batch-lane path,
-    // because the whole reason for the cap is its current batch behaviour.
-    constexpr std::uint32_t expert_rows_per_task = 12;
+    // construction below. It follows that kernel's SIMD width, so re-measure
+    // it on a machine with a different one.
+    constexpr std::uint32_t expert_rows_per_task = 32;
     const auto &config = model.config();
     const auto batch = inputs.size() / config.hidden;
     const auto &descriptor = model.layer(layer).moe;
@@ -1184,19 +1184,26 @@ void moe_forward_batch(
             }
         });
 
-    // One task per expert leaves the dispatch badly balanced and the biggest
-    // matmuls badly sized. Routing is skewed: a layer typically has about 85
-    // active experts holding 512 rows between them, roughly a third holding a
-    // single row while the largest holds around 56. parallel_tasks hands out
-    // contiguous index blocks, so a task 34 times heavier than its neighbour
-    // is assigned by position rather than by cost, and mach_expert_matmul
-    // reads its input column-major over a row-major array, so its cost per row
-    // degrades once the batch stops fitting cache: 0.66, 0.55, 0.72, 1.15, and
-    // 1.88 ms per row at 8, 12, 16, 32, and 64 rows.
+    // One task per expert leaves the dispatch badly balanced. Routing is
+    // skewed: a layer typically has about 85 active experts holding 512 rows
+    // between them, roughly a third holding a single row while the largest
+    // holds around 56. parallel_tasks hands out contiguous index blocks, so a
+    // task 34 times heavier than its neighbour is assigned by position rather
+    // than by cost.
     //
-    // Splitting an expert's rows into evenly sized chunks fixes both. Rows are
+    // Splitting an expert's rows into evenly sized chunks fixes that. Rows are
     // independent, so each chunk computes exactly what it would have computed
     // inside the larger call.
+    //
+    // The cap used to be twelve because the scalar batch loop's cost per row
+    // was U-shaped and twelve was its floor. The batch-lane kernel replaced
+    // that curve with one that is flat per SIMD block: on sixteen lanes a call
+    // costs about 0.75 ms for any batch of 1 to 16 rows, 1.27 for 17 to 32,
+    // and roughly 0.65 more per block after that. Cost per row therefore falls
+    // monotonically and splitting is pure overhead beyond what balance needs,
+    // so the cap is now two full blocks. Measured end to end at a 64-token
+    // prefill, medians of seven runs: 28.0 tokens/second at twelve, 29.2 at
+    // sixteen, 29.8 at thirty-two, 27.8 at sixty-four, 28.3 uncapped.
     scratch.tasks.clear();
     for (const auto expert : scratch.active) {
         const auto rows = scratch.counts[expert];
@@ -1206,8 +1213,8 @@ void moe_forward_batch(
         std::uint32_t placed = 0;
         for (std::uint32_t chunk = 0; chunk < chunks; ++chunk) {
             // Spread rows evenly rather than leaving a one-row remainder,
-            // which would fall back to the single-vector path at three times
-            // the cost per row.
+            // which would fall back to the single-vector path at more than ten
+            // times the cost per row.
             const auto chunk_rows = (rows - placed) / (chunks - chunk);
             scratch.tasks.push_back({expert, begin + placed, chunk_rows});
             placed += chunk_rows;
