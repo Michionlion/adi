@@ -22,6 +22,9 @@ struct MachExpertMatrix {
 struct ExpertScratch {
     std::vector<float> input;
     std::vector<float> output;
+    // Batch-major inputs rearranged as [block][column][lane] for the
+    // batch-oriented non-expert kernel.
+    std::vector<float> batch_packed;
     std::vector<std::uint16_t> wave_indexes;
     std::vector<float> state_values;
     std::vector<float> wave_gamma;

@@ -20,6 +20,9 @@ add_library(adi_runtime STATIC
     src/json.cpp
     src/kernels.cpp
     src/model.cpp
+    src/ne_batch.cpp
+    src/ne_batch_x86_avx2.cpp
+    src/ne_batch_x86_avx512.cpp
     src/options.cpp
     src/parallel.cpp
     src/profiling.cpp
@@ -60,6 +63,14 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|amd64|x64|i[3-6]86)")
                 src/simd_x86_vbmi.cpp
                 PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
         endif()
+        # /fp:precise already forbids contraction across a statement, so the
+        # separate multiply and add in the batch kernels stay separate.
+        set_source_files_properties(
+            src/ne_batch_x86_avx2.cpp
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:precise")
+        set_source_files_properties(
+            src/ne_batch_x86_avx512.cpp
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX512;/fp:precise")
     elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         set_source_files_properties(
             src/simd_x86_avx2.cpp
@@ -71,6 +82,17 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|amd64|x64|i[3-6]86)")
             src/simd_x86_vbmi.cpp
             PROPERTIES COMPILE_OPTIONS
                 "-mavx512f;-mavx512bw;-mavx512vbmi")
+        # The batch kernels must not fuse their multiply and add into an FMA:
+        # that would round differently from the scalar reference and break
+        # bit-exactness. AVX2 and AVX-512 both make FMA available, so the
+        # contraction has to be disabled explicitly.
+        set_source_files_properties(
+            src/ne_batch_x86_avx2.cpp
+            PROPERTIES COMPILE_OPTIONS "-mavx2;-ffp-contract=off")
+        set_source_files_properties(
+            src/ne_batch_x86_avx512.cpp
+            PROPERTIES COMPILE_OPTIONS
+                "-mavx512f;-mavx512bw;-ffp-contract=off")
     endif()
 endif()
 
@@ -100,6 +122,16 @@ if(ADI_BUILD_TESTS)
     target_link_libraries(adi_int5_batch_test PRIVATE adi_runtime)
     target_include_directories(adi_int5_batch_test PRIVATE src)
     add_test(NAME int5_batch COMMAND adi_int5_batch_test)
+
+    add_executable(adi_ne_trellis_test tests/ne_trellis_test.cpp)
+    target_link_libraries(adi_ne_trellis_test PRIVATE adi_runtime)
+    target_include_directories(adi_ne_trellis_test PRIVATE src)
+    add_test(NAME ne_trellis COMMAND adi_ne_trellis_test)
+
+    add_executable(adi_ne_batch_test tests/ne_batch_test.cpp)
+    target_link_libraries(adi_ne_batch_test PRIVATE adi_runtime)
+    target_include_directories(adi_ne_batch_test PRIVATE src)
+    add_test(NAME ne_batch COMMAND adi_ne_batch_test)
 
     add_executable(adi_codec_cache_test tests/codec_cache_test.cpp)
     target_link_libraries(adi_codec_cache_test PRIVATE adi_runtime)
@@ -186,6 +218,8 @@ if(ADI_BUILD_TESTS)
             adi_gguf_test
             adi_kernels_test
             adi_int5_batch_test
+            adi_ne_trellis_test
+            adi_ne_batch_test
             adi_codec_cache_test
             adi_gated_delta_test
             adi_simd_dispatch_test

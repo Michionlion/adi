@@ -1,5 +1,7 @@
 #include "adi/kernels.hpp"
 #include "codec_cache.hpp"
+#include "ne_batch.hpp"
+#include "ne_trellis.hpp"
 #include "parallel.hpp"
 #include "profiling_internal.hpp"
 #include "simd.hpp"
@@ -85,6 +87,95 @@ std::span<const float> ne_state_values(
         scratch.state_value_components = detail::ne_values_per_state;
     }
     return scratch.state_values;
+}
+
+// Reference accumulation for the batched non-expert stream. Every SIMD batch
+// kernel must reproduce this bit for bit: tile column by tile column, state
+// by state, first decoded value then second, with the two products added
+// separately.
+//
+//   inputs  [batch, matrix.columns], already sign-applied and Hadamard'd
+//   outputs [batch, matrix.rows], before the output Hadamard and signs
+void ne_accumulate_tiles_scalar(
+    const MachNeMatrix &matrix,
+    std::span<const float> state_values,
+    std::span<const float> inputs,
+    std::uint32_t batch,
+    std::span<float> outputs) {
+    constexpr std::uint32_t ne_values_per_state = 2;
+    using detail::ne_words_per_tile;
+    const auto tile_rows = matrix.rows / tile_size;
+    const auto tile_columns = matrix.columns / tile_size;
+
+    parallel_ranges(
+        tile_rows,
+        4,
+        [&](std::uint32_t row_begin, std::uint32_t row_end) {
+            std::vector<float> row_sums(
+                static_cast<std::size_t>(batch) * tile_size);
+            for (std::uint32_t tile_row = row_begin;
+                 tile_row < row_end;
+                 ++tile_row) {
+                std::fill(row_sums.begin(), row_sums.end(), 0.0F);
+                for (std::uint32_t tile_column = 0;
+                     tile_column < tile_columns;
+                     ++tile_column) {
+                    const auto tile_index =
+                        static_cast<std::size_t>(tile_row) * tile_columns +
+                        tile_column;
+                    const auto *words =
+                        matrix.trellis.data() +
+                        tile_index * ne_words_per_tile;
+                    const auto *tile_input =
+                        inputs.data() + tile_column * tile_size;
+                    detail::for_each_ne_state(
+                        words,
+                        [&](std::uint32_t state_index, std::uint32_t state) {
+                            const auto local_row = state_index >> 3;
+                            const auto local_column = (state_index & 7U) << 1;
+                            const float weight0 =
+                                state_values[
+                                    static_cast<std::size_t>(state) *
+                                    ne_values_per_state] *
+                                matrix.weight_scale;
+                            const float weight1 =
+                                state_values[
+                                    static_cast<std::size_t>(state) *
+                                        ne_values_per_state +
+                                    1] *
+                                matrix.weight_scale;
+                            for (std::uint32_t batch_index = 0;
+                                 batch_index < batch;
+                                 ++batch_index) {
+                                const auto *row =
+                                    tile_input +
+                                    static_cast<std::size_t>(batch_index) *
+                                        matrix.columns;
+                                auto &sum =
+                                    row_sums[
+                                        static_cast<std::size_t>(batch_index) *
+                                            tile_size +
+                                        local_row];
+                                sum += weight0 * row[local_column];
+                                sum += weight1 * row[local_column + 1];
+                            }
+                        });
+                }
+                for (std::uint32_t batch_index = 0;
+                     batch_index < batch;
+                     ++batch_index) {
+                    std::copy_n(
+                        row_sums.begin() +
+                            static_cast<std::size_t>(batch_index) *
+                                tile_size,
+                        tile_size,
+                        outputs.begin() +
+                            static_cast<std::size_t>(batch_index) *
+                                matrix.rows +
+                            tile_row * tile_size);
+                }
+            }
+        });
 }
 
 std::span<const std::uint16_t> expert_wave_indexes(
@@ -455,10 +546,7 @@ void mach_ne_matvec(
         KernelKind::non_expert,
         static_cast<std::uint64_t>(matrix.rows) * matrix.columns);
     constexpr std::uint32_t ne_values_per_state = 2;
-    constexpr std::uint32_t ne_fresh_bits = 8;
-    constexpr std::uint32_t ne_states_per_tile = tile_values / ne_values_per_state;
-    constexpr std::uint32_t ne_stream_bits = 1024;
-    constexpr std::uint32_t ne_words_per_tile = ne_stream_bits / 16;
+    using detail::ne_words_per_tile;
 
     if (!is_power_of_two(matrix.rows) || !is_power_of_two(matrix.columns) ||
         matrix.rows % tile_size != 0 || matrix.columns % tile_size != 0) {
@@ -493,35 +581,31 @@ void mach_ne_matvec(
                     static_cast<std::size_t>(tile_row) * tile_columns + tile_column;
                 const auto *words =
                     matrix.trellis.data() + tile_index * ne_words_per_tile;
-                std::uint32_t state = words[0];
-                for (std::uint32_t state_index = 0; state_index < ne_states_per_tile;
-                     ++state_index) {
-                    if (state_index != 0) {
-                        const auto position =
-                            register_bits + (state_index - 1) * ne_fresh_bits;
-                        const auto fresh = extract_stream_bits(
-                            words,
-                            ne_words_per_tile,
-                            ne_stream_bits,
-                            position,
-                            ne_fresh_bits);
-                        state = ((state << ne_fresh_bits) & 0xFFFFU) | fresh;
-                    }
-                    for (std::uint32_t component = 0;
-                         component < ne_values_per_state; ++component) {
-                        const auto element =
-                            state_index * ne_values_per_state + component;
-                        const auto local_row = element / tile_size;
-                        const auto local_column = element % tile_size;
-                        const auto column = tile_column * tile_size + local_column;
-                        row_sums[local_row] +=
+                const auto *tile_input =
+                    scratch.input.data() + tile_column * tile_size;
+                detail::for_each_ne_state(
+                    words,
+                    [&](std::uint32_t state_index, std::uint32_t state) {
+                        const auto local_row = state_index >> 3;
+                        const auto local_column = (state_index & 7U) << 1;
+                        // Two separate accumulations in this order: folding
+                        // the pair into one expression changes the rounding.
+                        const float weight0 =
+                            state_values[
+                                static_cast<std::size_t>(state) *
+                                ne_values_per_state] *
+                            matrix.weight_scale;
+                        const float weight1 =
                             state_values[
                                 static_cast<std::size_t>(state) *
                                     ne_values_per_state +
-                                component] *
-                            matrix.weight_scale * scratch.input[column];
-                    }
-                }
+                                1] *
+                            matrix.weight_scale;
+                        row_sums[local_row] +=
+                            weight0 * tile_input[local_column];
+                        row_sums[local_row] +=
+                            weight1 * tile_input[local_column + 1];
+                    });
             }
             std::copy_n(
                 row_sums,
@@ -549,11 +633,7 @@ void mach_ne_matmul(
         KernelKind::non_expert_batch,
         static_cast<std::uint64_t>(matrix.rows) * matrix.columns * batch);
     constexpr std::uint32_t ne_values_per_state = 2;
-    constexpr std::uint32_t ne_fresh_bits = 8;
-    constexpr std::uint32_t ne_states_per_tile =
-        tile_values / ne_values_per_state;
-    constexpr std::uint32_t ne_stream_bits = 1024;
-    constexpr std::uint32_t ne_words_per_tile = ne_stream_bits / 16;
+    using detail::ne_words_per_tile;
 
     if (batch == 0 || !is_power_of_two(matrix.rows) ||
         !is_power_of_two(matrix.columns) || matrix.rows % tile_size != 0 ||
@@ -599,91 +679,26 @@ void mach_ne_matmul(
     }
     const auto state_values = ne_state_values(matrix, scratch);
 
-    parallel_ranges(
-        tile_rows,
-        4,
-        [&](std::uint32_t row_begin, std::uint32_t row_end) {
-            std::vector<float> row_sums(
-                static_cast<std::size_t>(batch) * tile_size);
-            for (std::uint32_t tile_row = row_begin;
-                 tile_row < row_end;
-                 ++tile_row) {
-                std::fill(row_sums.begin(), row_sums.end(), 0.0F);
-                for (std::uint32_t tile_column = 0;
-                     tile_column < tile_columns;
-                     ++tile_column) {
-                    const auto tile_index =
-                        static_cast<std::size_t>(tile_row) * tile_columns +
-                        tile_column;
-                    const auto *words =
-                        matrix.trellis.data() +
-                        tile_index * ne_words_per_tile;
-                    std::uint32_t state = words[0];
-                    for (std::uint32_t state_index = 0;
-                         state_index < ne_states_per_tile;
-                         ++state_index) {
-                        if (state_index != 0) {
-                            const auto position =
-                                register_bits +
-                                (state_index - 1) * ne_fresh_bits;
-                            const auto fresh = extract_stream_bits(
-                                words,
-                                ne_words_per_tile,
-                                ne_stream_bits,
-                                position,
-                                ne_fresh_bits);
-                            state =
-                                ((state << ne_fresh_bits) & 0xFFFFU) |
-                                fresh;
-                        }
-                        for (std::uint32_t component = 0;
-                             component < ne_values_per_state;
-                             ++component) {
-                            const auto element =
-                                state_index * ne_values_per_state +
-                                component;
-                            const auto local_row = element / tile_size;
-                            const auto local_column = element % tile_size;
-                            const auto column =
-                                tile_column * tile_size + local_column;
-                            const float weight =
-                                state_values[
-                                    static_cast<std::size_t>(state) *
-                                        ne_values_per_state +
-                                    component] *
-                                matrix.weight_scale;
-                            for (std::uint32_t batch_index = 0;
-                                 batch_index < batch;
-                                 ++batch_index) {
-                                row_sums[
-                                    static_cast<std::size_t>(batch_index) *
-                                        tile_size +
-                                    local_row] +=
-                                    weight *
-                                    scratch.input[
-                                        static_cast<std::size_t>(
-                                            batch_index) *
-                                            matrix.columns +
-                                        column];
-                            }
-                        }
-                    }
-                }
-                for (std::uint32_t batch_index = 0;
-                     batch_index < batch;
-                     ++batch_index) {
-                    std::copy_n(
-                        row_sums.begin() +
-                            static_cast<std::size_t>(batch_index) *
-                                tile_size,
-                        tile_size,
-                        scratch.output.begin() +
-                            static_cast<std::size_t>(batch_index) *
-                                matrix.rows +
-                            tile_row * tile_size);
-                }
-            }
-        });
+    // Decoding a packed weight once and applying it to a whole SIMD register
+    // of independent batch items is the point of the batch kernel. Below the
+    // threshold, and on ISAs without one, the scalar loop below stays the
+    // reference implementation.
+    const auto batch_lanes = detail::ne_batch_lanes();
+    if (batch_lanes != 0 && batch >= detail::ne_batch_minimum) {
+        scratch.batch_packed.resize(
+            detail::ne_batch_packed_floats(
+                matrix.columns, batch, batch_lanes));
+        detail::ne_matmul_tiles_batch(
+            matrix,
+            state_values,
+            scratch.input,
+            batch,
+            scratch.output,
+            scratch.batch_packed);
+    } else {
+        ne_accumulate_tiles_scalar(
+            matrix, state_values, scratch.input, batch, scratch.output);
+    }
 
     for (std::uint32_t batch_index = 0;
          batch_index < batch;
