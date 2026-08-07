@@ -1091,6 +1091,10 @@ void moe_forward_batch(
     DecoderBatchScratch &batch_scratch,
     const Backend &backend) {
     constexpr std::uint32_t routes_per_token = 8;
+    // Measured optimum for mach_expert_matmul on this codec; see the task
+    // construction below. Re-measure if that kernel gains a batch-lane path,
+    // because the whole reason for the cap is its current batch behaviour.
+    constexpr std::uint32_t expert_rows_per_task = 12;
     const auto &config = model.config();
     const auto batch = inputs.size() / config.hidden;
     const auto &descriptor = model.layer(layer).moe;
@@ -1180,16 +1184,48 @@ void moe_forward_batch(
             }
         });
 
-    detail::parallel_tasks(
-        static_cast<std::uint32_t>(scratch.active.size()),
-        [&](std::uint32_t active_index) {
-            const auto expert = scratch.active[active_index];
-            const auto begin = scratch.offsets[expert];
-            const auto expert_batch = scratch.counts[expert];
+    // One task per expert leaves the dispatch badly balanced and the biggest
+    // matmuls badly sized. Routing is skewed: a layer typically has about 85
+    // active experts holding 512 rows between them, roughly a third holding a
+    // single row while the largest holds around 56. parallel_tasks hands out
+    // contiguous index blocks, so a task 34 times heavier than its neighbour
+    // is assigned by position rather than by cost, and mach_expert_matmul
+    // reads its input column-major over a row-major array, so its cost per row
+    // degrades once the batch stops fitting cache: 0.66, 0.55, 0.72, 1.15, and
+    // 1.88 ms per row at 8, 12, 16, 32, and 64 rows.
+    //
+    // Splitting an expert's rows into evenly sized chunks fixes both. Rows are
+    // independent, so each chunk computes exactly what it would have computed
+    // inside the larger call.
+    scratch.tasks.clear();
+    for (const auto expert : scratch.active) {
+        const auto rows = scratch.counts[expert];
+        const auto begin = scratch.offsets[expert];
+        const auto chunks =
+            (rows + expert_rows_per_task - 1) / expert_rows_per_task;
+        std::uint32_t placed = 0;
+        for (std::uint32_t chunk = 0; chunk < chunks; ++chunk) {
+            // Spread rows evenly rather than leaving a one-row remainder,
+            // which would fall back to the single-vector path at three times
+            // the cost per row.
+            const auto chunk_rows = (rows - placed) / (chunks - chunk);
+            scratch.tasks.push_back({expert, begin + placed, chunk_rows});
+            placed += chunk_rows;
+        }
+    }
+    // Pulled rather than pre-assigned: chunking bounds how heavy any one task
+    // can be, and pulling means a worker that draws several light tasks simply
+    // comes back for more instead of finishing early and waiting.
+    detail::parallel_dynamic(
+        static_cast<std::uint32_t>(scratch.tasks.size()),
+        [&](std::uint32_t task_index) {
+            const auto task = scratch.tasks[task_index];
+            const auto expert = task.expert;
+            const auto expert_batch = task.rows;
             const auto hidden_offset =
-                static_cast<std::size_t>(begin) * config.hidden;
+                static_cast<std::size_t>(task.begin) * config.hidden;
             const auto expert_offset =
-                static_cast<std::size_t>(begin) * config.expert_hidden;
+                static_cast<std::size_t>(task.begin) * config.expert_hidden;
             const auto hidden_span =
                 static_cast<std::size_t>(expert_batch) * config.hidden;
             const auto expert_span =

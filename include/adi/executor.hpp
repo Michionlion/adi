@@ -108,8 +108,19 @@ struct DecoderScratch {
 // stage buffers. route_to_grouped maps a (batch, route) pair back to its
 // position in that grouping, which is what lets the output reduction run in
 // route order rather than grouped order.
+// One unit of expert work: a contiguous run of grouped rows belonging to one
+// expert. Large experts are split across several of these so no single task
+// dominates the dispatch and no matmul runs at a batch its kernel handles
+// badly.
+struct MoeExpertTask {
+    std::uint32_t expert;
+    std::uint32_t begin;
+    std::uint32_t rows;
+};
+
 struct MoeBatchScratch {
     std::vector<float> router_logits;
+    std::vector<MoeExpertTask> tasks;
     std::vector<std::uint32_t> route_order;
     std::vector<std::array<ExpertRoute, 8>> routes;
     std::vector<std::uint32_t> counts;

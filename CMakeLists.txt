@@ -123,6 +123,11 @@ if(ADI_BUILD_TESTS)
     target_include_directories(adi_int5_batch_test PRIVATE src)
     add_test(NAME int5_batch COMMAND adi_int5_batch_test)
 
+    add_executable(adi_parallel_test tests/parallel_test.cpp)
+    target_link_libraries(adi_parallel_test PRIVATE adi_runtime)
+    target_include_directories(adi_parallel_test PRIVATE src)
+    add_test(NAME parallel COMMAND adi_parallel_test)
+
     add_executable(adi_ne_trellis_test tests/ne_trellis_test.cpp)
     target_link_libraries(adi_ne_trellis_test PRIVATE adi_runtime)
     target_include_directories(adi_ne_trellis_test PRIVATE src)
@@ -228,6 +233,7 @@ if(ADI_BUILD_TESTS)
             adi_gguf_test
             adi_kernels_test
             adi_int5_batch_test
+            adi_parallel_test
             adi_ne_trellis_test
             adi_ne_batch_test
             adi_codec_cache_test

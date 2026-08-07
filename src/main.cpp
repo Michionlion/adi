@@ -105,7 +105,8 @@ std::size_t decoder_scratch_bytes(const adi::DecoderScratch &scratch) {
 }
 
 std::size_t moe_batch_scratch_bytes(const adi::MoeBatchScratch &scratch) {
-    return vector_bytes(scratch.router_logits) + vector_bytes(scratch.routes) +
+    return vector_bytes(scratch.router_logits) + vector_bytes(scratch.tasks) +
+           vector_bytes(scratch.routes) +
            vector_bytes(scratch.counts) + vector_bytes(scratch.offsets) +
            vector_bytes(scratch.cursors) + vector_bytes(scratch.active) +
            vector_bytes(scratch.grouped_batch) +
