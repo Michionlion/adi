@@ -9,16 +9,26 @@ option(ADI_BUILD_TESTS "Build ADI tests" ON)
 set(ADI_TEST_MODEL "" CACHE FILEPATH "Mach-1 GGUF used for checkpoint tests")
 
 add_library(adi_runtime STATIC
+    src/attention.cpp
     src/backend.cpp
     src/bpe.cpp
     src/chat.cpp
+    src/codec_cache.cpp
     src/executor.cpp
     src/generation.cpp
     src/gguf.cpp
     src/json.cpp
     src/kernels.cpp
     src/model.cpp
+    src/parallel.cpp
+    src/profiling.cpp
     src/server.cpp
+    src/simd.cpp
+    src/simd_arm.cpp
+    src/simd_x86.cpp
+    src/simd_x86_avx2.cpp
+    src/simd_x86_avx512.cpp
+    src/simd_x86_vbmi.cpp
     src/tokenizer.cpp
     src/unicode.cpp
     src/utf8.cpp
@@ -29,6 +39,38 @@ if(MSVC)
     target_compile_options(adi_runtime PRIVATE /W4 /permissive-)
 else()
     target_compile_options(adi_runtime PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|amd64|x64|i[3-6]86)")
+    if(MSVC)
+        set_source_files_properties(
+            src/simd_x86_avx2.cpp
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+        set_source_files_properties(
+            src/simd_x86_avx512.cpp
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+        if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+            set_source_files_properties(
+                src/simd_x86_vbmi.cpp
+                PROPERTIES COMPILE_OPTIONS
+                    "/arch:AVX512;/clang:-mavx512vbmi")
+        else()
+            set_source_files_properties(
+                src/simd_x86_vbmi.cpp
+                PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+        endif()
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        set_source_files_properties(
+            src/simd_x86_avx2.cpp
+            PROPERTIES COMPILE_OPTIONS "-mavx2")
+        set_source_files_properties(
+            src/simd_x86_avx512.cpp
+            PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw")
+        set_source_files_properties(
+            src/simd_x86_vbmi.cpp
+            PROPERTIES COMPILE_OPTIONS
+                "-mavx512f;-mavx512bw;-mavx512vbmi")
+    endif()
 endif()
 
 add_executable(adi src/main.cpp)
@@ -53,8 +95,39 @@ if(ADI_BUILD_TESTS)
     target_include_directories(adi_kernels_test PRIVATE src)
     add_test(NAME kernels COMMAND adi_kernels_test)
 
+    add_executable(adi_int5_batch_test tests/int5_batch_test.cpp)
+    target_link_libraries(adi_int5_batch_test PRIVATE adi_runtime)
+    target_include_directories(adi_int5_batch_test PRIVATE src)
+    add_test(NAME int5_batch COMMAND adi_int5_batch_test)
+
+    add_executable(adi_codec_cache_test tests/codec_cache_test.cpp)
+    target_link_libraries(adi_codec_cache_test PRIVATE adi_runtime)
+    target_include_directories(adi_codec_cache_test PRIVATE src)
+    add_test(NAME codec_cache COMMAND adi_codec_cache_test)
+
+    add_executable(adi_gated_delta_test tests/gated_delta_test.cpp)
+    target_link_libraries(adi_gated_delta_test PRIVATE adi_runtime)
+    target_include_directories(adi_gated_delta_test PRIVATE src)
+    add_test(NAME gated_delta COMMAND adi_gated_delta_test)
+
+    add_executable(adi_simd_dispatch_test tests/simd_dispatch_test.cpp)
+    target_link_libraries(adi_simd_dispatch_test PRIVATE adi_runtime)
+    target_include_directories(adi_simd_dispatch_test PRIVATE src)
+    add_test(NAME simd_dispatch COMMAND adi_simd_dispatch_test)
+
+    add_executable(adi_int5_vbmi_test tests/int5_vbmi_test.cpp)
+    target_link_libraries(adi_int5_vbmi_test PRIVATE adi_runtime)
+    target_include_directories(adi_int5_vbmi_test PRIVATE src)
+    add_test(NAME int5_vbmi COMMAND adi_int5_vbmi_test)
+
+    add_executable(adi_int5_vbmi_batch_test tests/int5_vbmi_batch_test.cpp)
+    target_link_libraries(adi_int5_vbmi_batch_test PRIVATE adi_runtime)
+    target_include_directories(adi_int5_vbmi_batch_test PRIVATE src)
+    add_test(NAME int5_vbmi_batch COMMAND adi_int5_vbmi_batch_test)
+
     add_executable(adi_executor_test tests/executor_test.cpp)
     target_link_libraries(adi_executor_test PRIVATE adi_runtime)
+    target_include_directories(adi_executor_test PRIVATE src)
     add_test(NAME executor COMMAND adi_executor_test)
 
     add_executable(adi_generation_test tests/generation_test.cpp)
@@ -102,6 +175,12 @@ if(ADI_BUILD_TESTS)
             adi_smoke_test
             adi_gguf_test
             adi_kernels_test
+            adi_int5_batch_test
+            adi_codec_cache_test
+            adi_gated_delta_test
+            adi_simd_dispatch_test
+            adi_int5_vbmi_test
+            adi_int5_vbmi_batch_test
             adi_executor_test
             adi_generation_test
             adi_json_test

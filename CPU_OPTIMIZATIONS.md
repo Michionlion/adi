@@ -1,5 +1,25 @@
 # ADI CPU optimization plan
 
+## Implemented correctness-first increment
+
+The first implementation pass now includes:
+
+- deterministic benchmark vectors and opt-in atomic per-kernel profiles;
+- immutable per-layer/expert descriptors and cached RoPE powers/tables;
+- a configurable persistent worker pool;
+- fixed-width trellis extraction and shared state metadata;
+- runtime scalar, AVX2, AVX-512, NEON, and SVE-aware dispatch;
+- vectorized int5 output-head and BF16/float dot helpers;
+- layer-major prompt prefill, grouped expert batching, and continuous server
+  decode batching;
+- grouped-query online-softmax attention.
+
+VNNI is detected as part of the x86 platform but is deliberately not used to
+quantize float activations. The AVX-512 float path preserves the model
+arithmetic more closely. Scalar/serial equivalence tests remain the authority:
+trellis and stateful execution are bit-exact, while SIMD reduction kernels use
+tight absolute/relative bounds.
+
 ## Current measured baseline
 
 ADI's repository records the following Release measurements on eight AMD EPYC 9645 cores:

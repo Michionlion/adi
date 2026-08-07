@@ -14,12 +14,23 @@ struct MachExpertMatrix {
     std::span<const std::uint16_t> sv_f16;
     std::span<const std::uint16_t> wave_gamma_f16;
     std::span<const float> tlut;
+    std::span<const float> state_values{};
+    std::span<const std::uint16_t> wave_indexes{};
+    std::span<const float> wave_gamma{};
 };
 
 struct ExpertScratch {
     std::vector<float> input;
     std::vector<float> output;
     std::vector<std::uint16_t> wave_indexes;
+    std::vector<float> state_values;
+    std::vector<float> wave_gamma;
+    const float *state_values_source = nullptr;
+    const std::uint16_t *wave_gamma_source = nullptr;
+    std::size_t wave_gamma_count = 0;
+    std::uint32_t state_value_components = 0;
+    std::uint32_t wave_tile_rows = 0;
+    std::uint32_t wave_tile_columns = 0;
 };
 
 struct MachNeMatrix {
@@ -30,6 +41,7 @@ struct MachNeMatrix {
     std::span<const std::int8_t> sv;
     float weight_scale;
     std::span<const float> tlut;
+    std::span<const float> state_values{};
 };
 
 struct MachEmbedding {
@@ -63,6 +75,13 @@ void mach_expert_matvec(
     const MachExpertMatrix &matrix,
     std::span<const float> input,
     std::span<float> output,
+    ExpertScratch &scratch);
+
+void mach_expert_matmul(
+    const MachExpertMatrix &matrix,
+    std::span<const float> inputs,
+    std::uint32_t batch,
+    std::span<float> outputs,
     ExpertScratch &scratch);
 
 // Computes y = W*x from the canonical K=4/V=2 non-expert stream.
@@ -103,6 +122,12 @@ void bf16_matvec(
     const Bf16Matrix &matrix,
     std::span<const float> input,
     std::span<float> output);
+
+void bf16_matmul(
+    const Bf16Matrix &matrix,
+    std::span<const float> inputs,
+    std::uint32_t batch,
+    std::span<float> outputs);
 
 void rms_norm(
     std::span<const float> input,

@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <vector>
 
@@ -40,10 +41,14 @@ struct FullAttentionState {
 struct FullAttentionScratch {
     ExpertScratch codec;
     std::vector<float> query_gate;
+    std::vector<float> contiguous_queries;
     std::vector<float> key;
     std::vector<float> value;
     std::vector<float> attended;
     std::vector<float> scores;
+    std::uint32_t rope_position = std::numeric_limits<std::uint32_t>::max();
+    std::array<float, 32> rope_cosine;
+    std::array<float, 32> rope_sine;
 };
 
 struct LinearAttentionState {
@@ -79,8 +84,24 @@ struct DecoderScratch {
 };
 
 struct DecoderBatchScratch {
+    ExpertScratch codec;
     std::vector<float> head_inputs;
     std::vector<float> head_outputs;
+    std::vector<float> projection_0;
+    std::vector<float> projection_1;
+    std::vector<float> projection_2;
+    std::vector<float> projection_3;
+    std::vector<float> projection_4;
+    std::vector<float> projection_5;
+    std::vector<float> moe_route_outputs;
+};
+
+struct PrefillScratch {
+    std::vector<float> hidden;
+    std::vector<float> rope_cosine;
+    std::vector<float> rope_sine;
+    DecoderScratch token;
+    DecoderBatchScratch batch;
 };
 
 [[nodiscard]] std::array<ExpertRoute, 8> top_experts(
@@ -136,6 +157,16 @@ void decode_batch(
     std::span<float> logits,
     std::span<DecoderScratch> scratches,
     DecoderBatchScratch &batch_scratch,
+    const Backend &backend = cpu_backend());
+
+// Evaluates one sequence in layer-major order. Only the final prompt token
+// produces logits; all recurrent and KV state is retained for decode.
+void prefill(
+    const MachModel &model,
+    std::span<const std::uint32_t> tokens,
+    DecoderState &state,
+    std::span<float> logits,
+    PrefillScratch &scratch,
     const Backend &backend = cpu_backend());
 
 } // namespace adi
