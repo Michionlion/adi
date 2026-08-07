@@ -20,6 +20,7 @@ add_library(adi_runtime STATIC
     src/json.cpp
     src/kernels.cpp
     src/model.cpp
+    src/options.cpp
     src/parallel.cpp
     src/profiling.cpp
     src/server.cpp
@@ -166,10 +167,18 @@ if(ADI_BUILD_TESTS)
     target_link_libraries(adi_model_e2e_test PRIVATE adi_runtime)
     add_executable(adi_model_batch_test tests/model_batch_test.cpp)
     target_link_libraries(adi_model_batch_test PRIVATE adi_runtime)
+    add_executable(adi_prefill_ubatch_test tests/prefill_ubatch_test.cpp)
+    target_link_libraries(adi_prefill_ubatch_test PRIVATE adi_runtime)
     if(ADI_TEST_MODEL)
         add_test(NAME tokenizer COMMAND adi_tokenizer_test ${ADI_TEST_MODEL})
         add_test(NAME model_e2e COMMAND adi_model_e2e_test ${ADI_TEST_MODEL})
         add_test(NAME model_batch COMMAND adi_model_batch_test ${ADI_TEST_MODEL})
+        # The wide matrix from the plan runs as "adi_prefill_ubatch_test MODEL
+        # --full"; chunk handling does not depend on prompt size, so the
+        # per-commit test keeps prompts short.
+        add_test(
+            NAME prefill_ubatch
+            COMMAND adi_prefill_ubatch_test ${ADI_TEST_MODEL})
     endif()
 
     foreach(test_target
@@ -191,7 +200,8 @@ if(ADI_BUILD_TESTS)
             adi_server_test
             adi_tokenizer_test
             adi_model_e2e_test
-            adi_model_batch_test)
+            adi_model_batch_test
+            adi_prefill_ubatch_test)
         if(MSVC)
             target_compile_options(${test_target} PRIVATE /UNDEBUG)
         else()

@@ -1449,7 +1449,8 @@ void prefill(
     PrefillScratch &scratch,
     const Backend &backend) {
     const auto &config = model.config();
-    if (tokens.empty() || logits.size() != config.vocabulary ||
+    if (tokens.empty() ||
+        (!logits.empty() && logits.size() != config.vocabulary) ||
         state.position >= config.context ||
         tokens.size() > config.context - state.position) {
         throw std::invalid_argument("prefill shape or context is invalid");
@@ -1693,19 +1694,24 @@ void prefill(
         }
     }
 
-    std::copy_n(
-        scratch.hidden.end() - config.hidden,
-        config.hidden,
-        scratch.token.hidden.begin());
-    finalize_hidden(model, scratch.token, backend);
-    for (std::uint32_t chunk = 0; chunk < 8; ++chunk) {
-        const auto head = model.head_chunk(chunk);
-        backend.head_matvec(
-            head,
-            scratch.token.normalized,
-            logits.subspan(
-                static_cast<std::size_t>(chunk) * head.rows,
-                head.rows));
+    // Intermediate prompt chunks discard their logits, so the final
+    // normalization and the eight vocabulary-head chunks are computed only
+    // when a caller asked for them. Every state update above already happened.
+    if (!logits.empty()) {
+        std::copy_n(
+            scratch.hidden.end() - config.hidden,
+            config.hidden,
+            scratch.token.hidden.begin());
+        finalize_hidden(model, scratch.token, backend);
+        for (std::uint32_t chunk = 0; chunk < 8; ++chunk) {
+            const auto head = model.head_chunk(chunk);
+            backend.head_matvec(
+                head,
+                scratch.token.normalized,
+                logits.subspan(
+                    static_cast<std::size_t>(chunk) * head.rows,
+                    head.rows));
+        }
     }
     state.position += static_cast<std::uint32_t>(count);
 }

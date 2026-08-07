@@ -3,6 +3,7 @@
 #include "adi/generation.hpp"
 #include "adi/gguf.hpp"
 #include "adi/model.hpp"
+#include "adi/options.hpp"
 #include "adi/profiling.hpp"
 #include "adi/server.hpp"
 #include "adi/tokenizer.hpp"
@@ -32,6 +33,95 @@ float stable_benchmark_input(
     const auto centered =
         static_cast<std::int32_t>((value >> 40) & 0xFFFFFFU) - 0x800000;
     return static_cast<float>(centered) / 8388608.0F;
+}
+
+// FNV-1a over raw bit patterns. Unlike a sum it detects reordered or
+// individually perturbed elements, which is what exactness checks care about.
+std::uint64_t hash_bytes(std::uint64_t hash, const void *data, std::size_t size) {
+    const auto *bytes = static_cast<const unsigned char *>(data);
+    for (std::size_t index = 0; index < size; ++index) {
+        hash ^= bytes[index];
+        hash *= 0x00000100000001B3ULL;
+    }
+    return hash;
+}
+
+std::uint64_t hash_floats(std::uint64_t hash, std::span<const float> values) {
+    return hash_bytes(hash, values.data(), values.size() * sizeof(float));
+}
+
+std::uint64_t decoder_state_checksum(
+    const adi::MachModel &model,
+    const adi::DecoderState &state) {
+    std::uint64_t hash = 0xCBF29CE484222325ULL;
+    hash = hash_bytes(hash, &state.position, sizeof(state.position));
+    for (std::uint32_t layer = 0; layer < model.config().layers; ++layer) {
+        hash = hash_floats(hash, state.full_attention[layer].keys);
+        hash = hash_floats(hash, state.full_attention[layer].values);
+        hash = hash_floats(hash, state.linear_attention[layer].convolution);
+        hash = hash_floats(hash, state.linear_attention[layer].recurrent);
+    }
+    return hash;
+}
+
+template <typename T>
+std::size_t vector_bytes(const std::vector<T> &values) {
+    return values.capacity() * sizeof(T);
+}
+
+std::size_t expert_scratch_bytes(const adi::ExpertScratch &scratch) {
+    return vector_bytes(scratch.input) + vector_bytes(scratch.output) +
+           vector_bytes(scratch.wave_indexes) +
+           vector_bytes(scratch.state_values) +
+           vector_bytes(scratch.wave_gamma);
+}
+
+std::size_t decoder_scratch_bytes(const adi::DecoderScratch &scratch) {
+    std::size_t bytes = vector_bytes(scratch.hidden) +
+                        vector_bytes(scratch.normalized) +
+                        vector_bytes(scratch.attention) +
+                        vector_bytes(scratch.feed_forward);
+    const auto &full = scratch.full_attention;
+    bytes += expert_scratch_bytes(full.codec) + vector_bytes(full.query_gate) +
+             vector_bytes(full.contiguous_queries) + vector_bytes(full.key) +
+             vector_bytes(full.value) + vector_bytes(full.attended) +
+             vector_bytes(full.scores);
+    const auto &linear = scratch.linear_attention;
+    bytes += expert_scratch_bytes(linear.codec) + vector_bytes(linear.qkv) +
+             vector_bytes(linear.gate) + vector_bytes(linear.convolved) +
+             vector_bytes(linear.alpha) + vector_bytes(linear.beta) +
+             vector_bytes(linear.recurrent_output) +
+             vector_bytes(linear.normalized);
+    const auto &moe = scratch.moe;
+    for (const auto &expert : moe.experts) {
+        bytes += expert_scratch_bytes(expert.codec) +
+                 vector_bytes(expert.gate) + vector_bytes(expert.up) +
+                 vector_bytes(expert.activated) + vector_bytes(expert.projected);
+    }
+    bytes += expert_scratch_bytes(moe.shared_codec) +
+             vector_bytes(moe.router_logits) + vector_bytes(moe.shared_gate) +
+             vector_bytes(moe.shared_up) + vector_bytes(moe.shared_down);
+    return bytes;
+}
+
+std::size_t batch_scratch_bytes(const adi::DecoderBatchScratch &scratch) {
+    return expert_scratch_bytes(scratch.codec) +
+           vector_bytes(scratch.head_inputs) +
+           vector_bytes(scratch.head_outputs) +
+           vector_bytes(scratch.projection_0) +
+           vector_bytes(scratch.projection_1) +
+           vector_bytes(scratch.projection_2) +
+           vector_bytes(scratch.projection_3) +
+           vector_bytes(scratch.projection_4) +
+           vector_bytes(scratch.projection_5) +
+           vector_bytes(scratch.moe_route_outputs);
+}
+
+std::size_t prefill_scratch_bytes(const adi::PrefillScratch &scratch) {
+    return vector_bytes(scratch.hidden) + vector_bytes(scratch.rope_cosine) +
+           vector_bytes(scratch.rope_sine) +
+           decoder_scratch_bytes(scratch.token) +
+           batch_scratch_bytes(scratch.batch);
 }
 
 template <typename Function>
@@ -399,6 +489,71 @@ int bench_linear_attention(int argc, char **argv) {
     return 0;
 }
 
+int bench_prefill(int argc, char **argv) {
+    const adi::MachModel model(argv[2]);
+    const auto prompt_tokens = parse_u32(argv[3], "tokens");
+    adi::ExecutionOptions execution;
+    execution.prefill_ubatch = parse_u32(argv[4], "ubatch");
+    const auto iterations = argc == 6 ? parse_u32(argv[5], "iterations") : 1;
+    if (prompt_tokens == 0 || iterations == 0) {
+        throw std::invalid_argument("tokens and iterations must be positive");
+    }
+    if (prompt_tokens >= model.config().context) {
+        throw std::invalid_argument("tokens exceeds model context");
+    }
+    adi::validate_execution_options(execution);
+
+    // The token sequence is generated, not tokenized, so the timed region
+    // never contains tokenizer work and repeats bit-identically across runs.
+    std::vector<std::uint32_t> tokens(prompt_tokens);
+    for (std::size_t index = 0; index < tokens.size(); ++index) {
+        std::uint64_t value =
+            index + 0x9E3779B97F4A7C15ULL;
+        value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        value = (value ^ (value >> 27)) * 0x94D049BB133111EBULL;
+        value ^= value >> 31;
+        tokens[index] =
+            static_cast<std::uint32_t>(value % model.config().vocabulary);
+    }
+
+    std::vector<float> logits(model.config().vocabulary);
+    adi::PrefillScratch scratch;
+    // One untimed pass faults in every model page and grows every scratch
+    // vector, so the measured iterations see a warm, steady-state runtime.
+    {
+        adi::DecoderState warm_state;
+        adi::prefill_prompt(model, tokens, warm_state, logits, scratch, execution);
+    }
+    adi::reset_kernel_profiles();
+
+    double seconds = 0.0;
+    std::uint64_t state_checksum = 0;
+    for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
+        adi::DecoderState state;
+        const auto start = std::chrono::steady_clock::now();
+        adi::prefill_prompt(model, tokens, state, logits, scratch, execution);
+        seconds += std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - start).count();
+        state_checksum = decoder_state_checksum(model, state);
+    }
+    const auto average = seconds / iterations;
+
+    std::cout << std::hex
+              << "final_logits_checksum: 0x"
+              << hash_floats(0xCBF29CE484222325ULL, logits) << '\n'
+              << "state_checksum: 0x" << state_checksum << '\n'
+              << std::dec
+              << "prompt_tokens: " << prompt_tokens << '\n'
+              << "ubatch: " << execution.prefill_ubatch << '\n'
+              << "iterations: " << iterations << '\n'
+              << "seconds/prefill: " << average << '\n'
+              << "prompt_tokens/second: "
+              << static_cast<double>(prompt_tokens) / average << '\n'
+              << "peak_scratch_bytes: " << prefill_scratch_bytes(scratch)
+              << '\n';
+    return 0;
+}
+
 int decode_one(const char *path, std::string_view token_string) {
     const adi::MachModel model(path);
     const auto token = parse_u32(token_string, "token");
@@ -477,12 +632,22 @@ int generate_text(int argc, char **argv) {
     const adi::MachModel model(argv[2]);
     adi::Tokenizer tokenizer(model);
     adi::GenerationOptions options;
-    if (argc == 5) {
-        options.max_output_tokens = parse_u32(argv[4], "max tokens");
+    adi::ExecutionOptions execution;
+    for (int index = 4; index < argc; ++index) {
+        const std::string_view argument = argv[index];
+        if (argument == "--ubatch" && index + 1 < argc) {
+            execution.prefill_ubatch = parse_u32(argv[++index], "ubatch");
+        } else if (index == 4) {
+            options.max_output_tokens = parse_u32(argument, "max tokens");
+        } else {
+            throw std::invalid_argument("invalid generate argument");
+        }
     }
+    adi::validate_execution_options(execution);
     options.temperature = 0.0F;
     const auto start = std::chrono::steady_clock::now();
-    const auto result = adi::generate(model, tokenizer, argv[3], options);
+    const auto result =
+        adi::generate(model, tokenizer, argv[3], options, execution);
     const auto elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - start).count();
     std::cout << result.text << '\n'
@@ -506,6 +671,9 @@ int serve_command(int argc, char **argv) {
                 throw std::invalid_argument("port is out of range");
             }
             options.port = static_cast<std::uint16_t>(port);
+        } else if (argument == "--ubatch" && index + 1 < argc) {
+            options.execution.prefill_ubatch =
+                parse_u32(argv[++index], "ubatch");
         } else {
             throw std::invalid_argument("invalid serve argument");
         }
@@ -513,6 +681,7 @@ int serve_command(int argc, char **argv) {
     if (options.model.empty()) {
         throw std::invalid_argument("--model is required");
     }
+    adi::validate_execution_options(options.execution);
     adi::serve(options);
 }
 
@@ -527,11 +696,13 @@ void usage() {
               << "  adi bench-moe MODEL.gguf LAYER [ITERATIONS]\n"
               << "  adi bench-attention MODEL.gguf LAYER [TOKENS]\n"
               << "  adi bench-linear MODEL.gguf LAYER [TOKENS]\n"
+              << "  adi bench-prefill MODEL.gguf TOKENS UBATCH [ITERATIONS]\n"
               << "  adi decode-token MODEL.gguf TOKEN\n"
               << "  adi decode-batch MODEL.gguf TOKEN BATCH\n"
               << "  adi tokenize MODEL.gguf TEXT\n"
-              << "  adi generate MODEL.gguf PROMPT [MAX_TOKENS]\n"
-              << "  adi serve --model MODEL.gguf [--host ADDRESS] [--port PORT]\n"
+              << "  adi generate MODEL.gguf PROMPT [MAX_TOKENS] [--ubatch TOKENS]\n"
+              << "  adi serve --model MODEL.gguf [--host ADDRESS] [--port PORT]"
+                 " [--ubatch TOKENS]\n"
               << "  adi embedding-row MODEL.gguf TOKEN\n";
 }
 
@@ -619,6 +790,15 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+    if ((argc == 5 || argc == 6) &&
+        std::string_view(argv[1]) == "bench-prefill") {
+        try {
+            return profiled_benchmark([&] { return bench_prefill(argc, argv); });
+        } catch (const std::exception &error) {
+            std::cerr << "adi: " << error.what() << '\n';
+            return 1;
+        }
+    }
     if (argc == 4 && std::string_view(argv[1]) == "decode-token") {
         try {
             return profiled_benchmark(
@@ -645,7 +825,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    if ((argc == 4 || argc == 5) && std::string_view(argv[1]) == "generate") {
+    if (argc >= 4 && std::string_view(argv[1]) == "generate") {
         try {
             return generate_text(argc, argv);
         } catch (const std::exception &error) {

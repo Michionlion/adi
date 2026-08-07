@@ -952,7 +952,7 @@ void handle_client(
 #endif
     const MachModel model(options.model);
     Tokenizer tokenizer(model);
-    ContinuousBatcher batcher(model, tokenizer);
+    ContinuousBatcher batcher(model, tokenizer, options.execution);
     std::atomic<std::uint32_t> active_connections = 0;
     const auto raw_listener = ::socket(
         AF_INET,

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "adi/executor.hpp"
+#include "adi/options.hpp"
 #include "adi/tokenizer.hpp"
 
 #include <cstdint>
@@ -34,6 +35,17 @@ struct GenerationResult {
 
 using TokenCallback = std::function<void(std::string_view)>;
 
+// Evaluates a whole prompt in execution.prefill_ubatch-sized chunks. Only the
+// final chunk computes logits, so an empty span advances state alone.
+void prefill_prompt(
+    const MachModel &model,
+    std::span<const std::uint32_t> tokens,
+    DecoderState &state,
+    std::span<float> logits,
+    PrefillScratch &scratch,
+    const ExecutionOptions &execution = {},
+    const CancelCallback &cancelled = {});
+
 [[nodiscard]] std::uint32_t sample_token(
     std::span<const float> logits,
     float temperature,
@@ -44,7 +56,8 @@ using TokenCallback = std::function<void(std::string_view)>;
     const MachModel &model,
     Tokenizer &tokenizer,
     std::string_view input,
-    const GenerationOptions &options);
+    const GenerationOptions &options,
+    const ExecutionOptions &execution = {});
 
 [[nodiscard]] GenerationResult generate_from_prompt(
     const MachModel &model,
@@ -52,11 +65,15 @@ using TokenCallback = std::function<void(std::string_view)>;
     std::string_view formatted_prompt,
     const GenerationOptions &options,
     const TokenCallback &token_callback = {},
-    const CancelCallback &cancelled = {});
+    const CancelCallback &cancelled = {},
+    const ExecutionOptions &execution = {});
 
 class ContinuousBatcher {
   public:
-    ContinuousBatcher(const MachModel &model, Tokenizer &tokenizer);
+    ContinuousBatcher(
+        const MachModel &model,
+        Tokenizer &tokenizer,
+        const ExecutionOptions &execution = {});
     ~ContinuousBatcher();
 
     ContinuousBatcher(const ContinuousBatcher &) = delete;

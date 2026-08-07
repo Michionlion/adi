@@ -63,7 +63,10 @@ void validate_generation_options(
     }
 }
 
-constexpr std::size_t prefill_chunk_tokens = 64;
+const ExecutionOptions &validated(const ExecutionOptions &options) {
+    validate_execution_options(options);
+    return options;
+}
 
 void throw_if_cancelled(const CancelCallback &cancelled) {
     if (cancelled && cancelled()) {
@@ -71,30 +74,35 @@ void throw_if_cancelled(const CancelCallback &cancelled) {
     }
 }
 
+} // namespace
+
 void prefill_prompt(
     const MachModel &model,
     std::span<const std::uint32_t> tokens,
     DecoderState &state,
     std::span<float> logits,
     PrefillScratch &scratch,
+    const ExecutionOptions &execution,
     const CancelCallback &cancelled) {
+    validate_execution_options(execution);
+    const auto chunk_tokens =
+        static_cast<std::size_t>(execution.prefill_ubatch);
     for (std::size_t offset = 0; offset < tokens.size();
-         offset += prefill_chunk_tokens) {
+         offset += chunk_tokens) {
         throw_if_cancelled(cancelled);
-        const auto count = std::min(
-            prefill_chunk_tokens,
-            tokens.size() - offset);
+        const auto count = std::min(chunk_tokens, tokens.size() - offset);
+        // Only the last chunk's logits are ever read, and the vocabulary head
+        // is expensive, so earlier chunks advance state without computing it.
+        const bool final_chunk = offset + count == tokens.size();
         prefill(
             model,
             tokens.subspan(offset, count),
             state,
-            logits,
+            final_chunk ? logits : std::span<float>{},
             scratch);
     }
     throw_if_cancelled(cancelled);
 }
-
-} // namespace
 
 std::uint32_t sample_token(
     std::span<const float> logits,
@@ -168,9 +176,10 @@ GenerationResult generate(
     const MachModel &model,
     Tokenizer &tokenizer,
     std::string_view input,
-    const GenerationOptions &options) {
+    const GenerationOptions &options,
+    const ExecutionOptions &execution) {
     return generate_from_prompt(
-        model, tokenizer, qwen_user_prompt(input), options);
+        model, tokenizer, qwen_user_prompt(input), options, {}, {}, execution);
 }
 
 GenerationResult generate_from_prompt(
@@ -179,8 +188,10 @@ GenerationResult generate_from_prompt(
     std::string_view formatted_prompt,
     const GenerationOptions &options,
     const TokenCallback &token_callback,
-    const CancelCallback &cancelled) {
+    const CancelCallback &cancelled,
+    const ExecutionOptions &execution) {
     validate_generation_options(model, options);
+    validate_execution_options(execution);
     const auto prompt_tokens = tokenizer.encode(formatted_prompt, cancelled);
     if (prompt_tokens.empty()) {
         throw std::invalid_argument("prompt exceeds model context");
@@ -205,6 +216,7 @@ GenerationResult generate_from_prompt(
         state,
         logits,
         prefill_scratch,
+        execution,
         cancelled);
     tokenizer.mask_unused_logits(logits);
     std::mt19937_64 random(options.seed);
@@ -288,9 +300,13 @@ struct ContinuousBatcher::Impl {
         std::mt19937_64 random;
     };
 
-    Impl(const MachModel &model, Tokenizer &tokenizer)
+    Impl(
+        const MachModel &model,
+        Tokenizer &tokenizer,
+        const ExecutionOptions &execution)
         : model(model),
           tokenizer(tokenizer),
+          execution(execution),
           worker([this](std::stop_token stop) { run(stop); }) {}
 
     ~Impl() {
@@ -400,6 +416,7 @@ struct ContinuousBatcher::Impl {
             state,
             prompt_logits,
             prefill_scratch,
+            execution,
             request_cancelled);
         tokenizer.mask_unused_logits(prompt_logits);
         Active admitted{
@@ -590,6 +607,7 @@ struct ContinuousBatcher::Impl {
 
     const MachModel &model;
     Tokenizer &tokenizer;
+    ExecutionOptions execution;
     std::mutex mutex;
     std::condition_variable_any condition;
     std::deque<std::shared_ptr<Request>> pending;
@@ -598,8 +616,9 @@ struct ContinuousBatcher::Impl {
 
 ContinuousBatcher::ContinuousBatcher(
     const MachModel &model,
-    Tokenizer &tokenizer)
-    : impl_(std::make_unique<Impl>(model, tokenizer)) {}
+    Tokenizer &tokenizer,
+    const ExecutionOptions &execution)
+    : impl_(std::make_unique<Impl>(model, tokenizer, validated(execution))) {}
 
 ContinuousBatcher::~ContinuousBatcher() = default;
 

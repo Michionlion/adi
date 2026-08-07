@@ -165,6 +165,7 @@ void prefill(
     const MachModel &model,
     std::span<const std::uint32_t> tokens,
     DecoderState &state,
+    // An empty span advances the model state without computing unused logits.
     std::span<float> logits,
     PrefillScratch &scratch,
     const Backend &backend = cpu_backend());
