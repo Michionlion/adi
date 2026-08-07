@@ -117,11 +117,21 @@ std::size_t batch_scratch_bytes(const adi::DecoderBatchScratch &scratch) {
            vector_bytes(scratch.moe_route_outputs);
 }
 
+std::size_t linear_prefill_scratch_bytes(
+    const adi::LinearPrefillScratch &scratch) {
+    return expert_scratch_bytes(scratch.codec) + vector_bytes(scratch.qkv) +
+           vector_bytes(scratch.gate) + vector_bytes(scratch.alpha) +
+           vector_bytes(scratch.beta) + vector_bytes(scratch.convolved) +
+           vector_bytes(scratch.recurrent_output) +
+           vector_bytes(scratch.normalized);
+}
+
 std::size_t prefill_scratch_bytes(const adi::PrefillScratch &scratch) {
     return vector_bytes(scratch.hidden) + vector_bytes(scratch.rope_cosine) +
            vector_bytes(scratch.rope_sine) +
            decoder_scratch_bytes(scratch.token) +
-           batch_scratch_bytes(scratch.batch);
+           batch_scratch_bytes(scratch.batch) +
+           linear_prefill_scratch_bytes(scratch.linear);
 }
 
 template <typename Function>

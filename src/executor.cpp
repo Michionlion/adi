@@ -879,6 +879,204 @@ void linear_attention_forward_batch(
         batch_scratch.codec);
 }
 
+} // namespace
+
+// Prefill evaluates one sequence, so every token shares one recurrent state
+// and the batch function has to walk tokens one at a time, dispatching the
+// worker pool once per token per layer. The recurrence is independent across
+// value heads while tokens must stay ordered within a head, so this flips the
+// loops: one dispatch over heads for the whole chunk, tokens sequential
+// inside. Every value, and the order every value is computed in, is unchanged.
+void linear_attention_prefill_chunk(
+    const MachModel &model,
+    std::uint32_t layer,
+    std::span<const float> inputs,
+    std::uint32_t tokens,
+    LinearAttentionState &state,
+    LinearPrefillScratch &scratch,
+    std::span<float> outputs,
+    const Backend &backend) {
+    constexpr std::uint32_t key_heads = 16;
+    constexpr std::uint32_t value_heads = 32;
+    constexpr std::uint32_t head_size = 128;
+    constexpr std::uint32_t qk_size = key_heads * head_size;
+    constexpr std::uint32_t value_size = value_heads * head_size;
+    constexpr std::uint32_t channels = 2 * qk_size + value_size;
+    constexpr std::uint32_t convolution_width = 4;
+    constexpr float epsilon = 1.0e-6F;
+    const auto &config = model.config();
+    const auto &descriptor = model.layer(layer).linear;
+    const auto count = static_cast<std::size_t>(tokens);
+    if (tokens == 0 || inputs.size() != count * config.hidden ||
+        outputs.size() != count * config.hidden) {
+        throw std::invalid_argument(
+            "linear attention prefill shape mismatch");
+    }
+    if (descriptor.convolution.size() !=
+        static_cast<std::size_t>(channels) * convolution_width) {
+        throw std::runtime_error(
+            "linear attention convolution shape mismatch");
+    }
+    if (descriptor.alpha_bias.size() != value_heads ||
+        descriptor.a_log.size() != value_heads) {
+        throw std::runtime_error("linear attention decay shape mismatch");
+    }
+    if (state.convolution.empty()) {
+        state.convolution.assign(
+            static_cast<std::size_t>(channels) * (convolution_width - 1),
+            0.0F);
+    }
+    if (state.convolution.size() !=
+        static_cast<std::size_t>(channels) * (convolution_width - 1)) {
+        throw std::invalid_argument(
+            "linear attention convolution state mismatch");
+    }
+    if (state.recurrent.empty()) {
+        state.recurrent.assign(
+            static_cast<std::size_t>(value_heads) * head_size * head_size,
+            0.0F);
+    }
+    if (state.recurrent.size() !=
+        static_cast<std::size_t>(value_heads) * head_size * head_size) {
+        throw std::invalid_argument(
+            "linear attention recurrent state mismatch");
+    }
+    detail::KernelTimer timer(KernelKind::linear_attention, tokens);
+
+    scratch.qkv.resize(count * channels);
+    scratch.gate.resize(count * value_size);
+    scratch.alpha.resize(count * value_heads);
+    scratch.beta.resize(count * value_heads);
+    scratch.convolved.resize(count * channels);
+    scratch.recurrent_output.resize(count * value_size);
+    scratch.normalized.resize(count * value_size);
+
+    // Phase A: one batched call per projection for the whole chunk.
+    backend.ne_matmul(
+        descriptor.qkv, inputs, tokens, scratch.qkv, scratch.codec);
+    backend.ne_matmul(
+        descriptor.gate, inputs, tokens, scratch.gate, scratch.codec);
+    backend.dense_bf16_matmul(descriptor.alpha, inputs, tokens, scratch.alpha);
+    backend.dense_bf16_matmul(descriptor.beta, inputs, tokens, scratch.beta);
+
+    // Phase B: the short convolution carries history across tokens, so it
+    // stays strictly sequential, with the history shifted in the same order.
+    for (std::size_t token = 0; token < count; ++token) {
+        const auto *qkv = scratch.qkv.data() + token * channels;
+        auto *convolved = scratch.convolved.data() + token * channels;
+        for (std::uint32_t channel = 0; channel < channels; ++channel) {
+            const auto history = static_cast<std::size_t>(channel) * 3;
+            const auto weights =
+                static_cast<std::size_t>(channel) * convolution_width;
+            float value = 0.0F;
+            for (std::uint32_t index = 0; index < 3; ++index) {
+                value += state.convolution[history + index] *
+                         bf16_to_f32(descriptor.convolution[weights + index]);
+            }
+            value += qkv[channel] *
+                     bf16_to_f32(descriptor.convolution[weights + 3]);
+            convolved[channel] = silu(value);
+            state.convolution[history] = state.convolution[history + 1];
+            state.convolution[history + 1] = state.convolution[history + 2];
+            state.convolution[history + 2] = qkv[channel];
+        }
+        for (std::uint32_t head = 0; head < key_heads; ++head) {
+            const auto offset = static_cast<std::size_t>(head) * head_size;
+            l2_normalize(
+                std::span<float>(convolved + offset, head_size), epsilon);
+            l2_normalize(
+                std::span<float>(convolved + qk_size + offset, head_size),
+                epsilon);
+        }
+    }
+
+    // Phase C: one worker dispatch for the whole chunk instead of one per
+    // token. Each value head owns its own slice of the recurrent state.
+    const float output_scale =
+        1.0F / std::sqrt(static_cast<float>(head_size));
+    detail::parallel_ranges(
+        value_heads,
+        1,
+        [&](std::uint32_t head_begin, std::uint32_t head_end) {
+            for (std::uint32_t head = head_begin; head < head_end; ++head) {
+                const auto key_head =
+                    gated_delta_key_head(head, value_heads, key_heads);
+                const float a_log = bf16_to_f32(descriptor.a_log[head]);
+                const float alpha_bias =
+                    bf16_to_f32(descriptor.alpha_bias[head]);
+                for (std::size_t token = 0; token < count; ++token) {
+                    const auto *convolved =
+                        scratch.convolved.data() + token * channels;
+                    const auto key_offset =
+                        static_cast<std::size_t>(key_head) * head_size;
+                    const auto query = std::span<const float>(
+                        convolved + key_offset, head_size);
+                    const auto key = std::span<const float>(
+                        convolved + qk_size + key_offset, head_size);
+                    const auto *value =
+                        convolved + 2 * qk_size +
+                        static_cast<std::size_t>(head) * head_size;
+                    const float beta_value =
+                        sigmoid(scratch.beta[token * value_heads + head]);
+                    const float biased_alpha =
+                        scratch.alpha[token * value_heads + head] + alpha_bias;
+                    const float softplus =
+                        biased_alpha > 20.0F
+                            ? biased_alpha
+                            : std::log1p(std::exp(biased_alpha));
+                    const float decay = std::exp(-std::exp(a_log) * softplus);
+                    auto *attended =
+                        scratch.recurrent_output.data() + token * value_size +
+                        static_cast<std::size_t>(head) * head_size;
+                    for (std::uint32_t row = 0; row < head_size; ++row) {
+                        auto state_row = std::span<float>(
+                            state.recurrent.data() +
+                                (static_cast<std::size_t>(head) * head_size +
+                                 row) *
+                                    head_size,
+                            head_size);
+                        attended[row] =
+                            detail::gated_delta_update(
+                                state_row,
+                                query,
+                                key,
+                                value[row],
+                                beta_value,
+                                decay) *
+                            output_scale;
+                    }
+                }
+            }
+        });
+
+    // Phase D: normalization and gating over every [token, head] vector, then
+    // one batched output projection. Neither is nested inside a dispatch.
+    detail::parallel_ranges(
+        static_cast<std::uint32_t>(count) * value_heads,
+        1,
+        [&](std::uint32_t begin, std::uint32_t end) {
+            for (std::uint32_t index = begin; index < end; ++index) {
+                const auto offset =
+                    static_cast<std::size_t>(index) * head_size;
+                const auto source = std::span<const float>(
+                    scratch.recurrent_output.data() + offset, head_size);
+                auto destination = std::span<float>(
+                    scratch.normalized.data() + offset, head_size);
+                backend.normalize_rms(
+                    source, descriptor.norm, 0.0F, epsilon, destination);
+                for (std::uint32_t element = 0; element < head_size;
+                     ++element) {
+                    destination[element] *=
+                        silu(scratch.gate[offset + element]);
+                }
+            }
+        });
+    backend.ne_matmul(
+        descriptor.output, scratch.normalized, tokens, outputs, scratch.codec);
+}
+
+namespace {
+
 void moe_forward_batch(
     const MachModel &model,
     std::uint32_t layer,
@@ -1485,8 +1683,6 @@ void prefill(
     std::vector<std::uint32_t> positions(count);
     std::vector<FullAttentionState *> full_states(count);
     std::vector<FullAttentionScratch *> full_scratches(count);
-    std::vector<LinearAttentionState *> linear_states(count);
-    std::vector<LinearAttentionScratch *> linear_scratches(count);
     for (std::size_t token_index = 0; token_index < count; ++token_index) {
         positions[token_index] =
             initial_position + static_cast<std::uint32_t>(token_index);
@@ -1614,20 +1810,16 @@ void prefill(
                     scratch.token.normalized.end(),
                     scratch.batch.head_inputs.begin() +
                         token_index * config.hidden);
-                linear_states[token_index] =
-                    &state.linear_attention[layer];
-                linear_scratches[token_index] =
-                    &scratch.token.linear_attention;
             }
             scratch.batch.head_outputs.resize(count * config.hidden);
-            linear_attention_forward_batch(
+            linear_attention_prefill_chunk(
                 model,
                 layer,
                 scratch.batch.head_inputs,
-                linear_states,
-                linear_scratches,
+                static_cast<std::uint32_t>(count),
+                state.linear_attention[layer],
+                scratch.linear,
                 scratch.batch.head_outputs,
-                scratch.batch,
                 backend);
             for (std::size_t token_index = 0;
                  token_index < count;

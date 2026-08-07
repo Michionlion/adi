@@ -67,6 +67,22 @@ struct LinearAttentionScratch {
     std::vector<float> normalized;
 };
 
+// Chunk-wide buffers for the prefill linear-attention kernel. Each vector
+// holds one phase's values for every token in the chunk, laid out
+// token-major: [token, channels] for qkv and convolved, [token, value_size]
+// for gate, recurrent_output, and normalized, [token, value_heads] for the
+// decay inputs.
+struct LinearPrefillScratch {
+    ExpertScratch codec;
+    std::vector<float> qkv;
+    std::vector<float> gate;
+    std::vector<float> alpha;
+    std::vector<float> beta;
+    std::vector<float> convolved;
+    std::vector<float> recurrent_output;
+    std::vector<float> normalized;
+};
+
 struct DecoderState {
     std::uint32_t position = 0;
     std::array<FullAttentionState, 40> full_attention;
@@ -102,6 +118,7 @@ struct PrefillScratch {
     std::vector<float> rope_sine;
     DecoderScratch token;
     DecoderBatchScratch batch;
+    LinearPrefillScratch linear;
 };
 
 [[nodiscard]] std::array<ExpertRoute, 8> top_experts(
@@ -137,6 +154,20 @@ void linear_attention_forward(
     std::span<float> output,
     LinearAttentionState &state,
     LinearAttentionScratch &scratch,
+    const Backend &backend = cpu_backend());
+
+// Evaluates one chunk of a single sequence. Inputs and outputs are
+// [tokens, hidden]. The convolution and recurrent state advance exactly as
+// the same number of linear_attention_forward calls would, but the worker
+// pool is dispatched once for the chunk rather than once per token.
+void linear_attention_prefill_chunk(
+    const MachModel &model,
+    std::uint32_t layer,
+    std::span<const float> inputs,
+    std::uint32_t tokens,
+    LinearAttentionState &state,
+    LinearPrefillScratch &scratch,
+    std::span<float> outputs,
     const Backend &backend = cpu_backend());
 
 void decode_token(
