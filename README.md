@@ -77,11 +77,29 @@ build/adi bench-ne MODEL.gguf 0 TENSOR_NAME 10 4
 build/adi bench-head MODEL.gguf 0 10 4
 ```
 
+Measure prompt prefill at a chosen microbatch. The command prints
+tokens/second alongside checksums of the final logits and the complete
+decoder state, so a tuning run also shows that the result did not change:
+
+```bash
+build/adi bench-prefill MODEL.gguf 256 16
+```
+
+`--ubatch` sets how many prompt tokens share one packed-weight decode pass.
+It is a throughput and scratch-memory choice only: every microbatch produces
+identical logits and identical state, so it never changes what a request
+returns. The default is 16, chosen by measurement; see
+[`docs/benchmarks.md`](docs/benchmarks.md).
+
+```bash
+build/adi generate MODEL.gguf "prompt" 64 --ubatch 16
+```
+
 Start the Responses API:
 
 ```bash
 ./build/adi serve --model models/Mach-1-Additive-35B.gguf \
-  --host 127.0.0.1 --port 9932
+  --host 127.0.0.1 --port 9932 --ubatch 16
 ```
 
 On Windows:

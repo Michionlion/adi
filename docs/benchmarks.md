@@ -71,3 +71,123 @@ recorded 4.13 seconds. The 11-token prompt plus one greedy output-token
 checkpoint completes in roughly 12.5 seconds through layer-major prefill.
 These are regression observations, not final throughput claims; repeat runs
 and report variance before publishing tuned numbers.
+
+## Prefill and batch-decode increment
+
+Measured on 2026-08-07 with a Release build, GCC 14.2, eight EPYC 9645 cores
+(one thread per core), AVX-512 selected, and the model warm in the page cache.
+`adi bench-prefill MODEL TOKENS UBATCH [ITERATIONS]` reports these numbers with
+a generated token sequence, a fresh `DecoderState` per measured iteration, and
+FNV-1a checksums over the final logits and the complete decoder state.
+
+### Headline
+
+A 256-token prompt, each build at its own default microbatch, so this is what
+a caller actually sees:
+
+| | seconds | tokens/s | peak scratch |
+| --- | ---: | ---: | ---: |
+| Before, microbatch 64 | 171.57 | 1.49 | 15.4 MB |
+| After, microbatch 16 | 50.58 | 5.06 | 8.0 MB |
+
+3.39x the prompt throughput on 48% of the scratch, with logits checksum
+`0x35a5f9bc4d1133d2` and state checksum `0xd3861b9b0d49fdd` on both.
+
+Scratch is lower only because the default microbatch fell. Compared at the
+same microbatch of 64 it rises from 15.4 MB to 31.8 MB, because the chunk-wide
+linear-attention buffers and the persistent MoE stage buffers are new and both
+scale with the microbatch. That is a real steady-state increase for anyone who
+raises `--ubatch` back to 64 or beyond.
+
+### What each change is worth
+
+A 64-token prompt at microbatch 64, so every row is like-for-like. Kernel times
+are the wall time attributed to that kernel across the whole prefill.
+
+| Stage | tokens/s | non-expert batch | linear attention | MoE |
+| --- | ---: | ---: | ---: | ---: |
+| Configurable microbatch only | 1.515 | 22.21 s | 16.42 s | 21.42 s |
+| Non-expert batch kernel | 3.126 | 0.57 s | 0.81 s | 19.49 s |
+| Linear-attention prefill chunk | 3.157 | 0.65 s | 0.67 s | 19.42 s |
+| Batched MoE working set | 3.176 | 0.65 s | 0.66 s | 19.31 s |
+
+The non-expert batch kernel is nearly the whole prefill gain. It also accounts
+for most of the linear-attention drop, because that layer's cost was its
+non-expert projections rather than the recurrence or the per-token worker
+dispatch. Restructuring linear attention into one dispatch per chunk is worth
+18% of that kernel and about 1% end to end.
+
+Every row above produces logits checksum `0x8c24a3f4644e03d3` and state
+checksum `0xc75f92166aad6875`.
+
+### Microbatch sweep
+
+A 256-token prompt. Peak scratch is the summed capacity of every prefill
+scratch buffer after the run.
+
+| Microbatch | 2 | 4 | 8 | 16 | 32 | 64 | 128 | 256 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| tokens/s | 1.99 | 3.35 | 4.40 | 5.06 | 4.25 | 3.05 | 2.67 | 2.45 |
+| peak scratch (MB) | 1.0 | 2.0 | 4.1 | 8.0 | 16.0 | 31.8 | 63.5 | 126.9 |
+
+Sixteen is fastest and cheapest, so it is the default. A 1024-token prompt
+keeps the ordering: 4.89 tokens/s at sixteen against 3.00 at sixty-four.
+
+Large microbatches were expected to win, since decoding a packed weight once
+across many vectors is what made the non-expert kernel fast. They lose because
+of the other codec: once several tokens route to the same expert,
+`mach_expert_matmul` leaves the single-vector path for a scalar batch loop
+whose row accumulators and strided inputs no longer fit L1. Giving that kernel
+the same batch-lane treatment is the next piece of work, and this default
+should be re-measured after it.
+
+All eight microbatches produce the same checksums at a given prompt length.
+
+### Decode
+
+`adi decode-batch`, sequences/second. Batches 4, 8, and 16 are medians of seven
+runs; batches 1 and 32 are medians of three. Run-to-run spread is roughly
+±10%, so single runs do not separate these.
+
+| Batch | Before | After |
+| ---: | ---: | ---: |
+| 1 | 1.29 | 1.97 |
+| 4 | 2.67 | 4.25 |
+| 8 | 3.04 | 5.89 |
+| 16 | 3.22 | 6.69 |
+| 32 | 2.44 | 4.60 |
+
+Aggregate throughput used to flatten between batch 4 and batch 8. The
+non-expert batch kernel fixed that on its own, taking the pair from 2.67/3.04
+to 4.37/5.69; the batched MoE working set then added about 7% at batches 4
+through 16. Throughput still falls from batch 16 to batch 32, which is the same
+expert-codec effect the microbatch sweep shows.
+
+Single-sequence decode improves from 1.29 to 1.97 tokens/s, well clear of the
+2% no-regression requirement. It gains from the specialized trellis walk alone,
+since that path uses no batch kernel.
+
+### Exactness
+
+Bit-exact, not tolerance-bounded:
+
+- prompt lengths {1, 63, 64, 65, 257} against microbatches {1, 7, 64, 256}
+  agree on final logits, position, and all KV, convolution, and recurrent
+  state, and agree with token-at-a-time `decode_token`;
+- the specialized non-expert trellis walk reproduces the generic bit-window
+  extractor on 4,000 randomized tiles plus every single-bit edge case,
+  including the transition that wraps the stream;
+- the SIMD batch kernel equals the scalar kernel at batches {1, 2, 3, 4, 5, 7,
+  8, 15, 16, 17, 33, 64, 127} on three matrix shapes under both AVX2 and
+  AVX-512, and each batch row equals the single-vector kernel;
+- the linear-attention prefill chunk equals repeated `linear_attention_forward`
+  at {1, 2, 7, 16, 64, 65} tokens from a nonzero state;
+- batched MoE equals per-token `moe_forward` on routes, route weights, and
+  outputs at batches {1, 4, 8, 64, 256} for identical, varied, and duplicated
+  routing.
+
+The batch kernels compile with FP contraction disabled so their separate
+multiply and add are never fused; the objects contain no FMA instruction. The
+scalar path is retained and still runs below batch 4 and on ISAs without a
+batch kernel. The full suite passes under `ADI_CPU_ISA` of scalar, avx2, and
+avx512.
