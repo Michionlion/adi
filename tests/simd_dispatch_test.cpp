@@ -34,21 +34,26 @@ int main() {
     }
 
     adi::detail::force_cpu_isa_for_testing(adi::detail::CpuIsa::scalar);
-    const float scalar = adi::detail::f32_dot(left, right);
+    const auto scalar_dot = adi::detail::selected_f32_dot_kernel();
+    const float scalar = scalar_dot(left, right);
+    assert(adi::detail::f32_dot(left, right) == scalar);
     adi::detail::force_cpu_isa_for_testing(selected);
-    const float native = adi::detail::f32_dot(left, right);
+    const float native =
+        adi::detail::selected_f32_dot_kernel()(left, right);
     assert(std::abs(native - scalar) <=
            1.0e-5F * std::max(1.0F, std::abs(scalar)));
 
     if (features.avx2) {
         adi::detail::force_cpu_isa_for_testing(adi::detail::CpuIsa::avx2);
-        const float avx2 = adi::detail::f32_dot(left, right);
+        const float avx2 =
+            adi::detail::selected_f32_dot_kernel()(left, right);
         assert(std::abs(avx2 - scalar) <=
                1.0e-5F * std::max(1.0F, std::abs(scalar)));
     }
     if (features.avx512f && features.avx512bw) {
         adi::detail::force_cpu_isa_for_testing(adi::detail::CpuIsa::avx512);
-        const float avx512 = adi::detail::f32_dot(left, right);
+        const float avx512 =
+            adi::detail::selected_f32_dot_kernel()(left, right);
         assert(std::abs(avx512 - scalar) <=
                1.0e-5F * std::max(1.0F, std::abs(scalar)));
     }

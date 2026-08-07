@@ -384,6 +384,10 @@ void clear_cpu_isa_for_testing() noexcept {
     isa_override.store(no_override, std::memory_order_release);
 }
 
+F32DotKernel selected_f32_dot_kernel() noexcept {
+    return selected_ops().f32_dot;
+}
+
 void hadamard_transform(std::span<float> values) {
     selected_ops().hadamard(values);
 }
@@ -497,7 +501,7 @@ float f32_dot(
     if (left.size() != right.size()) {
         throw std::invalid_argument("float dot shape mismatch");
     }
-    return selected_ops().f32_dot(left, right);
+    return selected_f32_dot_kernel()(left, right);
 }
 
 float gated_delta_update(

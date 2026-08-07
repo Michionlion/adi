@@ -29,6 +29,10 @@ struct CpuFeatures {
     bool sve = false;
 };
 
+using F32DotKernel = float (*)(
+    std::span<const float> left,
+    std::span<const float> right);
+
 [[nodiscard]] CpuFeatures detected_cpu_features() noexcept;
 
 [[nodiscard]] CpuIsa selected_cpu_isa() noexcept;
@@ -58,6 +62,8 @@ void int5_scaled_dot_batch(
 [[nodiscard]] float bf16_dot(
     std::span<const std::uint16_t> weights,
     std::span<const float> input);
+
+[[nodiscard]] F32DotKernel selected_f32_dot_kernel() noexcept;
 
 [[nodiscard]] float f32_dot(
     std::span<const float> left,

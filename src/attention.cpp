@@ -35,6 +35,7 @@ void grouped_query_online_attention(
     const auto heads_per_group = query_heads / kv_heads;
     const float score_scale =
         1.0F / std::sqrt(static_cast<float>(head_size));
+    const auto dot = selected_f32_dot_kernel();
     std::fill(output.begin(), output.end(), 0.0F);
     std::vector<float> maxima(heads_per_group);
     std::vector<float> denominators(heads_per_group);
@@ -59,7 +60,7 @@ void grouped_query_online_attention(
                 const auto query = queries.subspan(
                     static_cast<std::size_t>(query_head) * head_size,
                     head_size);
-                const float score = f32_dot(query, key) * score_scale;
+                const float score = dot(query, key) * score_scale;
                 const float next_maximum =
                     std::max(maxima[group_head], score);
                 const float previous_scale =

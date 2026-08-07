@@ -22,9 +22,6 @@ using Int5BatchDotKernel = void (*)(
 using Bf16DotKernel = float (*)(
     std::span<const std::uint16_t> weights,
     std::span<const float> input);
-using F32DotKernel = float (*)(
-    std::span<const float> left,
-    std::span<const float> right);
 using GatedDeltaKernel = float (*)(
     std::span<float> state,
     std::span<const float> query,
