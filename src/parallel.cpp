@@ -135,11 +135,19 @@ class WorkerPool {
     }
 
   private:
-    void enqueue(std::function<void()> task) {
-        {
-            std::lock_guard lock(mutex_);
-            tasks_.push_back(std::move(task));
+    template <typename Task>
+    void enqueue(Task &&task) {
+        std::unique_lock lock(mutex_);
+
+        try {
+            tasks_.emplace_back(task);
+        } catch (...) {
+            lock.unlock();
+            task();
+            return;
         }
+
+        lock.unlock();
         condition_.notify_one();
     }
 
