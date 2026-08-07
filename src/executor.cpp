@@ -142,10 +142,18 @@ void gated_delta_recurrent(
 } // namespace
 
 std::array<ExpertRoute, 8> top_experts(std::span<const float> logits) {
+    std::vector<std::uint32_t> order;
+    return top_experts(logits, order);
+}
+
+std::array<ExpertRoute, 8> top_experts(
+    std::span<const float> logits,
+    std::vector<std::uint32_t> &order) {
     if (logits.size() < 8) {
         throw std::invalid_argument("MoE routing requires at least eight experts");
     }
-    std::vector<std::uint32_t> indexes(logits.size());
+    auto &indexes = order;
+    indexes.resize(logits.size());
     std::iota(indexes.begin(), indexes.end(), 0);
     std::partial_sort(
         indexes.begin(),
@@ -1075,8 +1083,6 @@ void linear_attention_prefill_chunk(
         descriptor.output, scratch.normalized, tokens, outputs, scratch.codec);
 }
 
-namespace {
-
 void moe_forward_batch(
     const MachModel &model,
     std::uint32_t layer,
@@ -1084,11 +1090,7 @@ void moe_forward_batch(
     std::span<float> outputs,
     DecoderBatchScratch &batch_scratch,
     const Backend &backend) {
-    struct RouteReference {
-        std::uint32_t batch;
-        std::uint32_t route;
-    };
-
+    constexpr std::uint32_t routes_per_token = 8;
     const auto &config = model.config();
     const auto batch = inputs.size() / config.hidden;
     const auto &descriptor = model.layer(layer).moe;
@@ -1098,97 +1100,141 @@ void moe_forward_batch(
         throw std::invalid_argument("MoE batch shape mismatch");
     }
     detail::KernelTimer timer(KernelKind::moe, batch * config.hidden);
-    batch_scratch.projection_0.resize(batch * config.experts);
+    auto &scratch = batch_scratch.moe;
+    const auto positions = batch * routes_per_token;
+
+    scratch.router_logits.resize(batch * config.experts);
     backend.dense_bf16_matmul(
         descriptor.router,
         inputs,
         static_cast<std::uint32_t>(batch),
-        batch_scratch.projection_0);
+        scratch.router_logits);
 
-    std::vector<std::array<ExpertRoute, 8>> routes(batch);
-    std::vector<std::vector<RouteReference>> grouped(config.experts);
+    scratch.routes.resize(batch);
+    scratch.counts.assign(config.experts, 0);
+    scratch.offsets.resize(static_cast<std::size_t>(config.experts) + 1);
+    scratch.cursors.resize(config.experts);
+    scratch.active.clear();
+    scratch.active.reserve(config.experts);
+    scratch.grouped_batch.resize(positions);
+    scratch.route_to_grouped.resize(positions);
     for (std::uint32_t batch_index = 0;
          batch_index < batch;
          ++batch_index) {
-        routes[batch_index] = top_experts(
-            std::span<const float>(batch_scratch.projection_0)
+        scratch.routes[batch_index] = top_experts(
+            std::span<const float>(scratch.router_logits)
                 .subspan(
-                    static_cast<std::size_t>(batch_index) *
-                        config.experts,
-                    config.experts));
-        for (std::uint32_t route = 0; route < 8; ++route) {
-            grouped[routes[batch_index][route].expert].push_back(
-                {batch_index, route});
+                    static_cast<std::size_t>(batch_index) * config.experts,
+                    config.experts),
+            scratch.route_order);
+        for (std::uint32_t route = 0; route < routes_per_token; ++route) {
+            ++scratch.counts[scratch.routes[batch_index][route].expert];
         }
     }
-    batch_scratch.moe_route_outputs.assign(
-        batch * 8 * config.hidden,
-        0.0F);
-    std::vector<std::uint32_t> active_experts;
+
+    // Counting sort: every active expert ends up owning one contiguous range
+    // of the stage buffers, so each expert runs as a single matmul.
+    std::uint32_t total = 0;
     for (std::uint32_t expert = 0; expert < config.experts; ++expert) {
-        if (!grouped[expert].empty()) {
-            active_experts.push_back(expert);
+        scratch.offsets[expert] = total;
+        scratch.cursors[expert] = total;
+        total += scratch.counts[expert];
+        if (scratch.counts[expert] != 0) {
+            scratch.active.push_back(expert);
         }
     }
+    scratch.offsets[config.experts] = total;
+    for (std::uint32_t batch_index = 0;
+         batch_index < batch;
+         ++batch_index) {
+        for (std::uint32_t route = 0; route < routes_per_token; ++route) {
+            const auto expert = scratch.routes[batch_index][route].expert;
+            const auto position = scratch.cursors[expert]++;
+            scratch.grouped_batch[position] = batch_index;
+            scratch.route_to_grouped[
+                static_cast<std::size_t>(batch_index) * routes_per_token +
+                route] = position;
+        }
+    }
+
+    scratch.gathered.resize(
+        static_cast<std::size_t>(positions) * config.hidden);
+    scratch.gate.resize(
+        static_cast<std::size_t>(positions) * config.expert_hidden);
+    scratch.up.resize(scratch.gate.size());
+    scratch.activated.resize(scratch.gate.size());
+    scratch.projected.resize(scratch.gathered.size());
+    detail::parallel_ranges(
+        static_cast<std::uint32_t>(positions),
+        64,
+        [&](std::uint32_t begin, std::uint32_t end) {
+            for (std::uint32_t position = begin; position < end; ++position) {
+                std::copy_n(
+                    inputs.begin() +
+                        static_cast<std::size_t>(
+                            scratch.grouped_batch[position]) *
+                            config.hidden,
+                    config.hidden,
+                    scratch.gathered.begin() +
+                        static_cast<std::size_t>(position) * config.hidden);
+            }
+        });
+
     detail::parallel_tasks(
-        static_cast<std::uint32_t>(active_experts.size()),
+        static_cast<std::uint32_t>(scratch.active.size()),
         [&](std::uint32_t active_index) {
-        const auto expert = active_experts[active_index];
-        const auto &references = grouped[expert];
-        const auto expert_batch =
-            static_cast<std::uint32_t>(references.size());
-        std::vector<float> gathered(
-            static_cast<std::size_t>(expert_batch) * config.hidden);
-        for (std::uint32_t index = 0; index < expert_batch; ++index) {
-            std::copy_n(
-                inputs.begin() +
-                    static_cast<std::size_t>(references[index].batch) *
-                        config.hidden,
-                config.hidden,
-                gathered.begin() +
-                    static_cast<std::size_t>(index) * config.hidden);
-        }
-        std::vector<float> gate(
-            static_cast<std::size_t>(expert_batch) *
-            config.expert_hidden);
-        std::vector<float> up(gate.size());
-        std::vector<float> activated(gate.size());
-        std::vector<float> projected(
-            static_cast<std::size_t>(expert_batch) * config.hidden);
-        ExpertScratch codec;
-        backend.expert_matmul(
-            descriptor.experts[expert][0],
-            gathered,
-            expert_batch,
-            gate,
-            codec);
-        backend.expert_matmul(
-            descriptor.experts[expert][1],
-            gathered,
-            expert_batch,
-            up,
-            codec);
-        for (std::size_t index = 0; index < activated.size(); ++index) {
-            activated[index] = silu(gate[index]) * up[index];
-        }
-        backend.expert_matmul(
-            descriptor.experts[expert][2],
-            activated,
-            expert_batch,
-            projected,
-            codec);
-        for (std::uint32_t index = 0; index < expert_batch; ++index) {
-            const auto &reference = references[index];
-            std::copy_n(
-                projected.begin() +
-                    static_cast<std::size_t>(index) * config.hidden,
-                config.hidden,
-                batch_scratch.moe_route_outputs.begin() +
-                    (static_cast<std::size_t>(reference.batch) * 8 +
-                     reference.route) *
-                        config.hidden);
-        }
-    });
+            const auto expert = scratch.active[active_index];
+            const auto begin = scratch.offsets[expert];
+            const auto expert_batch = scratch.counts[expert];
+            const auto hidden_offset =
+                static_cast<std::size_t>(begin) * config.hidden;
+            const auto expert_offset =
+                static_cast<std::size_t>(begin) * config.expert_hidden;
+            const auto hidden_span =
+                static_cast<std::size_t>(expert_batch) * config.hidden;
+            const auto expert_span =
+                static_cast<std::size_t>(expert_batch) * config.expert_hidden;
+            // The worker pool is persistent and nested dispatches run in
+            // place, so one codec scratch per worker thread is enough and it
+            // survives across layers instead of being rebuilt per expert.
+            thread_local ExpertScratch codec;
+
+            const auto gathered = std::span<const float>(scratch.gathered)
+                                      .subspan(hidden_offset, hidden_span);
+            auto gate = std::span<float>(scratch.gate)
+                            .subspan(expert_offset, expert_span);
+            auto up =
+                std::span<float>(scratch.up).subspan(expert_offset, expert_span);
+            auto activated = std::span<float>(scratch.activated)
+                                 .subspan(expert_offset, expert_span);
+            auto projected = std::span<float>(scratch.projected)
+                                 .subspan(hidden_offset, hidden_span);
+            backend.expert_matmul(
+                descriptor.experts[expert][0],
+                gathered,
+                expert_batch,
+                gate,
+                codec);
+            backend.expert_matmul(
+                descriptor.experts[expert][1],
+                gathered,
+                expert_batch,
+                up,
+                codec);
+            for (std::size_t index = 0; index < activated.size(); ++index) {
+                activated[index] = silu(gate[index]) * up[index];
+            }
+            backend.expert_matmul(
+                descriptor.experts[expert][2],
+                activated,
+                expert_batch,
+                projected,
+                codec);
+        });
+
+    // Reduce in route order, not grouped order. Adding the eight expert
+    // contributions in the order top_experts returned them is what keeps the
+    // result bit-identical to the unbatched path.
     std::fill(outputs.begin(), outputs.end(), 0.0F);
     for (std::uint32_t batch_index = 0;
          batch_index < batch;
@@ -1196,21 +1242,20 @@ void moe_forward_batch(
         auto destination = outputs.subspan(
             static_cast<std::size_t>(batch_index) * config.hidden,
             config.hidden);
-        for (std::uint32_t route = 0; route < 8; ++route) {
-            const auto source = std::span<const float>(
-                batch_scratch.moe_route_outputs)
+        for (std::uint32_t route = 0; route < routes_per_token; ++route) {
+            const auto position = scratch.route_to_grouped[
+                static_cast<std::size_t>(batch_index) * routes_per_token +
+                route];
+            const auto source = std::span<const float>(scratch.projected)
                                     .subspan(
-                                        (static_cast<std::size_t>(
-                                             batch_index) *
-                                             8 +
-                                         route) *
+                                        static_cast<std::size_t>(position) *
                                             config.hidden,
                                         config.hidden);
+            const float weight = scratch.routes[batch_index][route].weight;
             for (std::uint32_t index = 0;
                  index < config.hidden;
                  ++index) {
-                destination[index] +=
-                    routes[batch_index][route].weight * source[index];
+                destination[index] += weight * source[index];
             }
         }
     }
@@ -1268,6 +1313,8 @@ void moe_forward_batch(
         }
     }
 }
+
+namespace {
 
 void initialize_hidden(
     const MachModel &model,

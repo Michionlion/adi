@@ -99,8 +99,35 @@ struct DecoderScratch {
     MoeScratch moe;
 };
 
+// Persistent working set for the batched MoE. Every buffer is resized and
+// reused, never reconstructed, so a steady-size workload stops allocating
+// after the first call.
+//
+// Routes are grouped by a counting sort: each active expert owns one
+// contiguous range [offsets[expert], offsets[expert] + counts[expert]) of the
+// stage buffers. route_to_grouped maps a (batch, route) pair back to its
+// position in that grouping, which is what lets the output reduction run in
+// route order rather than grouped order.
+struct MoeBatchScratch {
+    std::vector<float> router_logits;
+    std::vector<std::uint32_t> route_order;
+    std::vector<std::array<ExpertRoute, 8>> routes;
+    std::vector<std::uint32_t> counts;
+    std::vector<std::uint32_t> offsets;
+    std::vector<std::uint32_t> cursors;
+    std::vector<std::uint32_t> active;
+    std::vector<std::uint32_t> grouped_batch;
+    std::vector<std::uint32_t> route_to_grouped;
+    std::vector<float> gathered;
+    std::vector<float> gate;
+    std::vector<float> up;
+    std::vector<float> activated;
+    std::vector<float> projected;
+};
+
 struct DecoderBatchScratch {
     ExpertScratch codec;
+    MoeBatchScratch moe;
     std::vector<float> head_inputs;
     std::vector<float> head_outputs;
     std::vector<float> projection_0;
@@ -109,7 +136,6 @@ struct DecoderBatchScratch {
     std::vector<float> projection_3;
     std::vector<float> projection_4;
     std::vector<float> projection_5;
-    std::vector<float> moe_route_outputs;
 };
 
 struct PrefillScratch {
@@ -124,6 +150,12 @@ struct PrefillScratch {
 [[nodiscard]] std::array<ExpertRoute, 8> top_experts(
     std::span<const float> logits);
 
+// Same routing, with the index scratch supplied by the caller so a hot loop
+// does not allocate one per token.
+[[nodiscard]] std::array<ExpertRoute, 8> top_experts(
+    std::span<const float> logits,
+    std::vector<std::uint32_t> &order);
+
 [[nodiscard]] std::uint32_t gated_delta_key_head(
     std::uint32_t value_head,
     std::uint32_t value_heads,
@@ -135,6 +167,17 @@ struct PrefillScratch {
     std::span<const float> input,
     std::span<float> output,
     MoeScratch &scratch,
+    const Backend &backend = cpu_backend());
+
+// Evaluates the MoE block for a batch of independent vectors. Inputs and
+// outputs are [batch, hidden]. Each row's routes, route weights, and output
+// match moe_forward exactly. Routes are left in batch_scratch.moe.routes.
+void moe_forward_batch(
+    const MachModel &model,
+    std::uint32_t layer,
+    std::span<const float> inputs,
+    std::span<float> outputs,
+    DecoderBatchScratch &batch_scratch,
     const Backend &backend = cpu_backend());
 
 void full_attention_forward(

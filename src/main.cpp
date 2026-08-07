@@ -104,8 +104,20 @@ std::size_t decoder_scratch_bytes(const adi::DecoderScratch &scratch) {
     return bytes;
 }
 
+std::size_t moe_batch_scratch_bytes(const adi::MoeBatchScratch &scratch) {
+    return vector_bytes(scratch.router_logits) + vector_bytes(scratch.routes) +
+           vector_bytes(scratch.counts) + vector_bytes(scratch.offsets) +
+           vector_bytes(scratch.cursors) + vector_bytes(scratch.active) +
+           vector_bytes(scratch.grouped_batch) +
+           vector_bytes(scratch.route_to_grouped) +
+           vector_bytes(scratch.gathered) + vector_bytes(scratch.gate) +
+           vector_bytes(scratch.up) + vector_bytes(scratch.activated) +
+           vector_bytes(scratch.projected);
+}
+
 std::size_t batch_scratch_bytes(const adi::DecoderBatchScratch &scratch) {
     return expert_scratch_bytes(scratch.codec) +
+           moe_batch_scratch_bytes(scratch.moe) +
            vector_bytes(scratch.head_inputs) +
            vector_bytes(scratch.head_outputs) +
            vector_bytes(scratch.projection_0) +
@@ -113,8 +125,7 @@ std::size_t batch_scratch_bytes(const adi::DecoderBatchScratch &scratch) {
            vector_bytes(scratch.projection_2) +
            vector_bytes(scratch.projection_3) +
            vector_bytes(scratch.projection_4) +
-           vector_bytes(scratch.projection_5) +
-           vector_bytes(scratch.moe_route_outputs);
+           vector_bytes(scratch.projection_5);
 }
 
 std::size_t linear_prefill_scratch_bytes(

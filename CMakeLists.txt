@@ -203,10 +203,15 @@ if(ADI_BUILD_TESTS)
     target_link_libraries(adi_prefill_ubatch_test PRIVATE adi_runtime)
     add_executable(adi_linear_prefill_test tests/linear_prefill_test.cpp)
     target_link_libraries(adi_linear_prefill_test PRIVATE adi_runtime)
+    add_executable(adi_moe_batch_test tests/moe_batch_test.cpp)
+    target_link_libraries(adi_moe_batch_test PRIVATE adi_runtime)
     if(ADI_TEST_MODEL)
         add_test(
             NAME linear_prefill
             COMMAND adi_linear_prefill_test ${ADI_TEST_MODEL})
+        add_test(
+            NAME moe_batch
+            COMMAND adi_moe_batch_test ${ADI_TEST_MODEL})
         add_test(NAME tokenizer COMMAND adi_tokenizer_test ${ADI_TEST_MODEL})
         add_test(NAME model_e2e COMMAND adi_model_e2e_test ${ADI_TEST_MODEL})
         add_test(NAME model_batch COMMAND adi_model_batch_test ${ADI_TEST_MODEL})
@@ -241,7 +246,8 @@ if(ADI_BUILD_TESTS)
             adi_model_e2e_test
             adi_model_batch_test
             adi_prefill_ubatch_test
-            adi_linear_prefill_test)
+            adi_linear_prefill_test
+            adi_moe_batch_test)
         if(MSVC)
             target_compile_options(${test_target} PRIVATE /UNDEBUG)
         else()
