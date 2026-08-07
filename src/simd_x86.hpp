@@ -37,5 +37,9 @@ struct X86Kernels {
 [[nodiscard]] CpuFeatures x86_detect_features() noexcept;
 [[nodiscard]] const X86Kernels &x86_avx2_kernels() noexcept;
 [[nodiscard]] const X86Kernels &x86_avx512_kernels() noexcept;
+[[nodiscard]] float x86_int5_dot_vbmi(
+    std::span<const std::uint8_t> packed,
+    std::span<const std::uint16_t> scales,
+    std::span<const float> input);
 
 } // namespace adi::detail

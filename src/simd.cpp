@@ -199,10 +199,13 @@ const SimdOps &avx2_ops() noexcept {
 const SimdOps &avx512_ops() noexcept {
     static const SimdOps operations = [] {
         const auto &kernels = x86_avx512_kernels();
+        const auto int5_dot = detected_cpu_features().avx512vbmi
+                                  ? x86_int5_dot_vbmi
+                                  : kernels.int5_dot;
         return SimdOps{
             CpuIsa::avx512,
             kernels.hadamard,
-            kernels.int5_dot,
+            int5_dot,
             kernels.bf16_dot,
             kernels.f32_dot,
             kernels.gated_delta,
