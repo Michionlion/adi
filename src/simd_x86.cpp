@@ -1,495 +1,109 @@
-#include "simd.hpp"
+#include "simd_x86.hpp"
 
-#include "adi/kernels.hpp"
-
-#include <algorithm>
-#include <cmath>
 #include <cstdint>
-#include <span>
 
-#if defined(__x86_64__) || defined(_M_X64)
-#include <immintrin.h>
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <intrin.h>
+#elif (defined(__GNUC__) || defined(__clang__)) && \
+    (defined(__x86_64__) || defined(__i386__))
+#include <cpuid.h>
 #endif
 
 namespace adi::detail {
-
-#if (defined(__x86_64__) || defined(_M_X64)) && \
-    (defined(__GNUC__) || defined(__clang__))
 namespace {
 
-__attribute__((target("avx2"))) float reduce_avx2(__m256 value) {
-    alignas(32) float lanes[8];
-    _mm256_store_ps(lanes, value);
-    float sum = 0.0F;
-    for (const float lane : lanes) {
-        sum += lane;
-    }
-    return sum;
+struct Registers {
+    std::uint32_t eax = 0;
+    std::uint32_t ebx = 0;
+    std::uint32_t ecx = 0;
+    std::uint32_t edx = 0;
+};
+
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+Registers cpuid(std::uint32_t leaf, std::uint32_t subleaf) noexcept {
+    int values[4]{};
+    __cpuidex(
+        values,
+        static_cast<int>(leaf),
+        static_cast<int>(subleaf));
+    return {
+        static_cast<std::uint32_t>(values[0]),
+        static_cast<std::uint32_t>(values[1]),
+        static_cast<std::uint32_t>(values[2]),
+        static_cast<std::uint32_t>(values[3]),
+    };
 }
 
-__attribute__((target("avx512f,avx512bw"))) float reduce_avx512(__m512 value) {
-    alignas(64) float lanes[16];
-    _mm512_store_ps(lanes, value);
-    float sum = 0.0F;
-    for (const float lane : lanes) {
-        sum += lane;
-    }
-    return sum;
+std::uint64_t xgetbv(std::uint32_t index) noexcept {
+    return _xgetbv(index);
 }
-
-__attribute__((target("avx2"))) void hadamard_avx2(std::span<float> values) {
-    for (std::size_t stride = 1; stride < values.size(); stride *= 2) {
-        for (std::size_t block = 0; block < values.size(); block += 2 * stride) {
-            std::size_t index = 0;
-            if (stride >= 8) {
-                for (; index + 8 <= stride; index += 8) {
-                    const auto left =
-                        _mm256_loadu_ps(values.data() + block + index);
-                    const auto right = _mm256_loadu_ps(
-                        values.data() + block + stride + index);
-                    _mm256_storeu_ps(
-                        values.data() + block + index,
-                        _mm256_add_ps(left, right));
-                    _mm256_storeu_ps(
-                        values.data() + block + stride + index,
-                        _mm256_sub_ps(left, right));
-                }
-            }
-            for (; index < stride; ++index) {
-                const float left = values[block + index];
-                const float right = values[block + stride + index];
-                values[block + index] = left + right;
-                values[block + stride + index] = left - right;
-            }
-        }
-    }
-    const float scalar_scale =
-        1.0F / std::sqrt(static_cast<float>(values.size()));
-    const auto scale = _mm256_set1_ps(scalar_scale);
-    std::size_t index = 0;
-    for (; index + 8 <= values.size(); index += 8) {
-        _mm256_storeu_ps(
-            values.data() + index,
-            _mm256_mul_ps(_mm256_loadu_ps(values.data() + index), scale));
-    }
-    for (; index < values.size(); ++index) {
-        values[index] *= scalar_scale;
-    }
-}
-
-__attribute__((target("avx512f,avx512bw"))) void hadamard_avx512(
-    std::span<float> values) {
-    for (std::size_t stride = 1; stride < values.size(); stride *= 2) {
-        for (std::size_t block = 0; block < values.size(); block += 2 * stride) {
-            std::size_t index = 0;
-            if (stride >= 16) {
-                for (; index + 16 <= stride; index += 16) {
-                    const auto left =
-                        _mm512_loadu_ps(values.data() + block + index);
-                    const auto right = _mm512_loadu_ps(
-                        values.data() + block + stride + index);
-                    _mm512_storeu_ps(
-                        values.data() + block + index,
-                        _mm512_add_ps(left, right));
-                    _mm512_storeu_ps(
-                        values.data() + block + stride + index,
-                        _mm512_sub_ps(left, right));
-                }
-            }
-            for (; index < stride; ++index) {
-                const float left = values[block + index];
-                const float right = values[block + stride + index];
-                values[block + index] = left + right;
-                values[block + stride + index] = left - right;
-            }
-        }
-    }
-    const float scalar_scale =
-        1.0F / std::sqrt(static_cast<float>(values.size()));
-    const auto scale = _mm512_set1_ps(scalar_scale);
-    std::size_t index = 0;
-    for (; index + 16 <= values.size(); index += 16) {
-        _mm512_storeu_ps(
-            values.data() + index,
-            _mm512_mul_ps(_mm512_loadu_ps(values.data() + index), scale));
-    }
-    for (; index < values.size(); ++index) {
-        values[index] *= scalar_scale;
-    }
-}
-
-void unpack_int5_group(
-    const std::uint8_t *packed,
-    float scale,
-    float *weights) {
-    for (std::uint32_t block = 0; block < 8; ++block) {
-        std::uint64_t word = 0;
-        for (std::uint32_t byte = 0; byte < 5; ++byte) {
-            word |= static_cast<std::uint64_t>(packed[block * 5 + byte])
-                    << (byte * 8);
-        }
-        for (std::uint32_t index = 0; index < 8; ++index) {
-            const auto code = static_cast<std::int32_t>(
-                (word >> (index * 5)) & 0x1FU) - 16;
-            weights[block * 8 + index] = static_cast<float>(code) * scale;
-        }
-    }
-}
-
-__attribute__((target("avx2"))) float int5_dot_avx2(
-    std::span<const std::uint8_t> packed,
-    std::span<const std::uint16_t> scales,
-    std::span<const float> input) {
-    __m256 sum = _mm256_setzero_ps();
-    alignas(32) float weights[64];
-    for (std::size_t group = 0; group < scales.size(); ++group) {
-        unpack_int5_group(
-            packed.data() + group * 40,
-            f16_to_f32(scales[group]),
-            weights);
-        for (std::size_t index = 0; index < 64; index += 8) {
-            sum = _mm256_add_ps(
-                sum,
-                _mm256_mul_ps(
-                    _mm256_load_ps(weights + index),
-                    _mm256_loadu_ps(input.data() + group * 64 + index)));
-        }
-    }
-    return reduce_avx2(sum);
-}
-
-__attribute__((target("avx512f,avx512bw"))) float int5_dot_avx512(
-    std::span<const std::uint8_t> packed,
-    std::span<const std::uint16_t> scales,
-    std::span<const float> input) {
-    __m512 sum = _mm512_setzero_ps();
-    alignas(64) float weights[64];
-    for (std::size_t group = 0; group < scales.size(); ++group) {
-        unpack_int5_group(
-            packed.data() + group * 40,
-            f16_to_f32(scales[group]),
-            weights);
-        for (std::size_t index = 0; index < 64; index += 16) {
-            sum = _mm512_add_ps(
-                sum,
-                _mm512_mul_ps(
-                    _mm512_load_ps(weights + index),
-                    _mm512_loadu_ps(input.data() + group * 64 + index)));
-        }
-    }
-    return reduce_avx512(sum);
-}
-
-__attribute__((target("avx2"))) float bf16_dot_avx2(
-    std::span<const std::uint16_t> weights,
-    std::span<const float> input) {
-    __m256 sum = _mm256_setzero_ps();
-    std::size_t index = 0;
-    for (; index + 8 <= weights.size(); index += 8) {
-        const auto packed =
-            _mm_loadu_si128(reinterpret_cast<const __m128i *>(weights.data() + index));
-        auto expanded = _mm256_cvtepu16_epi32(packed);
-        expanded = _mm256_slli_epi32(expanded, 16);
-        sum = _mm256_add_ps(
-            sum,
-            _mm256_mul_ps(
-                _mm256_castsi256_ps(expanded),
-                _mm256_loadu_ps(input.data() + index)));
-    }
-    float result = reduce_avx2(sum);
-    for (; index < weights.size(); ++index) {
-        result += bf16_to_f32(weights[index]) * input[index];
-    }
+#elif (defined(__GNUC__) || defined(__clang__)) && \
+    (defined(__x86_64__) || defined(__i386__))
+Registers cpuid(std::uint32_t leaf, std::uint32_t subleaf) noexcept {
+    Registers result;
+    __cpuid_count(
+        leaf,
+        subleaf,
+        result.eax,
+        result.ebx,
+        result.ecx,
+        result.edx);
     return result;
 }
 
-__attribute__((target("avx512f,avx512bw"))) float bf16_dot_avx512(
-    std::span<const std::uint16_t> weights,
-    std::span<const float> input) {
-    __m512 sum = _mm512_setzero_ps();
-    std::size_t index = 0;
-    for (; index + 16 <= weights.size(); index += 16) {
-        const auto packed =
-            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(weights.data() + index));
-        auto expanded = _mm512_cvtepu16_epi32(packed);
-        expanded = _mm512_slli_epi32(expanded, 16);
-        sum = _mm512_add_ps(
-            sum,
-            _mm512_mul_ps(
-                _mm512_castsi512_ps(expanded),
-                _mm512_loadu_ps(input.data() + index)));
-    }
-    float result = reduce_avx512(sum);
-    for (; index < weights.size(); ++index) {
-        result += bf16_to_f32(weights[index]) * input[index];
-    }
-    return result;
+std::uint64_t xgetbv(std::uint32_t index) noexcept {
+    std::uint32_t eax = 0;
+    std::uint32_t edx = 0;
+    __asm__ volatile(
+        ".byte 0x0f, 0x01, 0xd0"
+        : "=a"(eax), "=d"(edx)
+        : "c"(index));
+    return static_cast<std::uint64_t>(eax) |
+           (static_cast<std::uint64_t>(edx) << 32);
 }
+#endif
 
-__attribute__((target("avx2"))) float f32_dot_avx2(
-    std::span<const float> left,
-    std::span<const float> right) {
-    __m256 sum = _mm256_setzero_ps();
-    std::size_t index = 0;
-    for (; index + 8 <= left.size(); index += 8) {
-        sum = _mm256_add_ps(
-            sum,
-            _mm256_mul_ps(
-                _mm256_loadu_ps(left.data() + index),
-                _mm256_loadu_ps(right.data() + index)));
-    }
-    float result = reduce_avx2(sum);
-    for (; index < left.size(); ++index) {
-        result += left[index] * right[index];
-    }
-    return result;
-}
-
-__attribute__((target("avx512f"))) float f32_dot_avx512(
-    std::span<const float> left,
-    std::span<const float> right) {
-    __m512 sum = _mm512_setzero_ps();
-    std::size_t index = 0;
-    for (; index + 16 <= left.size(); index += 16) {
-        sum = _mm512_add_ps(
-            sum,
-            _mm512_mul_ps(
-                _mm512_loadu_ps(left.data() + index),
-                _mm512_loadu_ps(right.data() + index)));
-    }
-    float result = reduce_avx512(sum);
-    for (; index < left.size(); ++index) {
-        result += left[index] * right[index];
-    }
-    return result;
-}
-
-
-__attribute__((target("avx2"))) float gated_delta_update_avx2(
-    std::span<float> state,
-    std::span<const float> query,
-    std::span<const float> key,
-    float value,
-    float beta,
-    float decay) {
-    const auto decay_vector = _mm256_set1_ps(decay);
-    __m256 prediction_sum = _mm256_setzero_ps();
-    std::size_t index = 0;
-    for (; index + 8 <= state.size(); index += 8) {
-        auto state_vector = _mm256_mul_ps(
-            _mm256_loadu_ps(state.data() + index),
-            decay_vector);
-        _mm256_storeu_ps(state.data() + index, state_vector);
-        prediction_sum = _mm256_add_ps(
-            prediction_sum,
-            _mm256_mul_ps(
-                state_vector,
-                _mm256_loadu_ps(key.data() + index)));
-    }
-    float prediction = reduce_avx2(prediction_sum);
-    for (; index < state.size(); ++index) {
-        state[index] *= decay;
-        prediction += state[index] * key[index];
-    }
-
-    const float delta = (value - prediction) * beta;
-    const auto delta_vector = _mm256_set1_ps(delta);
-    __m256 attended_sum = _mm256_setzero_ps();
-    index = 0;
-    for (; index + 8 <= state.size(); index += 8) {
-        auto state_vector = _mm256_add_ps(
-            _mm256_loadu_ps(state.data() + index),
-            _mm256_mul_ps(
-                _mm256_loadu_ps(key.data() + index),
-                delta_vector));
-        _mm256_storeu_ps(state.data() + index, state_vector);
-        attended_sum = _mm256_add_ps(
-            attended_sum,
-            _mm256_mul_ps(
-                state_vector,
-                _mm256_loadu_ps(query.data() + index)));
-    }
-    float attended = reduce_avx2(attended_sum);
-    for (; index < state.size(); ++index) {
-        state[index] += key[index] * delta;
-        attended += state[index] * query[index];
-    }
-    return attended;
-}
-
-__attribute__((target("avx512f"))) float gated_delta_update_avx512(
-    std::span<float> state,
-    std::span<const float> query,
-    std::span<const float> key,
-    float value,
-    float beta,
-    float decay) {
-    const auto decay_vector = _mm512_set1_ps(decay);
-    __m512 prediction_sum = _mm512_setzero_ps();
-    std::size_t index = 0;
-    for (; index + 16 <= state.size(); index += 16) {
-        auto state_vector = _mm512_mul_ps(
-            _mm512_loadu_ps(state.data() + index),
-            decay_vector);
-        _mm512_storeu_ps(state.data() + index, state_vector);
-        prediction_sum = _mm512_add_ps(
-            prediction_sum,
-            _mm512_mul_ps(
-                state_vector,
-                _mm512_loadu_ps(key.data() + index)));
-    }
-    float prediction = reduce_avx512(prediction_sum);
-    for (; index < state.size(); ++index) {
-        state[index] *= decay;
-        prediction += state[index] * key[index];
-    }
-
-    const float delta = (value - prediction) * beta;
-    const auto delta_vector = _mm512_set1_ps(delta);
-    __m512 attended_sum = _mm512_setzero_ps();
-    index = 0;
-    for (; index + 16 <= state.size(); index += 16) {
-        auto state_vector = _mm512_add_ps(
-            _mm512_loadu_ps(state.data() + index),
-            _mm512_mul_ps(
-                _mm512_loadu_ps(key.data() + index),
-                delta_vector));
-        _mm512_storeu_ps(state.data() + index, state_vector);
-        attended_sum = _mm512_add_ps(
-            attended_sum,
-            _mm512_mul_ps(
-                state_vector,
-                _mm512_loadu_ps(query.data() + index)));
-    }
-    float attended = reduce_avx512(attended_sum);
-    for (; index < state.size(); ++index) {
-        state[index] += key[index] * delta;
-        attended += state[index] * query[index];
-    }
-    return attended;
+constexpr bool bit(std::uint32_t value, std::uint32_t index) noexcept {
+    return (value & (1U << index)) != 0;
 }
 
 } // namespace
-#endif
 
-CpuIsa x86_detect_isa() noexcept {
-#if (defined(__x86_64__) || defined(_M_X64)) && \
-    (defined(__GNUC__) || defined(__clang__))
-    __builtin_cpu_init();
-    if (__builtin_cpu_supports("avx512f") &&
-        __builtin_cpu_supports("avx512bw")) {
-        return CpuIsa::avx512;
+CpuFeatures x86_detect_features() noexcept {
+    CpuFeatures features;
+#if (defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))) || \
+    ((defined(__GNUC__) || defined(__clang__)) && \
+     (defined(__x86_64__) || defined(__i386__)))
+    const auto maximum = cpuid(0, 0).eax;
+    if (maximum < 1) {
+        return features;
     }
-    if (__builtin_cpu_supports("avx2")) {
-        return CpuIsa::avx2;
+    const auto leaf1 = cpuid(1, 0);
+    const bool osxsave = bit(leaf1.ecx, 27);
+    const bool hardware_avx = bit(leaf1.ecx, 28);
+    const auto xcr0 = osxsave ? xgetbv(0) : 0;
+    const bool avx_state = hardware_avx && (xcr0 & 0x6U) == 0x6U;
+    const bool avx512_state =
+        avx_state && (xcr0 & 0xE6U) == 0xE6U;
+    features.f16c = avx_state && bit(leaf1.ecx, 29);
+    if (maximum < 7) {
+        return features;
+    }
+
+    const auto leaf7 = cpuid(7, 0);
+    features.avx2 = avx_state && bit(leaf7.ebx, 5);
+    features.avx512f = avx512_state && bit(leaf7.ebx, 16);
+    features.avx512bw = features.avx512f && bit(leaf7.ebx, 30);
+    features.avx512vbmi = features.avx512f && bit(leaf7.ecx, 1);
+    features.avx512vbmi2 = features.avx512f && bit(leaf7.ecx, 6);
+    features.avx512vnni = features.avx512f && bit(leaf7.ecx, 11);
+    if (leaf7.eax >= 1) {
+        const auto leaf71 = cpuid(7, 1);
+        features.avx_vnni = avx_state && bit(leaf71.eax, 4);
+        features.avx512bf16 = features.avx512f && bit(leaf71.eax, 5);
     }
 #endif
-    return CpuIsa::scalar;
-}
-
-void x86_hadamard(std::span<float> values, CpuIsa isa) {
-#if (defined(__x86_64__) || defined(_M_X64)) && \
-    (defined(__GNUC__) || defined(__clang__))
-    if (isa == CpuIsa::avx512) {
-        hadamard_avx512(values);
-    } else {
-        hadamard_avx2(values);
-    }
-#else
-    (void)values;
-    (void)isa;
-#endif
-}
-
-float x86_int5_scaled_dot(
-    std::span<const std::uint8_t> packed,
-    std::span<const std::uint16_t> scales,
-    std::span<const float> input,
-    CpuIsa isa) {
-#if (defined(__x86_64__) || defined(_M_X64)) && \
-    (defined(__GNUC__) || defined(__clang__))
-    return isa == CpuIsa::avx512
-               ? int5_dot_avx512(packed, scales, input)
-               : int5_dot_avx2(packed, scales, input);
-#else
-    (void)packed;
-    (void)scales;
-    (void)input;
-    (void)isa;
-    return 0.0F;
-#endif
-}
-
-float x86_bf16_dot(
-    std::span<const std::uint16_t> weights,
-    std::span<const float> input,
-    CpuIsa isa) {
-#if (defined(__x86_64__) || defined(_M_X64)) && \
-    (defined(__GNUC__) || defined(__clang__))
-    return isa == CpuIsa::avx512
-               ? bf16_dot_avx512(weights, input)
-               : bf16_dot_avx2(weights, input);
-#else
-    (void)weights;
-    (void)input;
-    (void)isa;
-    return 0.0F;
-#endif
-}
-
-float x86_f32_dot(
-    std::span<const float> left,
-    std::span<const float> right,
-    CpuIsa isa) {
-#if (defined(__x86_64__) || defined(_M_X64)) && \
-    (defined(__GNUC__) || defined(__clang__))
-    return isa == CpuIsa::avx512
-               ? f32_dot_avx512(left, right)
-               : f32_dot_avx2(left, right);
-#else
-    (void)left;
-    (void)right;
-    (void)isa;
-    return 0.0F;
-#endif
-}
-
-
-float x86_gated_delta_update(
-    std::span<float> state,
-    std::span<const float> query,
-    std::span<const float> key,
-    float value,
-    float beta,
-    float decay,
-    CpuIsa isa) {
-#if (defined(__x86_64__) || defined(_M_X64)) && \
-    (defined(__GNUC__) || defined(__clang__))
-    return isa == CpuIsa::avx512
-               ? gated_delta_update_avx512(
-                     state,
-                     query,
-                     key,
-                     value,
-                     beta,
-                     decay)
-               : gated_delta_update_avx2(
-                     state,
-                     query,
-                     key,
-                     value,
-                     beta,
-                     decay);
-#else
-    (void)state;
-    (void)query;
-    (void)key;
-    (void)value;
-    (void)beta;
-    (void)decay;
-    (void)isa;
-    return 0.0F;
-#endif
+    return features;
 }
 
 } // namespace adi::detail

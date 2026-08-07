@@ -14,6 +14,22 @@ enum class CpuIsa : std::uint32_t {
     sve,
 };
 
+struct CpuFeatures {
+    bool avx2 = false;
+    bool f16c = false;
+    bool avx_vnni = false;
+    bool avx512f = false;
+    bool avx512bw = false;
+    bool avx512vbmi = false;
+    bool avx512vbmi2 = false;
+    bool avx512vnni = false;
+    bool avx512bf16 = false;
+    bool neon = false;
+    bool sve = false;
+};
+
+[[nodiscard]] CpuFeatures detected_cpu_features() noexcept;
+
 [[nodiscard]] CpuIsa selected_cpu_isa() noexcept;
 [[nodiscard]] std::string_view cpu_isa_name(CpuIsa isa) noexcept;
 void force_cpu_isa_for_testing(CpuIsa isa) noexcept;

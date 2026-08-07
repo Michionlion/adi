@@ -1,6 +1,7 @@
 #include "simd.hpp"
 
 #include "adi/kernels.hpp"
+#include "simd_x86.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -10,31 +11,7 @@
 #include <string_view>
 
 namespace adi::detail {
-[[nodiscard]] CpuIsa x86_detect_isa() noexcept;
 [[nodiscard]] CpuIsa arm_detect_isa() noexcept;
-
-void x86_hadamard(std::span<float> values, CpuIsa isa);
-float x86_int5_scaled_dot(
-    std::span<const std::uint8_t> packed,
-    std::span<const std::uint16_t> scales,
-    std::span<const float> input,
-    CpuIsa isa);
-float x86_bf16_dot(
-    std::span<const std::uint16_t> weights,
-    std::span<const float> input,
-    CpuIsa isa);
-float x86_f32_dot(
-    std::span<const float> left,
-    std::span<const float> right,
-    CpuIsa isa);
-float x86_gated_delta_update(
-    std::span<float> state,
-    std::span<const float> query,
-    std::span<const float> key,
-    float value,
-    float beta,
-    float decay,
-    CpuIsa isa);
 
 void arm_hadamard(std::span<float> values, CpuIsa isa);
 float arm_int5_scaled_dot(
@@ -53,40 +30,17 @@ float arm_f32_dot(
 
 namespace {
 
+struct SimdOps {
+    CpuIsa isa;
+    HadamardKernel hadamard;
+    Int5DotKernel int5_dot;
+    Bf16DotKernel bf16_dot;
+    F32DotKernel f32_dot;
+    GatedDeltaKernel gated_delta;
+};
+
 constexpr int no_override = -1;
 std::atomic<int> isa_override{no_override};
-
-CpuIsa detect_isa() noexcept {
-    if (const char *requested = std::getenv("ADI_CPU_ISA"); requested != nullptr) {
-        const std::string_view value(requested);
-        if (value == "scalar") {
-            return CpuIsa::scalar;
-        }
-        if (value == "avx2") {
-            return x86_detect_isa() == CpuIsa::scalar
-                       ? CpuIsa::scalar
-                       : CpuIsa::avx2;
-        }
-        if (value == "avx512") {
-            return x86_detect_isa() == CpuIsa::avx512
-                       ? CpuIsa::avx512
-                       : CpuIsa::scalar;
-        }
-        if (value == "neon") {
-            const auto arm = arm_detect_isa();
-            return arm == CpuIsa::neon || arm == CpuIsa::sve
-                       ? CpuIsa::neon
-                       : CpuIsa::scalar;
-        }
-        if (value == "sve") {
-            return arm_detect_isa() == CpuIsa::sve
-                       ? CpuIsa::sve
-                       : CpuIsa::scalar;
-        }
-    }
-    const auto x86 = x86_detect_isa();
-    return x86 != CpuIsa::scalar ? x86 : arm_detect_isa();
-}
 
 void scalar_hadamard(std::span<float> values) {
     for (std::size_t stride = 1; stride < values.size(); stride *= 2) {
@@ -169,15 +123,231 @@ float scalar_gated_delta_update(
     return attended;
 }
 
-} // namespace
+void neon_hadamard(std::span<float> values) {
+    arm_hadamard(values, CpuIsa::neon);
+}
 
-CpuIsa selected_cpu_isa() noexcept {
+void sve_hadamard(std::span<float> values) {
+    arm_hadamard(values, CpuIsa::sve);
+}
+
+float neon_int5_dot(
+    std::span<const std::uint8_t> packed,
+    std::span<const std::uint16_t> scales,
+    std::span<const float> input) {
+    return arm_int5_scaled_dot(packed, scales, input, CpuIsa::neon);
+}
+
+float sve_int5_dot(
+    std::span<const std::uint8_t> packed,
+    std::span<const std::uint16_t> scales,
+    std::span<const float> input) {
+    return arm_int5_scaled_dot(packed, scales, input, CpuIsa::sve);
+}
+
+float neon_bf16_dot(
+    std::span<const std::uint16_t> weights,
+    std::span<const float> input) {
+    return arm_bf16_dot(weights, input, CpuIsa::neon);
+}
+
+float sve_bf16_dot(
+    std::span<const std::uint16_t> weights,
+    std::span<const float> input) {
+    return arm_bf16_dot(weights, input, CpuIsa::sve);
+}
+
+float neon_f32_dot(
+    std::span<const float> left,
+    std::span<const float> right) {
+    return arm_f32_dot(left, right, CpuIsa::neon);
+}
+
+float sve_f32_dot(
+    std::span<const float> left,
+    std::span<const float> right) {
+    return arm_f32_dot(left, right, CpuIsa::sve);
+}
+
+const SimdOps &scalar_ops() noexcept {
+    static const SimdOps operations{
+        CpuIsa::scalar,
+        scalar_hadamard,
+        scalar_int5_scaled_dot,
+        scalar_bf16_dot,
+        scalar_f32_dot,
+        scalar_gated_delta_update,
+    };
+    return operations;
+}
+
+const SimdOps &avx2_ops() noexcept {
+    static const SimdOps operations = [] {
+        const auto &kernels = x86_avx2_kernels();
+        return SimdOps{
+            CpuIsa::avx2,
+            kernels.hadamard,
+            kernels.int5_dot,
+            kernels.bf16_dot,
+            kernels.f32_dot,
+            kernels.gated_delta,
+        };
+    }();
+    return operations;
+}
+
+const SimdOps &avx512_ops() noexcept {
+    static const SimdOps operations = [] {
+        const auto &kernels = x86_avx512_kernels();
+        return SimdOps{
+            CpuIsa::avx512,
+            kernels.hadamard,
+            kernels.int5_dot,
+            kernels.bf16_dot,
+            kernels.f32_dot,
+            kernels.gated_delta,
+        };
+    }();
+    return operations;
+}
+
+const SimdOps &neon_ops() noexcept {
+    static const SimdOps operations{
+        CpuIsa::neon,
+        neon_hadamard,
+        neon_int5_dot,
+        neon_bf16_dot,
+        neon_f32_dot,
+        scalar_gated_delta_update,
+    };
+    return operations;
+}
+
+const SimdOps &sve_ops() noexcept {
+    static const SimdOps operations{
+        CpuIsa::sve,
+        sve_hadamard,
+        sve_int5_dot,
+        sve_bf16_dot,
+        sve_f32_dot,
+        scalar_gated_delta_update,
+    };
+    return operations;
+}
+
+CpuFeatures detect_features() noexcept {
+    auto features = x86_detect_features();
+    const auto arm = arm_detect_isa();
+    features.neon = arm == CpuIsa::neon || arm == CpuIsa::sve;
+    features.sve = arm == CpuIsa::sve;
+    return features;
+}
+
+const CpuFeatures &cpu_features() noexcept {
+    static const CpuFeatures features = detect_features();
+    return features;
+}
+
+bool supports(CpuIsa isa, const CpuFeatures &features) noexcept {
+    switch (isa) {
+    case CpuIsa::scalar:
+        return true;
+    case CpuIsa::avx2:
+        return features.avx2;
+    case CpuIsa::avx512:
+        return features.avx512f && features.avx512bw;
+    case CpuIsa::neon:
+        return features.neon;
+    case CpuIsa::sve:
+        return features.sve;
+    }
+    return false;
+}
+
+const SimdOps &ops_for_isa(CpuIsa isa) noexcept {
+    if (!supports(isa, cpu_features())) {
+        return scalar_ops();
+    }
+    switch (isa) {
+    case CpuIsa::scalar:
+        return scalar_ops();
+    case CpuIsa::avx2:
+        return avx2_ops();
+    case CpuIsa::avx512:
+        return avx512_ops();
+    case CpuIsa::neon:
+        return neon_ops();
+    case CpuIsa::sve:
+        return sve_ops();
+    }
+    return scalar_ops();
+}
+
+CpuIsa requested_isa() noexcept {
+    const auto &features = cpu_features();
+    if (const char *requested = std::getenv("ADI_CPU_ISA");
+        requested != nullptr) {
+        const std::string_view value(requested);
+        if (value == "scalar") {
+            return CpuIsa::scalar;
+        }
+        if (value == "avx2") {
+            return supports(CpuIsa::avx2, features)
+                       ? CpuIsa::avx2
+                       : CpuIsa::scalar;
+        }
+        if (value == "avx512") {
+            return supports(CpuIsa::avx512, features)
+                       ? CpuIsa::avx512
+                       : CpuIsa::scalar;
+        }
+        if (value == "neon") {
+            return supports(CpuIsa::neon, features)
+                       ? CpuIsa::neon
+                       : CpuIsa::scalar;
+        }
+        if (value == "sve") {
+            return supports(CpuIsa::sve, features)
+                       ? CpuIsa::sve
+                       : CpuIsa::scalar;
+        }
+    }
+    if (supports(CpuIsa::avx512, features)) {
+        return CpuIsa::avx512;
+    }
+    if (supports(CpuIsa::avx2, features)) {
+        return CpuIsa::avx2;
+    }
+    if (supports(CpuIsa::sve, features)) {
+        return CpuIsa::sve;
+    }
+    if (supports(CpuIsa::neon, features)) {
+        return CpuIsa::neon;
+    }
+    return CpuIsa::scalar;
+}
+
+const SimdOps &native_ops() noexcept {
+    static const SimdOps *operations = &ops_for_isa(requested_isa());
+    return *operations;
+}
+
+const SimdOps &selected_ops() noexcept {
     const auto forced = isa_override.load(std::memory_order_acquire);
     if (forced != no_override) {
-        return static_cast<CpuIsa>(forced);
+        return ops_for_isa(static_cast<CpuIsa>(forced));
     }
-    static const CpuIsa detected = detect_isa();
-    return detected;
+    return native_ops();
+}
+
+} // namespace
+
+CpuFeatures detected_cpu_features() noexcept {
+    return cpu_features();
+}
+
+CpuIsa selected_cpu_isa() noexcept {
+    return selected_ops().isa;
 }
 
 std::string_view cpu_isa_name(CpuIsa isa) noexcept {
@@ -205,14 +375,7 @@ void clear_cpu_isa_for_testing() noexcept {
 }
 
 void hadamard_transform(std::span<float> values) {
-    const auto isa = selected_cpu_isa();
-    if (isa == CpuIsa::avx2 || isa == CpuIsa::avx512) {
-        x86_hadamard(values, isa);
-    } else if (isa == CpuIsa::neon || isa == CpuIsa::sve) {
-        arm_hadamard(values, isa);
-    } else {
-        scalar_hadamard(values);
-    }
+    selected_ops().hadamard(values);
 }
 
 float int5_scaled_dot(
@@ -226,14 +389,7 @@ float int5_scaled_dot(
         input.size() != scales.size() * group) {
         throw std::invalid_argument("int5 dot shape mismatch");
     }
-    const auto isa = selected_cpu_isa();
-    if (isa == CpuIsa::avx2 || isa == CpuIsa::avx512) {
-        return x86_int5_scaled_dot(packed, scales, input, isa);
-    }
-    if (isa == CpuIsa::neon || isa == CpuIsa::sve) {
-        return arm_int5_scaled_dot(packed, scales, input, isa);
-    }
-    return scalar_int5_scaled_dot(packed, scales, input);
+    return selected_ops().int5_dot(packed, scales, input);
 }
 
 void int5_scaled_dot_batch(
@@ -275,29 +431,15 @@ void int5_scaled_dot_batch(
             }
         }
     }
-    const auto isa = selected_cpu_isa();
+    const auto &operations = selected_ops();
     for (std::uint32_t batch_index = 0;
          batch_index < batch;
          ++batch_index) {
-        const auto input = inputs.subspan(
-            static_cast<std::size_t>(batch_index) * columns,
-            columns);
-        if (isa == CpuIsa::avx2 || isa == CpuIsa::avx512) {
-            outputs[batch_index] = x86_f32_dot(weight_scratch, input, isa);
-        } else if (isa == CpuIsa::neon || isa == CpuIsa::sve) {
-            float result = 0.0F;
-            for (std::size_t group_index = 0;
-                 group_index < scales.size();
-                 ++group_index) {
-                result += arm_f32_dot(
-                    weight_scratch.subspan(group_index * group, group),
-                    input.subspan(group_index * group, group),
-                    isa);
-            }
-            outputs[batch_index] = result;
-        } else {
-            outputs[batch_index] = scalar_f32_dot(weight_scratch, input);
-        }
+        outputs[batch_index] = operations.f32_dot(
+            weight_scratch,
+            inputs.subspan(
+                static_cast<std::size_t>(batch_index) * columns,
+                columns));
     }
 }
 
@@ -307,14 +449,7 @@ float bf16_dot(
     if (weights.size() != input.size()) {
         throw std::invalid_argument("BF16 dot shape mismatch");
     }
-    const auto isa = selected_cpu_isa();
-    if (isa == CpuIsa::avx2 || isa == CpuIsa::avx512) {
-        return x86_bf16_dot(weights, input, isa);
-    }
-    if (isa == CpuIsa::neon || isa == CpuIsa::sve) {
-        return arm_bf16_dot(weights, input, isa);
-    }
-    return scalar_bf16_dot(weights, input);
+    return selected_ops().bf16_dot(weights, input);
 }
 
 float f32_dot(
@@ -323,14 +458,7 @@ float f32_dot(
     if (left.size() != right.size()) {
         throw std::invalid_argument("float dot shape mismatch");
     }
-    const auto isa = selected_cpu_isa();
-    if (isa == CpuIsa::avx2 || isa == CpuIsa::avx512) {
-        return x86_f32_dot(left, right, isa);
-    }
-    if (isa == CpuIsa::neon || isa == CpuIsa::sve) {
-        return arm_f32_dot(left, right, isa);
-    }
-    return scalar_f32_dot(left, right);
+    return selected_ops().f32_dot(left, right);
 }
 
 float gated_delta_update(
@@ -344,18 +472,7 @@ float gated_delta_update(
         state.size() != key.size()) {
         throw std::invalid_argument("Gated DeltaNet row shape mismatch");
     }
-    const auto isa = selected_cpu_isa();
-    if (isa == CpuIsa::avx2 || isa == CpuIsa::avx512) {
-        return x86_gated_delta_update(
-            state,
-            query,
-            key,
-            value,
-            beta,
-            decay,
-            isa);
-    }
-    return scalar_gated_delta_update(
+    return selected_ops().gated_delta(
         state,
         query,
         key,
