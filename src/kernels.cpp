@@ -1,5 +1,6 @@
 #include "adi/kernels.hpp"
 #include "codec_cache.hpp"
+#include "expert_trellis.hpp"
 #include "ne_batch.hpp"
 #include "ne_trellis.hpp"
 #include "parallel.hpp"
@@ -19,32 +20,12 @@ namespace adi {
 namespace {
 
 constexpr std::uint32_t tile_size = 16;
-constexpr std::uint32_t tile_values = tile_size * tile_size;
-constexpr std::uint32_t register_bits = 16;
-constexpr std::uint32_t values_per_state = 8;
-constexpr std::uint32_t fresh_bits = 12;
-constexpr std::uint32_t states_per_tile = tile_values / values_per_state;
-constexpr std::uint32_t stream_bits = 384;
-constexpr std::uint32_t words_per_tile = stream_bits / 16;
+constexpr std::uint32_t values_per_state = detail::expert_values_per_state;
+constexpr std::uint32_t words_per_tile = detail::expert_words_per_tile;
 using detail::parallel_ranges;
 
 bool is_power_of_two(std::uint32_t value) {
     return value != 0 && (value & (value - 1)) == 0;
-}
-
-std::uint32_t extract_stream_bits(
-    const std::uint16_t *words,
-    std::uint32_t word_count,
-    std::uint32_t bit_count,
-    std::uint32_t position,
-    std::uint32_t width) {
-    position %= bit_count;
-    const auto word = position / 16;
-    const auto offset = position % 16;
-    const std::uint32_t window =
-        (static_cast<std::uint32_t>(words[word]) << 16) |
-        words[(word + 1) % word_count];
-    return (window >> (32 - offset - width)) & ((1U << width) - 1U);
 }
 
 std::span<const float> expert_state_values(
@@ -340,33 +321,26 @@ void mach_expert_matvec(
             const auto tile_index =
                 static_cast<std::size_t>(tile_row) * tile_columns + tile_column;
             const auto *words = matrix.trellis.data() + tile_index * words_per_tile;
-            std::uint32_t state = words[0];
-            for (std::uint32_t state_index = 0; state_index < states_per_tile;
-                 ++state_index) {
-                if (state_index != 0) {
-                    const auto position = register_bits + (state_index - 1) * fresh_bits;
-                    state = ((state << fresh_bits) & 0xFFFFU) |
-                            extract_stream_bits(
-                                words,
-                                words_per_tile,
-                                stream_bits,
-                                position,
-                                fresh_bits);
-                }
-                for (std::uint32_t component = 0; component < values_per_state;
-                     ++component) {
-                    const auto element = state_index * values_per_state + component;
-                    const auto local_row = element / tile_size;
-                    const auto local_column = element % tile_size;
-                    const auto column = tile_column * tile_size + local_column;
-                    partial[local_row] +=
-                        state_values[
-                            static_cast<std::size_t>(state) *
-                                values_per_state +
-                            component] *
-                        scratch.input[column];
-                }
-            }
+            detail::for_each_expert_state(
+                words,
+                [&](std::uint32_t state_index, std::uint32_t state) {
+                    // State i covers tile elements 8i..8i+7, which is half of
+                    // local row i >> 1: the low half when i is even, the high
+                    // half when it is odd.
+                    const auto local_row = state_index >> 1;
+                    const auto column = tile_column * tile_size +
+                                        ((state_index & 1U) << 3);
+                    for (std::uint32_t component = 0;
+                         component < values_per_state;
+                         ++component) {
+                        partial[local_row] +=
+                            state_values[
+                                static_cast<std::size_t>(state) *
+                                    values_per_state +
+                                component] *
+                            scratch.input[column + component];
+                    }
+                });
             const float gamma = wave_gamma[wave_indexes[tile_index]];
             for (std::uint32_t row = 0; row < tile_size; ++row) {
                 row_sums[row] += partial[row] * gamma;
@@ -444,9 +418,7 @@ void mach_expert_matmul(
         static_cast<std::size_t>(batch) * tile_size);
     std::vector<float> partial(
         static_cast<std::size_t>(batch) * tile_size);
-    for (std::uint32_t tile_row = 0;
-         tile_row < tile_rows;
-         ++tile_row) {
+    for (std::uint32_t tile_row = 0; tile_row < tile_rows; ++tile_row) {
         std::fill(row_sums.begin(), row_sums.end(), 0.0F);
         for (std::uint32_t tile_column = 0;
              tile_column < tile_columns;
@@ -457,51 +429,35 @@ void mach_expert_matmul(
                 tile_column;
             const auto *words =
                 matrix.trellis.data() + tile_index * words_per_tile;
-            std::uint32_t state = words[0];
-            for (std::uint32_t state_index = 0;
-                 state_index < states_per_tile;
-                 ++state_index) {
-                if (state_index != 0) {
-                    const auto position =
-                        register_bits + (state_index - 1) * fresh_bits;
-                    state =
-                        ((state << fresh_bits) & 0xFFFFU) |
-                        extract_stream_bits(
-                            words,
-                            words_per_tile,
-                            stream_bits,
-                            position,
-                            fresh_bits);
-                }
-                for (std::uint32_t component = 0;
-                     component < values_per_state;
-                     ++component) {
-                    const auto element =
-                        state_index * values_per_state + component;
-                    const auto local_row = element / tile_size;
-                    const auto local_column = element % tile_size;
-                    const auto column =
-                        tile_column * tile_size + local_column;
-                    const float weight =
-                        state_values[
-                            static_cast<std::size_t>(state) *
-                                values_per_state +
-                            component];
-                    for (std::uint32_t batch_index = 0;
-                         batch_index < batch;
-                         ++batch_index) {
-                        partial[
-                            static_cast<std::size_t>(batch_index) *
-                                tile_size +
-                            local_row] +=
-                            weight *
-                            scratch.input[
+            detail::for_each_expert_state(
+                words,
+                [&](std::uint32_t state_index, std::uint32_t state) {
+                    const auto local_row = state_index >> 1;
+                    const auto column = tile_column * tile_size +
+                                        ((state_index & 1U) << 3);
+                    for (std::uint32_t component = 0;
+                         component < values_per_state;
+                         ++component) {
+                        const float weight =
+                            state_values[
+                                static_cast<std::size_t>(state) *
+                                    values_per_state +
+                                component];
+                        for (std::uint32_t batch_index = 0;
+                             batch_index < batch;
+                             ++batch_index) {
+                            partial[
                                 static_cast<std::size_t>(batch_index) *
-                                    matrix.columns +
-                                column];
+                                    tile_size +
+                                local_row] +=
+                                weight *
+                                scratch.input[
+                                    static_cast<std::size_t>(batch_index) *
+                                        matrix.columns +
+                                    column + component];
+                        }
                     }
-                }
-            }
+                });
             const float gamma = wave_gamma[wave_indexes[tile_index]];
             for (std::size_t index = 0; index < row_sums.size(); ++index) {
                 row_sums[index] += partial[index] * gamma;
