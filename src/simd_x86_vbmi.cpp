@@ -2,6 +2,7 @@
 
 #include "adi/kernels.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <span>
@@ -111,6 +112,73 @@ float x86_int5_dot_vbmi(
     (void)scales;
     (void)input;
     return 0.0F;
+#endif
+}
+
+
+void x86_int5_dot_batch_vbmi(
+    std::span<const std::uint8_t> packed,
+    std::span<const std::uint16_t> scales,
+    std::span<const float> inputs,
+    std::uint32_t batch,
+    std::span<float> outputs,
+    std::span<float> scratch) {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || \
+    defined(_M_IX86)
+    constexpr std::size_t lanes = 16;
+    const auto columns = scales.size() * 64;
+    std::fill_n(scratch.begin(), static_cast<std::size_t>(batch) * lanes, 0.0F);
+    for (std::size_t group = 0; group < scales.size(); ++group) {
+        const auto codes = unpack_int5_group_vbmi(packed.data() + group * 40);
+        const auto scale = _mm512_set1_ps(f16_to_f32(scales[group]));
+        const auto weights_0 = scaled_int5_quarter<0>(codes, scale);
+        const auto weights_1 = scaled_int5_quarter<1>(codes, scale);
+        const auto weights_2 = scaled_int5_quarter<2>(codes, scale);
+        const auto weights_3 = scaled_int5_quarter<3>(codes, scale);
+        const auto input_offset = group * 64;
+        for (std::uint32_t batch_index = 0;
+             batch_index < batch;
+             ++batch_index) {
+            auto sum = _mm512_loadu_ps(
+                scratch.data() +
+                static_cast<std::size_t>(batch_index) * lanes);
+            const auto *input =
+                inputs.data() +
+                static_cast<std::size_t>(batch_index) * columns +
+                input_offset;
+            sum = _mm512_add_ps(
+                sum,
+                _mm512_mul_ps(weights_0, _mm512_loadu_ps(input)));
+            sum = _mm512_add_ps(
+                sum,
+                _mm512_mul_ps(weights_1, _mm512_loadu_ps(input + 16)));
+            sum = _mm512_add_ps(
+                sum,
+                _mm512_mul_ps(weights_2, _mm512_loadu_ps(input + 32)));
+            sum = _mm512_add_ps(
+                sum,
+                _mm512_mul_ps(weights_3, _mm512_loadu_ps(input + 48)));
+            _mm512_storeu_ps(
+                scratch.data() +
+                    static_cast<std::size_t>(batch_index) * lanes,
+                sum);
+        }
+    }
+    for (std::uint32_t batch_index = 0;
+         batch_index < batch;
+         ++batch_index) {
+        outputs[batch_index] = reduce_avx512(
+            _mm512_loadu_ps(
+                scratch.data() +
+                static_cast<std::size_t>(batch_index) * lanes));
+    }
+#else
+    (void)packed;
+    (void)scales;
+    (void)inputs;
+    (void)batch;
+    (void)outputs;
+    (void)scratch;
 #endif
 }
 

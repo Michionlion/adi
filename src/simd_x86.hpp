@@ -12,6 +12,13 @@ using Int5DotKernel = float (*)(
     std::span<const std::uint8_t> packed,
     std::span<const std::uint16_t> scales,
     std::span<const float> input);
+using Int5BatchDotKernel = void (*)(
+    std::span<const std::uint8_t> packed,
+    std::span<const std::uint16_t> scales,
+    std::span<const float> inputs,
+    std::uint32_t batch,
+    std::span<float> outputs,
+    std::span<float> scratch);
 using Bf16DotKernel = float (*)(
     std::span<const std::uint16_t> weights,
     std::span<const float> input);
@@ -41,5 +48,12 @@ struct X86Kernels {
     std::span<const std::uint8_t> packed,
     std::span<const std::uint16_t> scales,
     std::span<const float> input);
+void x86_int5_dot_batch_vbmi(
+    std::span<const std::uint8_t> packed,
+    std::span<const std::uint16_t> scales,
+    std::span<const float> inputs,
+    std::uint32_t batch,
+    std::span<float> outputs,
+    std::span<float> scratch);
 
 } // namespace adi::detail

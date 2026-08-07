@@ -34,6 +34,7 @@ struct SimdOps {
     CpuIsa isa;
     HadamardKernel hadamard;
     Int5DotKernel int5_dot;
+    Int5BatchDotKernel int5_batch_dot;
     Bf16DotKernel bf16_dot;
     F32DotKernel f32_dot;
     GatedDeltaKernel gated_delta;
@@ -174,6 +175,7 @@ const SimdOps &scalar_ops() noexcept {
         CpuIsa::scalar,
         scalar_hadamard,
         scalar_int5_scaled_dot,
+        nullptr,
         scalar_bf16_dot,
         scalar_f32_dot,
         scalar_gated_delta_update,
@@ -188,6 +190,7 @@ const SimdOps &avx2_ops() noexcept {
             CpuIsa::avx2,
             kernels.hadamard,
             kernels.int5_dot,
+            nullptr,
             kernels.bf16_dot,
             kernels.f32_dot,
             kernels.gated_delta,
@@ -199,13 +202,15 @@ const SimdOps &avx2_ops() noexcept {
 const SimdOps &avx512_ops() noexcept {
     static const SimdOps operations = [] {
         const auto &kernels = x86_avx512_kernels();
-        const auto int5_dot = detected_cpu_features().avx512vbmi
-                                  ? x86_int5_dot_vbmi
-                                  : kernels.int5_dot;
+        const bool vbmi = detected_cpu_features().avx512vbmi;
+        const auto int5_dot = vbmi ? x86_int5_dot_vbmi : kernels.int5_dot;
+        const auto int5_batch_dot =
+            vbmi ? x86_int5_dot_batch_vbmi : nullptr;
         return SimdOps{
             CpuIsa::avx512,
             kernels.hadamard,
             int5_dot,
+            int5_batch_dot,
             kernels.bf16_dot,
             kernels.f32_dot,
             kernels.gated_delta,
@@ -219,6 +224,7 @@ const SimdOps &neon_ops() noexcept {
         CpuIsa::neon,
         neon_hadamard,
         neon_int5_dot,
+        nullptr,
         neon_bf16_dot,
         neon_f32_dot,
         scalar_gated_delta_update,
@@ -231,6 +237,7 @@ const SimdOps &sve_ops() noexcept {
         CpuIsa::sve,
         sve_hadamard,
         sve_int5_dot,
+        nullptr,
         sve_bf16_dot,
         sve_f32_dot,
         scalar_gated_delta_update,
@@ -395,6 +402,15 @@ float int5_scaled_dot(
     return selected_ops().int5_dot(packed, scales, input);
 }
 
+std::size_t int5_scaled_dot_batch_scratch_size(
+    std::size_t columns,
+    std::uint32_t batch) noexcept {
+    if (selected_ops().int5_batch_dot != nullptr) {
+        return static_cast<std::size_t>(batch) * 16;
+    }
+    return columns;
+}
+
 void int5_scaled_dot_batch(
     std::span<const std::uint8_t> packed,
     std::span<const std::uint16_t> scales,
@@ -405,11 +421,32 @@ void int5_scaled_dot_batch(
     constexpr std::size_t group = 64;
     constexpr std::size_t bytes_per_group = 40;
     const auto columns = scales.size() * group;
+    const auto &operations = selected_ops();
+    const auto optimized_scratch =
+        operations.int5_batch_dot != nullptr
+            ? static_cast<std::size_t>(batch) * 16
+            : columns;
+    const bool valid_scratch =
+        weight_scratch.size() == optimized_scratch ||
+        weight_scratch.size() == columns;
     if (batch == 0 || scales.empty() ||
         packed.size() != scales.size() * bytes_per_group ||
         inputs.size() != static_cast<std::size_t>(batch) * columns ||
-        outputs.size() != batch || weight_scratch.size() != columns) {
+        outputs.size() != batch || !valid_scratch) {
         throw std::invalid_argument("int5 batch dot shape mismatch");
+    }
+    const bool use_fused =
+        operations.int5_batch_dot != nullptr &&
+        weight_scratch.size() >= optimized_scratch;
+    if (use_fused) {
+        operations.int5_batch_dot(
+            packed,
+            scales,
+            inputs,
+            batch,
+            outputs,
+            weight_scratch.first(optimized_scratch));
+        return;
     }
 
     for (std::size_t scale_index = 0;
@@ -434,7 +471,6 @@ void int5_scaled_dot_batch(
             }
         }
     }
-    const auto &operations = selected_ops();
     for (std::uint32_t batch_index = 0;
          batch_index < batch;
          ++batch_index) {

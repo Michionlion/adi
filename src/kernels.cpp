@@ -825,8 +825,10 @@ void mach_head_matmul(
     }
     const auto bytes_per_row = head.columns / 8 * 5;
     const auto groups_per_row = head.columns / group;
+    const auto scratch_size =
+        detail::int5_scaled_dot_batch_scratch_size(head.columns, batch);
     parallel_ranges(head.rows, 512, [&](std::uint32_t row_begin, std::uint32_t row_end) {
-        std::vector<float> weight_scratch(head.columns);
+        std::vector<float> weight_scratch(scratch_size);
         std::vector<float> row_outputs(batch);
         for (std::uint32_t row = row_begin; row < row_end; ++row) {
             const auto packed_row =

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string_view>
@@ -41,6 +42,10 @@ void hadamard_transform(std::span<float> values);
     std::span<const std::uint8_t> packed,
     std::span<const std::uint16_t> scales_f16,
     std::span<const float> input);
+
+[[nodiscard]] std::size_t int5_scaled_dot_batch_scratch_size(
+    std::size_t columns,
+    std::uint32_t batch) noexcept;
 
 void int5_scaled_dot_batch(
     std::span<const std::uint8_t> packed,
