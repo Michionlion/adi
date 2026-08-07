@@ -13,6 +13,7 @@ add_library(adi_runtime STATIC
     src/backend.cpp
     src/bpe.cpp
     src/chat.cpp
+    src/codec_cache.cpp
     src/executor.cpp
     src/generation.cpp
     src/gguf.cpp
@@ -63,6 +64,11 @@ if(ADI_BUILD_TESTS)
     target_link_libraries(adi_int5_batch_test PRIVATE adi_runtime)
     target_include_directories(adi_int5_batch_test PRIVATE src)
     add_test(NAME int5_batch COMMAND adi_int5_batch_test)
+
+    add_executable(adi_codec_cache_test tests/codec_cache_test.cpp)
+    target_link_libraries(adi_codec_cache_test PRIVATE adi_runtime)
+    target_include_directories(adi_codec_cache_test PRIVATE src)
+    add_test(NAME codec_cache COMMAND adi_codec_cache_test)
 
     add_executable(adi_executor_test tests/executor_test.cpp)
     target_link_libraries(adi_executor_test PRIVATE adi_runtime)
@@ -115,6 +121,7 @@ if(ADI_BUILD_TESTS)
             adi_gguf_test
             adi_kernels_test
             adi_int5_batch_test
+            adi_codec_cache_test
             adi_executor_test
             adi_generation_test
             adi_json_test

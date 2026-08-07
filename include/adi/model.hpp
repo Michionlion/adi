@@ -111,6 +111,11 @@ class MachModel {
     std::span<const std::uint16_t> final_norm_;
     std::array<float, 32> rope_inverse_frequencies_;
     std::array<float, 32> rope_theta_divisors_;
+    std::vector<float> expert_state_values_;
+    std::vector<float> ne_state_values_;
+    std::vector<std::uint16_t> expert_wave_indexes_forward_;
+    std::vector<std::uint16_t> expert_wave_indexes_reverse_;
+    std::vector<float> expert_wave_gamma_;
     std::vector<LayerDescriptor> layers_;
 };
 

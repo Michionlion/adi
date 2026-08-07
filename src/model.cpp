@@ -1,4 +1,5 @@
 #include "adi/model.hpp"
+#include "codec_cache.hpp"
 #include "chat.hpp"
 #include "utf8.hpp"
 
@@ -539,6 +540,61 @@ const LayerDescriptor &MachModel::layer(std::uint32_t index) const {
 }
 
 void MachModel::cache_descriptors() {
+    const auto expert_tlut = view<float>(
+        file_,
+        required_tensor(file_, "mach.tlut.expert.tlut", GgmlType::f32));
+    const auto ne_tlut = view<float>(
+        file_,
+        required_tensor(file_, "mach.tlut.ne.tlut", GgmlType::f32));
+    expert_state_values_ = detail::build_expert_state_values(expert_tlut);
+    ne_state_values_ = detail::build_ne_state_values(ne_tlut);
+    expert_wave_indexes_forward_ = detail::build_wave_indexes(
+        config_.expert_hidden / 16,
+        config_.hidden / 16);
+    expert_wave_indexes_reverse_ = detail::build_wave_indexes(
+        config_.hidden / 16,
+        config_.expert_hidden / 16);
+
+    const auto gamma_values =
+        static_cast<std::size_t>(config_.hidden + config_.expert_hidden) / 16;
+    const auto gamma_count =
+        static_cast<std::size_t>(config_.layers) * config_.experts * 3 *
+        gamma_values;
+    expert_wave_gamma_.resize(gamma_count);
+    std::size_t gamma_offset = 0;
+    const auto cache_non_expert = [&](MachNeMatrix matrix) {
+        matrix.state_values = std::span<const float>(ne_state_values_);
+        return matrix;
+    };
+    const auto cache_expert = [&](MachExpertMatrix matrix) {
+        matrix.state_values = std::span<const float>(expert_state_values_);
+        if (matrix.rows == config_.expert_hidden &&
+            matrix.columns == config_.hidden) {
+            matrix.wave_indexes =
+                std::span<const std::uint16_t>(expert_wave_indexes_forward_);
+        } else if (matrix.rows == config_.hidden &&
+                   matrix.columns == config_.expert_hidden) {
+            matrix.wave_indexes =
+                std::span<const std::uint16_t>(expert_wave_indexes_reverse_);
+        } else {
+            throw std::runtime_error(
+                "model: unsupported expert cache geometry");
+        }
+        if (matrix.wave_gamma_f16.size() != gamma_values ||
+            gamma_offset + gamma_values > expert_wave_gamma_.size()) {
+            throw std::runtime_error("model: malformed expert gamma cache");
+        }
+        auto converted = std::span<float>(expert_wave_gamma_).subspan(
+            gamma_offset,
+            gamma_values);
+        for (std::size_t index = 0; index < gamma_values; ++index) {
+            converted[index] = f16_to_f32(matrix.wave_gamma_f16[index]);
+        }
+        matrix.wave_gamma = converted;
+        gamma_offset += gamma_values;
+        return matrix;
+    };
+
     embedding_ = embedding();
     for (std::uint32_t chunk = 0; chunk < head_chunks_.size(); ++chunk) {
         head_chunks_[chunk] = head_chunk(chunk);
@@ -572,33 +628,33 @@ void MachModel::cache_descriptors() {
             bf16_matrix(prefix + "mlp.shared_expert_gate.weight");
         const auto shared = prefix + "mlp.shared_expert.";
         descriptor.moe.shared_gate =
-            non_expert(layer_index, shared + "gate_proj.weight");
+            cache_non_expert(non_expert(layer_index, shared + "gate_proj.weight"));
         descriptor.moe.shared_up =
-            non_expert(layer_index, shared + "up_proj.weight");
+            cache_non_expert(non_expert(layer_index, shared + "up_proj.weight"));
         descriptor.moe.shared_down =
-            non_expert(layer_index, shared + "down_proj.weight");
+            cache_non_expert(non_expert(layer_index, shared + "down_proj.weight"));
         for (std::uint32_t expert_index = 0;
              expert_index < config_.experts;
              ++expert_index) {
             descriptor.moe.experts[expert_index][0] =
-                expert(layer_index, expert_index, ExpertProjection::gate);
+                cache_expert(expert(layer_index, expert_index, ExpertProjection::gate));
             descriptor.moe.experts[expert_index][1] =
-                expert(layer_index, expert_index, ExpertProjection::up);
+                cache_expert(expert(layer_index, expert_index, ExpertProjection::up));
             descriptor.moe.experts[expert_index][2] =
-                expert(layer_index, expert_index, ExpertProjection::down);
+                cache_expert(expert(layer_index, expert_index, ExpertProjection::down));
         }
 
         descriptor.full_attention = (layer_index + 1) % 4 == 0;
         if (descriptor.full_attention) {
             const auto attention = prefix + "self_attn.";
             descriptor.full.query =
-                non_expert(layer_index, attention + "q_proj.weight");
+                cache_non_expert(non_expert(layer_index, attention + "q_proj.weight"));
             descriptor.full.key =
-                non_expert(layer_index, attention + "k_proj.weight");
+                cache_non_expert(non_expert(layer_index, attention + "k_proj.weight"));
             descriptor.full.value =
-                non_expert(layer_index, attention + "v_proj.weight");
+                cache_non_expert(non_expert(layer_index, attention + "v_proj.weight"));
             descriptor.full.output =
-                non_expert(layer_index, attention + "o_proj.weight");
+                cache_non_expert(non_expert(layer_index, attention + "o_proj.weight"));
             descriptor.full.query_norm =
                 bf16_vector(attention + "q_norm.weight");
             descriptor.full.key_norm =
@@ -606,11 +662,11 @@ void MachModel::cache_descriptors() {
         } else {
             const auto attention = prefix + "linear_attn.";
             descriptor.linear.qkv =
-                non_expert(layer_index, attention + "in_proj_qkv.weight");
+                cache_non_expert(non_expert(layer_index, attention + "in_proj_qkv.weight"));
             descriptor.linear.gate =
-                non_expert(layer_index, attention + "in_proj_z.weight");
+                cache_non_expert(non_expert(layer_index, attention + "in_proj_z.weight"));
             descriptor.linear.output =
-                non_expert(layer_index, attention + "out_proj.weight");
+                cache_non_expert(non_expert(layer_index, attention + "out_proj.weight"));
             descriptor.linear.alpha =
                 bf16_matrix(attention + "in_proj_a.weight");
             descriptor.linear.beta =
@@ -625,6 +681,9 @@ void MachModel::cache_descriptors() {
                 bf16_vector(attention + "norm.weight");
         }
         layers_.push_back(std::move(descriptor));
+    }
+    if (gamma_offset != expert_wave_gamma_.size()) {
+        throw std::runtime_error("model: incomplete expert gamma cache");
     }
     descriptors_ready_ = true;
 }

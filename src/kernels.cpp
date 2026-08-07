@@ -1,4 +1,5 @@
 #include "adi/kernels.hpp"
+#include "codec_cache.hpp"
 #include "parallel.hpp"
 #include "profiling_internal.hpp"
 #include "simd.hpp"
@@ -44,79 +45,87 @@ std::uint32_t extract_stream_bits(
     return (window >> (32 - offset - width)) & ((1U << width) - 1U);
 }
 
-struct StateMetadata {
-    std::uint16_t expert_row;
-    std::uint16_t ne_row;
-    bool negative;
-};
-
-const std::array<StateMetadata, 65536> &state_metadata() {
-    static const auto metadata = [] {
-        std::array<StateMetadata, 65536> result;
-        for (std::uint32_t state = 0; state < result.size(); ++state) {
-            const std::uint64_t product =
-                static_cast<std::uint64_t>(state) * (state + 1);
-            result[state] = {
-                static_cast<std::uint16_t>(product & 0x7FFFU),
-                static_cast<std::uint16_t>((product >> 6) & 0x1FFU),
-                ((product >> 15) & 1U) != 0,
-            };
+std::span<const float> expert_state_values(
+    const MachExpertMatrix &matrix,
+    ExpertScratch &scratch) {
+    constexpr std::size_t expected =
+        static_cast<std::size_t>(detail::codec_state_count) *
+        detail::expert_values_per_state;
+    if (!matrix.state_values.empty()) {
+        if (matrix.state_values.size() != expected) {
+            throw std::invalid_argument("Mach expert state cache shape mismatch");
         }
-        return result;
-    }();
-    return metadata;
+        return matrix.state_values;
+    }
+    if (scratch.state_values_source != matrix.tlut.data() ||
+        scratch.state_value_components != detail::expert_values_per_state) {
+        scratch.state_values = detail::build_expert_state_values(matrix.tlut);
+        scratch.state_values_source = matrix.tlut.data();
+        scratch.state_value_components = detail::expert_values_per_state;
+    }
+    return scratch.state_values;
 }
 
-void build_wave_indexes(
+std::span<const float> ne_state_values(
+    const MachNeMatrix &matrix,
+    ExpertScratch &scratch) {
+    constexpr std::size_t expected =
+        static_cast<std::size_t>(detail::codec_state_count) *
+        detail::ne_values_per_state;
+    if (!matrix.state_values.empty()) {
+        if (matrix.state_values.size() != expected) {
+            throw std::invalid_argument("Mach NE state cache shape mismatch");
+        }
+        return matrix.state_values;
+    }
+    if (scratch.state_values_source != matrix.tlut.data() ||
+        scratch.state_value_components != detail::ne_values_per_state) {
+        scratch.state_values = detail::build_ne_state_values(matrix.tlut);
+        scratch.state_values_source = matrix.tlut.data();
+        scratch.state_value_components = detail::ne_values_per_state;
+    }
+    return scratch.state_values;
+}
+
+std::span<const std::uint16_t> expert_wave_indexes(
+    const MachExpertMatrix &matrix,
     std::uint32_t tile_rows,
     std::uint32_t tile_columns,
-    std::vector<std::uint16_t> &indexes) {
-    indexes.assign(static_cast<std::size_t>(tile_rows) * tile_columns, 0);
-    std::uint16_t wave = 0;
-    for (std::uint32_t index = 0; index < tile_rows; ++index, ++wave) {
-        std::int32_t row = static_cast<std::int32_t>(tile_rows - index - 1);
-        std::int32_t column = static_cast<std::int32_t>(tile_columns - 1);
-        while (row < static_cast<std::int32_t>(tile_rows) && column >= 0) {
-            indexes[static_cast<std::size_t>(row) * tile_columns + column] = wave;
-            ++row;
-            --column;
+    ExpertScratch &scratch) {
+    const auto expected =
+        static_cast<std::size_t>(tile_rows) * tile_columns;
+    if (!matrix.wave_indexes.empty()) {
+        if (matrix.wave_indexes.size() != expected) {
+            throw std::invalid_argument("Mach expert wave-index cache shape mismatch");
         }
+        return matrix.wave_indexes;
     }
-    for (std::uint32_t index = 0; index < tile_columns; ++index, ++wave) {
-        std::int32_t row = 0;
-        std::int32_t column = static_cast<std::int32_t>(tile_columns - index - 1);
-        while (row < static_cast<std::int32_t>(tile_rows) && column >= 0) {
-            indexes[static_cast<std::size_t>(row) * tile_columns + column] = wave;
-            ++row;
-            --column;
-        }
+    if (scratch.wave_tile_rows != tile_rows ||
+        scratch.wave_tile_columns != tile_columns) {
+        scratch.wave_indexes =
+            detail::build_wave_indexes(tile_rows, tile_columns);
+        scratch.wave_tile_rows = tile_rows;
+        scratch.wave_tile_columns = tile_columns;
     }
+    return scratch.wave_indexes;
 }
 
-float lattice_value(
-    std::span<const float> tlut,
-    std::uint32_t state,
-    std::uint32_t component) {
-    const auto metadata = state_metadata()[state];
-    float value =
-        tlut[static_cast<std::size_t>(metadata.expert_row) * values_per_state +
-             component];
-    if (component == 0 && metadata.negative) {
-        value = -value;
+std::span<const float> expert_wave_gamma(
+    const MachExpertMatrix &matrix,
+    ExpertScratch &scratch) {
+    if (!matrix.wave_gamma.empty()) {
+        if (matrix.wave_gamma.size() != matrix.wave_gamma_f16.size()) {
+            throw std::invalid_argument("Mach expert gamma cache shape mismatch");
+        }
+        return matrix.wave_gamma;
     }
-    return f16_to_f32(f32_to_f16(value));
-}
-
-float ne_lattice_value(
-    std::span<const float> tlut,
-    std::uint32_t state,
-    std::uint32_t component) {
-    const auto metadata = state_metadata()[state];
-    float value = tlut[static_cast<std::size_t>(metadata.ne_row) * 2 + component];
-    if (component == 0 && metadata.negative) {
-        value = -value;
+    if (scratch.wave_gamma_source != matrix.wave_gamma_f16.data() ||
+        scratch.wave_gamma_count != matrix.wave_gamma_f16.size()) {
+        scratch.wave_gamma = detail::convert_f16_values(matrix.wave_gamma_f16);
+        scratch.wave_gamma_source = matrix.wave_gamma_f16.data();
+        scratch.wave_gamma_count = matrix.wave_gamma_f16.size();
     }
-    return f16_to_f32(f32_to_f16(value));
+    return scratch.wave_gamma;
 }
 
 } // namespace
@@ -228,7 +237,10 @@ void mach_expert_matvec(
         scratch.input[index] = input[index] * f16_to_f32(matrix.su_f16[index]);
     }
     detail::hadamard_transform(scratch.input);
-    build_wave_indexes(tile_rows, tile_columns, scratch.wave_indexes);
+    const auto state_values = expert_state_values(matrix, scratch);
+    const auto wave_indexes =
+        expert_wave_indexes(matrix, tile_rows, tile_columns, scratch);
+    const auto wave_gamma = expert_wave_gamma(matrix, scratch);
 
     for (std::uint32_t tile_row = 0; tile_row < tile_rows; ++tile_row) {
         float row_sums[tile_size] = {};
@@ -257,12 +269,14 @@ void mach_expert_matvec(
                     const auto local_column = element % tile_size;
                     const auto column = tile_column * tile_size + local_column;
                     partial[local_row] +=
-                        lattice_value(matrix.tlut, state, component) *
+                        state_values[
+                            static_cast<std::size_t>(state) *
+                                values_per_state +
+                            component] *
                         scratch.input[column];
                 }
             }
-            const float gamma = f16_to_f32(
-                matrix.wave_gamma_f16[scratch.wave_indexes[tile_index]]);
+            const float gamma = wave_gamma[wave_indexes[tile_index]];
             for (std::uint32_t row = 0; row < tile_size; ++row) {
                 row_sums[row] += partial[row] * gamma;
             }
@@ -330,7 +344,10 @@ void mach_expert_matmul(
         }
         detail::hadamard_transform(transformed);
     }
-    build_wave_indexes(tile_rows, tile_columns, scratch.wave_indexes);
+    const auto state_values = expert_state_values(matrix, scratch);
+    const auto wave_indexes =
+        expert_wave_indexes(matrix, tile_rows, tile_columns, scratch);
+    const auto wave_gamma = expert_wave_gamma(matrix, scratch);
 
     std::vector<float> row_sums(
         static_cast<std::size_t>(batch) * tile_size);
@@ -375,7 +392,10 @@ void mach_expert_matmul(
                     const auto column =
                         tile_column * tile_size + local_column;
                     const float weight =
-                        lattice_value(matrix.tlut, state, component);
+                        state_values[
+                            static_cast<std::size_t>(state) *
+                                values_per_state +
+                            component];
                     for (std::uint32_t batch_index = 0;
                          batch_index < batch;
                          ++batch_index) {
@@ -391,8 +411,7 @@ void mach_expert_matmul(
                     }
                 }
             }
-            const float gamma = f16_to_f32(
-                matrix.wave_gamma_f16[scratch.wave_indexes[tile_index]]);
+            const float gamma = wave_gamma[wave_indexes[tile_index]];
             for (std::size_t index = 0; index < row_sums.size(); ++index) {
                 row_sums[index] += partial[index] * gamma;
             }
@@ -463,6 +482,7 @@ void mach_ne_matvec(
         scratch.input[index] = input[index] * static_cast<float>(matrix.su[index]);
     }
     detail::hadamard_transform(scratch.input);
+    const auto state_values = ne_state_values(matrix, scratch);
 
     parallel_ranges(tile_rows, 4, [&](std::uint32_t row_begin, std::uint32_t row_end) {
         for (std::uint32_t tile_row = row_begin; tile_row < row_end; ++tile_row) {
@@ -495,7 +515,10 @@ void mach_ne_matvec(
                         const auto local_column = element % tile_size;
                         const auto column = tile_column * tile_size + local_column;
                         row_sums[local_row] +=
-                            ne_lattice_value(matrix.tlut, state, component) *
+                            state_values[
+                                static_cast<std::size_t>(state) *
+                                    ne_values_per_state +
+                                component] *
                             matrix.weight_scale * scratch.input[column];
                     }
                 }
@@ -574,6 +597,7 @@ void mach_ne_matmul(
         }
         detail::hadamard_transform(transformed);
     }
+    const auto state_values = ne_state_values(matrix, scratch);
 
     parallel_ranges(
         tile_rows,
@@ -623,10 +647,10 @@ void mach_ne_matmul(
                             const auto column =
                                 tile_column * tile_size + local_column;
                             const float weight =
-                                ne_lattice_value(
-                                    matrix.tlut,
-                                    state,
-                                    component) *
+                                state_values[
+                                    static_cast<std::size_t>(state) *
+                                        ne_values_per_state +
+                                    component] *
                                 matrix.weight_scale;
                             for (std::uint32_t batch_index = 0;
                                  batch_index < batch;
