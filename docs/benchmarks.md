@@ -122,6 +122,10 @@ checksum `0xc75f92166aad6875`.
 
 ### Microbatch sweep
 
+Superseded by the sweep under "Expert dispatch scheduling" below: splitting
+expert work into twelve-row chunks inverted this curve. The table records what
+this increment measured, not the current default.
+
 A 256-token prompt. Peak scratch is the summed capacity of every prefill
 scratch buffer after the run.
 
@@ -235,3 +239,23 @@ batched path. Batch 16 is nominally lower but the two ranges overlap.
 Checksums are unchanged and the wide microbatch matrix is exact in all twenty
 cases. The twelve-row cap exists only because of the expert kernel's current
 batch behaviour; re-measure it if that kernel gains a batch-lane path.
+
+### Microbatch after expert-dispatch splitting
+
+Chunking expert work inverted the microbatch curve. The same 256-token prompt,
+before and after that change:
+
+| Microbatch | 16 | 32 | 64 |
+| --- | ---: | ---: | ---: |
+| tokens/s, one matmul per expert | 5.06 | 4.25 | 3.05 |
+| tokens/s, twelve-row chunks | 6.31 | 7.70 | 8.40 |
+| peak scratch (MB) | 8.0 | 16.0 | 31.8 |
+
+`ExecutionOptions::prefill_ubatch` moves from 16 to 64, which is 33% more
+prompt throughput for 31.8 MB of prefill scratch against 8.0 MB. Callers who
+want the smaller footprint set `--ubatch 16`; the choice never changes what a
+request returns.
+
+This is interim. `mach_expert_matmul` is still a scalar batch loop, so the
+sweep above stops at 64 and the full range including 128 and beyond is measured
+after that kernel gains a batch-lane path.

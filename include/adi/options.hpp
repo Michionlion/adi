@@ -10,23 +10,32 @@ namespace adi {
 // prompt must produce the same tokens regardless of how the server was
 // launched.
 //
-// The default is measured, not assumed. On eight EPYC 9645 cores, a 256-token
-// prompt runs at 1.99, 3.35, 4.40, 5.06, 4.25, 3.05, 2.67, and 2.45 tokens
-// per second at microbatches of 2, 4, 8, 16, 32, 64, 128, and 256, and a
-// 1024-token prompt keeps the same ordering. Sixteen is both the fastest and
-// the cheapest of these, at 8 MB of scratch against 32 MB at sixty-four.
+// The default is measured, not assumed. It was sixteen for as long as the
+// expert dispatch handed each expert a single matmul over all of its routed
+// rows: mach_expert_matmul's cost per row grew with the batch, so raising the
+// microbatch made the dominant kernel slower faster than it made anything
+// else faster.
 //
-// The falloff above sixteen is a property of the expert codec, not of
-// batching: once several tokens route to the same expert, mach_expert_matmul
-// leaves the single-vector path for a scalar batch loop whose row
-// accumulators and strided inputs no longer fit L1. Give that kernel the
-// batch-lane treatment the non-expert kernel already has and this optimum
-// should move up; re-measure before changing it.
+// Splitting expert work into twelve-row chunks removed that penalty and
+// inverted the curve. On eight EPYC 9645 cores a 256-token prompt now runs at
+// 6.31, 7.70, and 8.40 tokens per second at microbatches of 16, 32, and 64,
+// where it previously ran at 5.06, 4.25, and 3.05. Sixty-four costs 31.8 MB of
+// prefill scratch against 8.0 MB at sixteen, which is the price of the 33%.
+//
+// Callers who want a different point on that trade — a smaller cache, a
+// different core count — set it with --ubatch. Every microbatch produces
+// identical logits and identical state, so this is a throughput and
+// scratch-memory choice only.
+//
+// This is an interim value. mach_expert_matmul is still a scalar batch loop;
+// once it decodes each packed weight once across a register of batch lanes the
+// curve moves again, and the full sweep including 128 and above belongs after
+// that lands.
 struct ExecutionOptions {
     static constexpr std::uint32_t minimum_prefill_ubatch = 1;
     static constexpr std::uint32_t maximum_prefill_ubatch = 4096;
 
-    std::uint32_t prefill_ubatch = 16;
+    std::uint32_t prefill_ubatch = 64;
 };
 
 // Throws std::invalid_argument when a field is outside its supported range.
