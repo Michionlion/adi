@@ -42,4 +42,12 @@ void int5_scaled_dot_batch(
     std::span<const float> left,
     std::span<const float> right);
 
+[[nodiscard]] float gated_delta_update(
+    std::span<float> state,
+    std::span<const float> query,
+    std::span<const float> key,
+    float value,
+    float beta,
+    float decay);
+
 } // namespace adi::detail

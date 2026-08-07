@@ -264,6 +264,111 @@ __attribute__((target("avx512f"))) float f32_dot_avx512(
     return result;
 }
 
+
+__attribute__((target("avx2"))) float gated_delta_update_avx2(
+    std::span<float> state,
+    std::span<const float> query,
+    std::span<const float> key,
+    float value,
+    float beta,
+    float decay) {
+    const auto decay_vector = _mm256_set1_ps(decay);
+    __m256 prediction_sum = _mm256_setzero_ps();
+    std::size_t index = 0;
+    for (; index + 8 <= state.size(); index += 8) {
+        auto state_vector = _mm256_mul_ps(
+            _mm256_loadu_ps(state.data() + index),
+            decay_vector);
+        _mm256_storeu_ps(state.data() + index, state_vector);
+        prediction_sum = _mm256_add_ps(
+            prediction_sum,
+            _mm256_mul_ps(
+                state_vector,
+                _mm256_loadu_ps(key.data() + index)));
+    }
+    float prediction = reduce_avx2(prediction_sum);
+    for (; index < state.size(); ++index) {
+        state[index] *= decay;
+        prediction += state[index] * key[index];
+    }
+
+    const float delta = (value - prediction) * beta;
+    const auto delta_vector = _mm256_set1_ps(delta);
+    __m256 attended_sum = _mm256_setzero_ps();
+    index = 0;
+    for (; index + 8 <= state.size(); index += 8) {
+        auto state_vector = _mm256_add_ps(
+            _mm256_loadu_ps(state.data() + index),
+            _mm256_mul_ps(
+                _mm256_loadu_ps(key.data() + index),
+                delta_vector));
+        _mm256_storeu_ps(state.data() + index, state_vector);
+        attended_sum = _mm256_add_ps(
+            attended_sum,
+            _mm256_mul_ps(
+                state_vector,
+                _mm256_loadu_ps(query.data() + index)));
+    }
+    float attended = reduce_avx2(attended_sum);
+    for (; index < state.size(); ++index) {
+        state[index] += key[index] * delta;
+        attended += state[index] * query[index];
+    }
+    return attended;
+}
+
+__attribute__((target("avx512f"))) float gated_delta_update_avx512(
+    std::span<float> state,
+    std::span<const float> query,
+    std::span<const float> key,
+    float value,
+    float beta,
+    float decay) {
+    const auto decay_vector = _mm512_set1_ps(decay);
+    __m512 prediction_sum = _mm512_setzero_ps();
+    std::size_t index = 0;
+    for (; index + 16 <= state.size(); index += 16) {
+        auto state_vector = _mm512_mul_ps(
+            _mm512_loadu_ps(state.data() + index),
+            decay_vector);
+        _mm512_storeu_ps(state.data() + index, state_vector);
+        prediction_sum = _mm512_add_ps(
+            prediction_sum,
+            _mm512_mul_ps(
+                state_vector,
+                _mm512_loadu_ps(key.data() + index)));
+    }
+    float prediction = reduce_avx512(prediction_sum);
+    for (; index < state.size(); ++index) {
+        state[index] *= decay;
+        prediction += state[index] * key[index];
+    }
+
+    const float delta = (value - prediction) * beta;
+    const auto delta_vector = _mm512_set1_ps(delta);
+    __m512 attended_sum = _mm512_setzero_ps();
+    index = 0;
+    for (; index + 16 <= state.size(); index += 16) {
+        auto state_vector = _mm512_add_ps(
+            _mm512_loadu_ps(state.data() + index),
+            _mm512_mul_ps(
+                _mm512_loadu_ps(key.data() + index),
+                delta_vector));
+        _mm512_storeu_ps(state.data() + index, state_vector);
+        attended_sum = _mm512_add_ps(
+            attended_sum,
+            _mm512_mul_ps(
+                state_vector,
+                _mm512_loadu_ps(query.data() + index)));
+    }
+    float attended = reduce_avx512(attended_sum);
+    for (; index < state.size(); ++index) {
+        state[index] += key[index] * delta;
+        attended += state[index] * query[index];
+    }
+    return attended;
+}
+
 } // namespace
 #endif
 
@@ -344,6 +449,44 @@ float x86_f32_dot(
 #else
     (void)left;
     (void)right;
+    (void)isa;
+    return 0.0F;
+#endif
+}
+
+
+float x86_gated_delta_update(
+    std::span<float> state,
+    std::span<const float> query,
+    std::span<const float> key,
+    float value,
+    float beta,
+    float decay,
+    CpuIsa isa) {
+#if (defined(__x86_64__) || defined(_M_X64)) && \
+    (defined(__GNUC__) || defined(__clang__))
+    return isa == CpuIsa::avx512
+               ? gated_delta_update_avx512(
+                     state,
+                     query,
+                     key,
+                     value,
+                     beta,
+                     decay)
+               : gated_delta_update_avx2(
+                     state,
+                     query,
+                     key,
+                     value,
+                     beta,
+                     decay);
+#else
+    (void)state;
+    (void)query;
+    (void)key;
+    (void)value;
+    (void)beta;
+    (void)decay;
     (void)isa;
     return 0.0F;
 #endif

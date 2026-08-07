@@ -70,6 +70,11 @@ if(ADI_BUILD_TESTS)
     target_include_directories(adi_codec_cache_test PRIVATE src)
     add_test(NAME codec_cache COMMAND adi_codec_cache_test)
 
+    add_executable(adi_gated_delta_test tests/gated_delta_test.cpp)
+    target_link_libraries(adi_gated_delta_test PRIVATE adi_runtime)
+    target_include_directories(adi_gated_delta_test PRIVATE src)
+    add_test(NAME gated_delta COMMAND adi_gated_delta_test)
+
     add_executable(adi_executor_test tests/executor_test.cpp)
     target_link_libraries(adi_executor_test PRIVATE adi_runtime)
     target_include_directories(adi_executor_test PRIVATE src)
@@ -122,6 +127,7 @@ if(ADI_BUILD_TESTS)
             adi_kernels_test
             adi_int5_batch_test
             adi_codec_cache_test
+            adi_gated_delta_test
             adi_executor_test
             adi_generation_test
             adi_json_test

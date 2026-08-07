@@ -27,6 +27,14 @@ float x86_f32_dot(
     std::span<const float> left,
     std::span<const float> right,
     CpuIsa isa);
+float x86_gated_delta_update(
+    std::span<float> state,
+    std::span<const float> query,
+    std::span<const float> key,
+    float value,
+    float beta,
+    float decay,
+    CpuIsa isa);
 
 void arm_hadamard(std::span<float> values, CpuIsa isa);
 float arm_int5_scaled_dot(
@@ -138,6 +146,27 @@ float scalar_f32_dot(
         sum += left[index] * right[index];
     }
     return sum;
+}
+
+float scalar_gated_delta_update(
+    std::span<float> state,
+    std::span<const float> query,
+    std::span<const float> key,
+    float value,
+    float beta,
+    float decay) {
+    float prediction = 0.0F;
+    for (std::size_t index = 0; index < state.size(); ++index) {
+        state[index] *= decay;
+        prediction += state[index] * key[index];
+    }
+    const float delta = (value - prediction) * beta;
+    float attended = 0.0F;
+    for (std::size_t index = 0; index < state.size(); ++index) {
+        state[index] += key[index] * delta;
+        attended += state[index] * query[index];
+    }
+    return attended;
 }
 
 } // namespace
@@ -302,6 +331,37 @@ float f32_dot(
         return arm_f32_dot(left, right, isa);
     }
     return scalar_f32_dot(left, right);
+}
+
+float gated_delta_update(
+    std::span<float> state,
+    std::span<const float> query,
+    std::span<const float> key,
+    float value,
+    float beta,
+    float decay) {
+    if (state.empty() || state.size() != query.size() ||
+        state.size() != key.size()) {
+        throw std::invalid_argument("Gated DeltaNet row shape mismatch");
+    }
+    const auto isa = selected_cpu_isa();
+    if (isa == CpuIsa::avx2 || isa == CpuIsa::avx512) {
+        return x86_gated_delta_update(
+            state,
+            query,
+            key,
+            value,
+            beta,
+            decay,
+            isa);
+    }
+    return scalar_gated_delta_update(
+        state,
+        query,
+        key,
+        value,
+        beta,
+        decay);
 }
 
 } // namespace adi::detail

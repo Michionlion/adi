@@ -2,6 +2,7 @@
 #include "attention.hpp"
 #include "parallel.hpp"
 #include "profiling_internal.hpp"
+#include "simd.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -61,6 +62,81 @@ void apply_rope(
         values[index] = first * cosine - second * sine;
         values[index + half] = second * cosine + first * sine;
     }
+}
+
+void gated_delta_recurrent(
+    std::span<float> recurrent,
+    std::span<const float> query,
+    std::span<const float> key,
+    std::span<const float> value,
+    std::span<const float> alpha,
+    std::span<const float> beta,
+    std::span<const std::uint16_t> alpha_bias,
+    std::span<const std::uint16_t> a_log,
+    std::uint32_t key_heads,
+    std::uint32_t value_heads,
+    std::uint32_t head_size,
+    std::span<float> output) {
+    const auto state_size =
+        static_cast<std::size_t>(value_heads) * head_size * head_size;
+    const auto value_size =
+        static_cast<std::size_t>(value_heads) * head_size;
+    const auto key_size =
+        static_cast<std::size_t>(key_heads) * head_size;
+    if (recurrent.size() != state_size || query.size() != key_size ||
+        key.size() != key_size || value.size() != value_size ||
+        alpha.size() != value_heads || beta.size() != value_heads ||
+        alpha_bias.size() != value_heads || a_log.size() != value_heads ||
+        output.size() != value_size) {
+        throw std::invalid_argument("Gated DeltaNet recurrent shape mismatch");
+    }
+
+    const float output_scale =
+        1.0F / std::sqrt(static_cast<float>(head_size));
+    detail::parallel_ranges(
+        value_heads,
+        1,
+        [&](std::uint32_t head_begin, std::uint32_t head_end) {
+            for (std::uint32_t head = head_begin;
+                 head < head_end;
+                 ++head) {
+                const auto key_head =
+                    gated_delta_key_head(head, value_heads, key_heads);
+                const auto q = query.subspan(
+                    static_cast<std::size_t>(key_head) * head_size,
+                    head_size);
+                const auto k = key.subspan(
+                    static_cast<std::size_t>(key_head) * head_size,
+                    head_size);
+                const auto v = value.subspan(
+                    static_cast<std::size_t>(head) * head_size,
+                    head_size);
+                const float beta_value = sigmoid(beta[head]);
+                const float biased_alpha =
+                    alpha[head] + bf16_to_f32(alpha_bias[head]);
+                const float softplus =
+                    biased_alpha > 20.0F
+                        ? biased_alpha
+                        : std::log1p(std::exp(biased_alpha));
+                const float decay = std::exp(
+                    -std::exp(bf16_to_f32(a_log[head])) * softplus);
+                for (std::uint32_t row = 0; row < head_size; ++row) {
+                    auto state_row = recurrent.subspan(
+                        (static_cast<std::size_t>(head) * head_size + row) *
+                            head_size,
+                        head_size);
+                    output[static_cast<std::size_t>(head) * head_size + row] =
+                        detail::gated_delta_update(
+                            state_row,
+                            q,
+                            k,
+                            v[row],
+                            beta_value,
+                            decay) *
+                        output_scale;
+                }
+            }
+        });
 }
 
 } // namespace
@@ -402,43 +478,19 @@ void linear_attention_forward(
         throw std::invalid_argument("linear attention recurrent state mismatch");
     }
 
-    const float output_scale = 1.0F / std::sqrt(static_cast<float>(head_size));
-    for (std::uint32_t head = 0; head < value_heads; ++head) {
-        const auto key_head =
-            gated_delta_key_head(head, value_heads, key_heads);
-        const auto q = query.subspan(
-            static_cast<std::size_t>(key_head) * head_size, head_size);
-        const auto k = key.subspan(
-            static_cast<std::size_t>(key_head) * head_size, head_size);
-        const auto v = value.subspan(
-            static_cast<std::size_t>(head) * head_size, head_size);
-        const float beta = sigmoid(scratch.beta[head]);
-        const float biased_alpha = scratch.alpha[head] + bf16_to_f32(alpha_bias[head]);
-        const float softplus =
-            biased_alpha > 20.0F ? biased_alpha : std::log1p(std::exp(biased_alpha));
-        const float decay =
-            std::exp(-std::exp(bf16_to_f32(a_log[head])) * softplus);
-        for (std::uint32_t row = 0; row < head_size; ++row) {
-            auto state_row = std::span<float>(
-                state.recurrent.data() +
-                    (static_cast<std::size_t>(head) * head_size + row) * head_size,
-                head_size);
-            float prediction = 0.0F;
-            for (std::uint32_t column = 0; column < head_size; ++column) {
-                state_row[column] *= decay;
-                prediction += state_row[column] * k[column];
-            }
-            const float delta = (v[row] - prediction) * beta;
-            float attended = 0.0F;
-            for (std::uint32_t column = 0; column < head_size; ++column) {
-                state_row[column] += k[column] * delta;
-                attended += state_row[column] * q[column];
-            }
-            scratch.recurrent_output[
-                static_cast<std::size_t>(head) * head_size + row] =
-                attended * output_scale;
-        }
-    }
+    gated_delta_recurrent(
+        state.recurrent,
+        query,
+        key,
+        value,
+        scratch.alpha,
+        scratch.beta,
+        alpha_bias,
+        a_log,
+        key_heads,
+        value_heads,
+        head_size,
+        scratch.recurrent_output);
 
     const auto norm = descriptor.norm;
     for (std::uint32_t head = 0; head < value_heads; ++head) {
@@ -777,59 +829,20 @@ void linear_attention_forward_batch(
             throw std::invalid_argument(
                 "linear attention recurrent state mismatch");
         }
-        const float output_scale =
-            1.0F / std::sqrt(static_cast<float>(head_size));
-        for (std::uint32_t head = 0; head < value_heads; ++head) {
-            const auto key_head =
-                gated_delta_key_head(head, value_heads, key_heads);
-            const auto q = query.subspan(
-                static_cast<std::size_t>(key_head) * head_size,
-                head_size);
-            const auto k = key.subspan(
-                static_cast<std::size_t>(key_head) * head_size,
-                head_size);
-            const auto v = value.subspan(
-                static_cast<std::size_t>(head) * head_size,
-                head_size);
-            const float beta = sigmoid(scratch.beta[head]);
-            const float biased_alpha =
-                scratch.alpha[head] +
-                bf16_to_f32(descriptor.alpha_bias[head]);
-            const float softplus =
-                biased_alpha > 20.0F
-                    ? biased_alpha
-                    : std::log1p(std::exp(biased_alpha));
-            const float decay =
-                std::exp(
-                    -std::exp(bf16_to_f32(descriptor.a_log[head])) *
-                    softplus);
-            for (std::uint32_t row = 0; row < head_size; ++row) {
-                auto state_row = std::span<float>(
-                    state.recurrent.data() +
-                        (static_cast<std::size_t>(head) * head_size +
-                         row) *
-                            head_size,
-                    head_size);
-                float prediction = 0.0F;
-                for (std::uint32_t column = 0;
-                     column < head_size;
-                     ++column) {
-                    state_row[column] *= decay;
-                    prediction += state_row[column] * k[column];
-                }
-                const float delta = (v[row] - prediction) * beta;
-                float attended = 0.0F;
-                for (std::uint32_t column = 0;
-                     column < head_size;
-                     ++column) {
-                    state_row[column] += k[column] * delta;
-                    attended += state_row[column] * q[column];
-                }
-                scratch.recurrent_output[
-                    static_cast<std::size_t>(head) * head_size + row] =
-                    attended * output_scale;
-            }
-        }
+        gated_delta_recurrent(
+            state.recurrent,
+            query,
+            key,
+            value,
+            scratch.alpha,
+            scratch.beta,
+            descriptor.alpha_bias,
+            descriptor.a_log,
+            key_heads,
+            value_heads,
+            head_size,
+            scratch.recurrent_output);
+
         for (std::uint32_t head = 0; head < value_heads; ++head) {
             const auto source = std::span<const float>(
                 scratch.recurrent_output.data() +
