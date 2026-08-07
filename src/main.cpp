@@ -448,6 +448,107 @@ int bench_moe(int argc, char **argv) {
     return 0;
 }
 
+// Reports how much of the batched MoE's wall time the expert matmuls actually
+// account for. Expert kernels run one task per active expert, so if the wall
+// time greatly exceeds the summed kernel time divided by the worker count,
+// the workers are idling at the barrier rather than computing.
+//
+// Read the efficiency here as an upper bound, not as the runtime's. Routing
+// depends on the input, and no synthetic input reproduces the distribution a
+// real prompt produces at depth: this command sees about 180 active experts
+// holding a few rows each, while an actual prefill concentrates 512 route
+// assignments into about 85 experts, the largest holding roughly 56. The flat
+// distribution here measures 0.87 efficiency; the real one measures 0.47.
+// Use this to compare scheduling strategies against each other, and measure
+// the runtime in situ before drawing conclusions about it.
+int bench_moe_batch(int argc, char **argv) {
+    const adi::MachModel model(argv[2]);
+    const auto layer = parse_u32(argv[3], "layer");
+    const auto batch = parse_u32(argv[4], "batch");
+    const auto iterations = argc >= 6 ? parse_u32(argv[5], "iterations") : 3;
+    const std::string_view pattern = argc == 7 ? argv[6] : "varied";
+    if (batch == 0 || iterations == 0) {
+        throw std::invalid_argument("batch and iterations must be positive");
+    }
+    if (pattern != "varied" && pattern != "identical") {
+        throw std::invalid_argument("pattern must be varied or identical");
+    }
+    const auto hidden = model.config().hidden;
+
+    // Routing is what decides how the work splits, and it is sensitive to the
+    // input distribution: white-noise vectors spread routes across far more
+    // experts than real hidden states do. So inputs come from real embedding
+    // rows, normalized the way a decoder layer normalizes its MoE input.
+    // "identical" repeats one token, the perfectly balanced case of eight
+    // equal tasks; "varied" uses distinct tokens.
+    std::vector<float> inputs(static_cast<std::size_t>(batch) * hidden);
+    std::vector<float> row(hidden);
+    const auto embedding = model.embedding();
+    for (std::uint32_t index = 0; index < batch; ++index) {
+        const auto token = pattern == "identical"
+                               ? 1000U
+                               : 1000U + index * 977U % model.config().vocabulary;
+        adi::mach_embedding_row(embedding, token, row);
+        adi::rms_norm(
+            row,
+            model.layer(layer).post_attention_norm,
+            1.0F,
+            1.0e-6F,
+            std::span<float>(inputs).subspan(
+                static_cast<std::size_t>(index) * hidden, hidden));
+    }
+    std::vector<float> outputs(inputs.size());
+    adi::DecoderBatchScratch scratch;
+    adi::moe_forward_batch(model, layer, inputs, outputs, scratch);
+
+    adi::reset_kernel_profiles();
+    const auto start = std::chrono::steady_clock::now();
+    for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
+        adi::moe_forward_batch(model, layer, inputs, outputs, scratch);
+    }
+    const auto elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    const auto seconds = elapsed / iterations;
+
+    const auto profiles = adi::kernel_profiles();
+    const auto expert_nanoseconds =
+        profiles[static_cast<std::size_t>(adi::KernelKind::expert)].nanoseconds +
+        profiles[static_cast<std::size_t>(adi::KernelKind::expert_batch)]
+            .nanoseconds;
+    const auto expert_seconds =
+        static_cast<double>(expert_nanoseconds) / 1.0e9 / iterations;
+    const auto threads = adi::worker_threads();
+    const auto balanced = expert_seconds / threads;
+
+    std::uint32_t active = 0;
+    std::uint32_t widest = 0;
+    std::uint32_t narrowest = std::numeric_limits<std::uint32_t>::max();
+    for (const auto count : scratch.moe.counts) {
+        if (count == 0) {
+            continue;
+        }
+        ++active;
+        widest = std::max(widest, count);
+        narrowest = std::min(narrowest, count);
+    }
+    double checksum = 0.0;
+    for (const auto value : outputs) {
+        checksum += value;
+    }
+
+    std::cout << "pattern: " << pattern << '\n'
+              << "batch: " << batch << '\n'
+              << "workers: " << threads << '\n'
+              << "active_experts: " << active << '\n'
+              << "rows_per_expert: " << narrowest << ".." << widest << '\n'
+              << "seconds/forward: " << seconds << '\n'
+              << "expert_kernel_seconds: " << expert_seconds << '\n'
+              << "balanced_seconds: " << balanced << '\n'
+              << "parallel_efficiency: " << balanced / seconds << '\n'
+              << "checksum: " << checksum << '\n';
+    return 0;
+}
+
 int bench_attention(int argc, char **argv) {
     const adi::MachModel model(argv[2]);
     const auto layer = parse_u32(argv[3], "layer");
@@ -715,6 +816,8 @@ void usage() {
               << "  adi bench-ne MODEL.gguf LAYER SOURCE_NAME [ITERATIONS] [BATCH]\n"
               << "  adi bench-head MODEL.gguf CHUNK [ITERATIONS] [BATCH]\n"
               << "  adi bench-moe MODEL.gguf LAYER [ITERATIONS]\n"
+              << "  adi bench-moe-batch MODEL.gguf LAYER BATCH [ITERATIONS]"
+                 " [varied|identical]\n"
               << "  adi bench-attention MODEL.gguf LAYER [TOKENS]\n"
               << "  adi bench-linear MODEL.gguf LAYER [TOKENS]\n"
               << "  adi bench-prefill MODEL.gguf TOKENS UBATCH [ITERATIONS]\n"
@@ -787,6 +890,16 @@ int main(int argc, char **argv) {
     if ((argc == 4 || argc == 5) && std::string_view(argv[1]) == "bench-moe") {
         try {
             return profiled_benchmark([&] { return bench_moe(argc, argv); });
+        } catch (const std::exception &error) {
+            std::cerr << "adi: " << error.what() << '\n';
+            return 1;
+        }
+    }
+    if (argc >= 5 && argc <= 7 &&
+        std::string_view(argv[1]) == "bench-moe-batch") {
+        try {
+            return profiled_benchmark(
+                [&] { return bench_moe_batch(argc, argv); });
         } catch (const std::exception &error) {
             std::cerr << "adi: " << error.what() << '\n';
             return 1;
