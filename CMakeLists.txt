@@ -15,6 +15,9 @@ add_library(adi_runtime STATIC
     src/chat.cpp
     src/codec_cache.cpp
     src/executor.cpp
+    src/expert_batch.cpp
+    src/expert_batch_x86_avx2.cpp
+    src/expert_batch_x86_avx512.cpp
     src/generation.cpp
     src/gguf.cpp
     src/json.cpp
@@ -66,9 +69,11 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|amd64|x64|i[3-6]86)")
         # /fp:precise already forbids contraction across a statement, so the
         # separate multiply and add in the batch kernels stay separate.
         set_source_files_properties(
+            src/expert_batch_x86_avx2.cpp
             src/ne_batch_x86_avx2.cpp
             PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:precise")
         set_source_files_properties(
+            src/expert_batch_x86_avx512.cpp
             src/ne_batch_x86_avx512.cpp
             PROPERTIES COMPILE_OPTIONS "/arch:AVX512;/fp:precise")
     elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -87,9 +92,11 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|amd64|x64|i[3-6]86)")
         # bit-exactness. AVX2 and AVX-512 both make FMA available, so the
         # contraction has to be disabled explicitly.
         set_source_files_properties(
+            src/expert_batch_x86_avx2.cpp
             src/ne_batch_x86_avx2.cpp
             PROPERTIES COMPILE_OPTIONS "-mavx2;-ffp-contract=off")
         set_source_files_properties(
+            src/expert_batch_x86_avx512.cpp
             src/ne_batch_x86_avx512.cpp
             PROPERTIES COMPILE_OPTIONS
                 "-mavx512f;-mavx512bw;-ffp-contract=off")
@@ -137,6 +144,11 @@ if(ADI_BUILD_TESTS)
     target_link_libraries(adi_ne_batch_test PRIVATE adi_runtime)
     target_include_directories(adi_ne_batch_test PRIVATE src)
     add_test(NAME ne_batch COMMAND adi_ne_batch_test)
+
+    add_executable(adi_expert_batch_test tests/expert_batch_test.cpp)
+    target_link_libraries(adi_expert_batch_test PRIVATE adi_runtime)
+    target_include_directories(adi_expert_batch_test PRIVATE src)
+    add_test(NAME expert_batch COMMAND adi_expert_batch_test)
 
     add_executable(adi_codec_cache_test tests/codec_cache_test.cpp)
     target_link_libraries(adi_codec_cache_test PRIVATE adi_runtime)
@@ -236,6 +248,7 @@ if(ADI_BUILD_TESTS)
             adi_parallel_test
             adi_ne_trellis_test
             adi_ne_batch_test
+            adi_expert_batch_test
             adi_codec_cache_test
             adi_gated_delta_test
             adi_simd_dispatch_test

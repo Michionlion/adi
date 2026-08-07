@@ -253,22 +253,30 @@ int bench_expert(int argc, char **argv) {
     const auto layer = parse_u32(argv[3], "layer");
     const auto expert = parse_u32(argv[4], "expert");
     const auto projection = parse_projection(argv[5]);
-    const auto iterations = argc == 7 ? parse_u32(argv[6], "iterations") : 3;
+    const auto iterations = argc >= 7 ? parse_u32(argv[6], "iterations") : 3;
+    const auto batch = argc == 8 ? parse_u32(argv[7], "batch") : 1;
     if (iterations == 0) {
         throw std::invalid_argument("iterations must be positive");
     }
+    if (batch == 0) {
+        throw std::invalid_argument("batch must be positive");
+    }
     const auto matrix = model.expert(layer, expert, projection);
-    std::vector<float> input(matrix.columns);
+    // Rows of a batch differ, so a batch of identical rows would let a cache
+    // do work the real routed input does not get for free.
+    std::vector<float> input(
+        static_cast<std::size_t>(batch) * matrix.columns);
     for (std::size_t index = 0; index < input.size(); ++index) {
         input[index] = stable_benchmark_input(index);
     }
-    std::vector<float> output(matrix.rows);
+    std::vector<float> output(
+        static_cast<std::size_t>(batch) * matrix.rows);
     adi::ExpertScratch scratch;
 
-    adi::mach_expert_matvec(matrix, input, output, scratch);
+    adi::mach_expert_matmul(matrix, input, batch, output, scratch);
     const auto start = std::chrono::steady_clock::now();
     for (std::uint32_t iteration = 0; iteration < iterations; ++iteration) {
-        adi::mach_expert_matvec(matrix, input, output, scratch);
+        adi::mach_expert_matmul(matrix, input, batch, output, scratch);
     }
     const auto elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - start).count();
@@ -278,9 +286,12 @@ int bench_expert(int argc, char **argv) {
         checksum += value;
         max_abs = std::max(max_abs, std::abs(value));
     }
+    const auto milliseconds = elapsed * 1000.0 / iterations;
     std::cout << "matrix: " << matrix.rows << "x" << matrix.columns << '\n'
+              << "batch: " << batch << '\n'
               << "iterations: " << iterations << '\n'
-              << "milliseconds/matvec: " << elapsed * 1000.0 / iterations << '\n'
+              << "milliseconds/call: " << milliseconds << '\n'
+              << "milliseconds/row: " << milliseconds / batch << '\n'
               << "checksum: " << checksum << '\n'
               << "max_abs: " << max_abs << '\n';
     return 0;
@@ -813,7 +824,8 @@ void usage() {
               << "  adi --version\n"
               << "  adi inspect MODEL.gguf\n"
               << "  adi validate MODEL.gguf\n"
-              << "  adi bench-expert MODEL.gguf LAYER EXPERT PROJECTION [ITERATIONS]\n"
+              << "  adi bench-expert MODEL.gguf LAYER EXPERT PROJECTION"
+                 " [ITERATIONS] [BATCH]\n"
               << "  adi bench-ne MODEL.gguf LAYER SOURCE_NAME [ITERATIONS] [BATCH]\n"
               << "  adi bench-head MODEL.gguf CHUNK [ITERATIONS] [BATCH]\n"
               << "  adi bench-moe MODEL.gguf LAYER [ITERATIONS]\n"
@@ -854,7 +866,8 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    if ((argc == 6 || argc == 7) && std::string_view(argv[1]) == "bench-expert") {
+    if ((argc >= 6 && argc <= 8) &&
+        std::string_view(argv[1]) == "bench-expert") {
         try {
             return profiled_benchmark([&] { return bench_expert(argc, argv); });
         } catch (const std::exception &error) {

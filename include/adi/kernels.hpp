@@ -22,8 +22,9 @@ struct MachExpertMatrix {
 struct ExpertScratch {
     std::vector<float> input;
     std::vector<float> output;
-    // Batch-major inputs rearranged as [block][column][lane] for the
-    // batch-oriented non-expert kernel.
+    // Batch-major inputs rearranged as [block][column][lane] for whichever
+    // batch-oriented kernel this call uses. A call is either an expert or a
+    // non-expert matmul, never both, so the two share the buffer.
     std::vector<float> batch_packed;
     std::vector<std::uint16_t> wave_indexes;
     std::vector<float> state_values;

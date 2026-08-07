@@ -1,5 +1,7 @@
 #include "adi/kernels.hpp"
+#include "batch_pack.hpp"
 #include "codec_cache.hpp"
+#include "expert_batch.hpp"
 #include "expert_trellis.hpp"
 #include "ne_batch.hpp"
 #include "ne_trellis.hpp"
@@ -157,6 +159,87 @@ void ne_accumulate_tiles_scalar(
                 }
             }
         });
+}
+
+// Reference accumulation for the batched expert stream. Every SIMD batch
+// kernel must reproduce this bit for bit: tile column by tile column, state by
+// state, component by component, into a per-tile partial that the tile's gamma
+// scales exactly once before it reaches the row sum.
+//
+//   inputs  [batch, matrix.columns], already scaled and Hadamard'd
+//   outputs [batch, matrix.rows], before the output Hadamard and scales
+void expert_accumulate_tiles_scalar(
+    const MachExpertMatrix &matrix,
+    std::span<const float> state_values,
+    std::span<const std::uint16_t> wave_indexes,
+    std::span<const float> wave_gamma,
+    std::span<const float> inputs,
+    std::uint32_t batch,
+    std::span<float> outputs) {
+    const auto tile_rows = matrix.rows / tile_size;
+    const auto tile_columns = matrix.columns / tile_size;
+
+    std::vector<float> row_sums(
+        static_cast<std::size_t>(batch) * tile_size);
+    std::vector<float> partial(
+        static_cast<std::size_t>(batch) * tile_size);
+    for (std::uint32_t tile_row = 0; tile_row < tile_rows; ++tile_row) {
+        std::fill(row_sums.begin(), row_sums.end(), 0.0F);
+        for (std::uint32_t tile_column = 0;
+             tile_column < tile_columns;
+             ++tile_column) {
+            std::fill(partial.begin(), partial.end(), 0.0F);
+            const auto tile_index =
+                static_cast<std::size_t>(tile_row) * tile_columns +
+                tile_column;
+            const auto *words =
+                matrix.trellis.data() + tile_index * words_per_tile;
+            detail::for_each_expert_state(
+                words,
+                [&](std::uint32_t state_index, std::uint32_t state) {
+                    const auto local_row = state_index >> 1;
+                    const auto column = tile_column * tile_size +
+                                        ((state_index & 1U) << 3);
+                    for (std::uint32_t component = 0;
+                         component < values_per_state;
+                         ++component) {
+                        const float weight =
+                            state_values[
+                                static_cast<std::size_t>(state) *
+                                    values_per_state +
+                                component];
+                        for (std::uint32_t batch_index = 0;
+                             batch_index < batch;
+                             ++batch_index) {
+                            partial[
+                                static_cast<std::size_t>(batch_index) *
+                                    tile_size +
+                                local_row] +=
+                                weight *
+                                inputs[
+                                    static_cast<std::size_t>(batch_index) *
+                                        matrix.columns +
+                                    column + component];
+                        }
+                    }
+                });
+            const float gamma = wave_gamma[wave_indexes[tile_index]];
+            for (std::size_t index = 0; index < row_sums.size(); ++index) {
+                row_sums[index] += partial[index] * gamma;
+            }
+        }
+        for (std::uint32_t batch_index = 0;
+             batch_index < batch;
+             ++batch_index) {
+            std::copy_n(
+                row_sums.begin() +
+                    static_cast<std::size_t>(batch_index) * tile_size,
+                tile_size,
+                outputs.begin() +
+                    static_cast<std::size_t>(batch_index) * matrix.rows +
+                    tile_row * tile_size);
+        }
+    }
 }
 
 std::span<const std::uint16_t> expert_wave_indexes(
@@ -414,66 +497,32 @@ void mach_expert_matmul(
         expert_wave_indexes(matrix, tile_rows, tile_columns, scratch);
     const auto wave_gamma = expert_wave_gamma(matrix, scratch);
 
-    std::vector<float> row_sums(
-        static_cast<std::size_t>(batch) * tile_size);
-    std::vector<float> partial(
-        static_cast<std::size_t>(batch) * tile_size);
-    for (std::uint32_t tile_row = 0; tile_row < tile_rows; ++tile_row) {
-        std::fill(row_sums.begin(), row_sums.end(), 0.0F);
-        for (std::uint32_t tile_column = 0;
-             tile_column < tile_columns;
-             ++tile_column) {
-            std::fill(partial.begin(), partial.end(), 0.0F);
-            const auto tile_index =
-                static_cast<std::size_t>(tile_row) * tile_columns +
-                tile_column;
-            const auto *words =
-                matrix.trellis.data() + tile_index * words_per_tile;
-            detail::for_each_expert_state(
-                words,
-                [&](std::uint32_t state_index, std::uint32_t state) {
-                    const auto local_row = state_index >> 1;
-                    const auto column = tile_column * tile_size +
-                                        ((state_index & 1U) << 3);
-                    for (std::uint32_t component = 0;
-                         component < values_per_state;
-                         ++component) {
-                        const float weight =
-                            state_values[
-                                static_cast<std::size_t>(state) *
-                                    values_per_state +
-                                component];
-                        for (std::uint32_t batch_index = 0;
-                             batch_index < batch;
-                             ++batch_index) {
-                            partial[
-                                static_cast<std::size_t>(batch_index) *
-                                    tile_size +
-                                local_row] +=
-                                weight *
-                                scratch.input[
-                                    static_cast<std::size_t>(batch_index) *
-                                        matrix.columns +
-                                    column + component];
-                        }
-                    }
-                });
-            const float gamma = wave_gamma[wave_indexes[tile_index]];
-            for (std::size_t index = 0; index < row_sums.size(); ++index) {
-                row_sums[index] += partial[index] * gamma;
-            }
-        }
-        for (std::uint32_t batch_index = 0;
-             batch_index < batch;
-             ++batch_index) {
-            std::copy_n(
-                row_sums.begin() +
-                    static_cast<std::size_t>(batch_index) * tile_size,
-                tile_size,
-                scratch.output.begin() +
-                    static_cast<std::size_t>(batch_index) * matrix.rows +
-                    tile_row * tile_size);
-        }
+    // Decoding a packed weight once and applying it to a whole SIMD register
+    // of independent batch items is the point of the batch kernel. Below the
+    // threshold, and on ISAs without one, expert_accumulate_tiles_scalar stays
+    // the reference implementation.
+    const auto batch_lanes = detail::expert_batch_lanes();
+    if (batch_lanes != 0 && batch >= detail::expert_batch_minimum) {
+        scratch.batch_packed.resize(
+            detail::batch_packed_floats(matrix.columns, batch, batch_lanes));
+        detail::expert_matmul_tiles_batch(
+            matrix,
+            state_values,
+            wave_indexes,
+            wave_gamma,
+            scratch.input,
+            batch,
+            scratch.output,
+            scratch.batch_packed);
+    } else {
+        expert_accumulate_tiles_scalar(
+            matrix,
+            state_values,
+            wave_indexes,
+            wave_gamma,
+            scratch.input,
+            batch,
+            scratch.output);
     }
 
     for (std::uint32_t batch_index = 0;
@@ -642,8 +691,7 @@ void mach_ne_matmul(
     const auto batch_lanes = detail::ne_batch_lanes();
     if (batch_lanes != 0 && batch >= detail::ne_batch_minimum) {
         scratch.batch_packed.resize(
-            detail::ne_batch_packed_floats(
-                matrix.columns, batch, batch_lanes));
+            detail::batch_packed_floats(matrix.columns, batch, batch_lanes));
         detail::ne_matmul_tiles_batch(
             matrix,
             state_values,

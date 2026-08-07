@@ -16,17 +16,11 @@ namespace adi::detail {
 // per-tile setup cost more than they save, and the scalar loop wins.
 constexpr std::uint32_t ne_batch_minimum = 4;
 
-// Packing scratch, in floats, that ne_matmul_tiles_batch needs for a shape.
-[[nodiscard]] std::size_t ne_batch_packed_floats(
-    std::uint32_t columns,
-    std::uint32_t batch,
-    std::uint32_t lanes) noexcept;
-
 // Accumulates every packed trellis tile across the batch dimension.
 //
 //   inputs   [batch, matrix.columns], already sign-applied and Hadamard'd
 //   outputs  [batch, matrix.rows], before the output Hadamard and signs
-//   packed   scratch of ne_batch_packed_floats() floats
+//   packed   scratch of batch_packed_floats() floats
 //
 // Vectorization is over the batch dimension only. Every lane performs the
 // same scalar accumulation sequence, in the same order, as mach_ne_matmul's

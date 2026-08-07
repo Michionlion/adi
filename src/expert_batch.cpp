@@ -1,4 +1,4 @@
-#include "ne_batch.hpp"
+#include "expert_batch.hpp"
 
 #include "batch_pack.hpp"
 #include "simd.hpp"
@@ -8,8 +8,10 @@
 namespace adi::detail {
 namespace {
 
-using NeTilesBatchKernel = void (*)(
-    const MachNeMatrix &,
+using ExpertTilesBatchKernel = void (*)(
+    const MachExpertMatrix &,
+    std::span<const float>,
+    std::span<const std::uint16_t>,
     std::span<const float>,
     std::span<const float>,
     std::uint32_t,
@@ -18,7 +20,7 @@ using NeTilesBatchKernel = void (*)(
 
 struct BatchKernel {
     std::uint32_t lanes = 0;
-    NeTilesBatchKernel run = nullptr;
+    ExpertTilesBatchKernel run = nullptr;
 };
 
 // selected_cpu_isa() already reports scalar for any ISA the running CPU does
@@ -27,9 +29,9 @@ struct BatchKernel {
 BatchKernel selected_batch_kernel() noexcept {
     switch (selected_cpu_isa()) {
     case CpuIsa::avx512:
-        return {16, x86_ne_tiles_batch_avx512};
+        return {16, x86_expert_tiles_batch_avx512};
     case CpuIsa::avx2:
-        return {8, x86_ne_tiles_batch_avx2};
+        return {8, x86_expert_tiles_batch_avx2};
     case CpuIsa::scalar:
     case CpuIsa::neon:
     case CpuIsa::sve:
@@ -40,13 +42,15 @@ BatchKernel selected_batch_kernel() noexcept {
 
 } // namespace
 
-std::uint32_t ne_batch_lanes() noexcept {
+std::uint32_t expert_batch_lanes() noexcept {
     return selected_batch_kernel().lanes;
 }
 
-void ne_matmul_tiles_batch(
-    const MachNeMatrix &matrix,
+void expert_matmul_tiles_batch(
+    const MachExpertMatrix &matrix,
     std::span<const float> state_values,
+    std::span<const std::uint16_t> wave_indexes,
+    std::span<const float> wave_gamma,
     std::span<const float> inputs,
     std::uint32_t batch,
     std::span<float> outputs,
@@ -58,9 +62,17 @@ void ne_matmul_tiles_batch(
         outputs.size() != static_cast<std::size_t>(batch) * matrix.rows ||
         packed.size() !=
             batch_packed_floats(matrix.columns, batch, kernel.lanes)) {
-        throw std::invalid_argument("Mach NE batch kernel shape mismatch");
+        throw std::invalid_argument("Mach expert batch kernel shape mismatch");
     }
-    kernel.run(matrix, state_values, inputs, batch, outputs, packed);
+    kernel.run(
+        matrix,
+        state_values,
+        wave_indexes,
+        wave_gamma,
+        inputs,
+        batch,
+        outputs,
+        packed);
 }
 
 } // namespace adi::detail

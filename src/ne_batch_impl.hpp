@@ -6,6 +6,7 @@
 // FMA. That is what keeps every lane bit-identical to the scalar kernel.
 
 #include "adi/kernels.hpp"
+#include "batch_pack.hpp"
 #include "ne_trellis.hpp"
 #include "parallel.hpp"
 
@@ -23,38 +24,6 @@ constexpr std::uint32_t ne_values_per_state_batch = 2;
 // SIMD register per tile row, so keeping this small lets the accumulators
 // stay in registers across the eight states that share a row.
 constexpr std::uint32_t ne_batch_max_group = 4;
-
-// Rearranges [batch, columns] into [block, column, lane]. Padding lanes are
-// zero: they contribute nothing to any accumulation and their results are
-// never written back to the caller's output.
-template <std::uint32_t Lanes>
-void ne_pack_inputs(
-    const float *inputs,
-    std::uint32_t batch,
-    std::uint32_t columns,
-    float *packed) {
-    const auto blocks = (batch + Lanes - 1) / Lanes;
-    for (std::uint32_t block = 0; block < blocks; ++block) {
-        float *destination =
-            packed + static_cast<std::size_t>(block) * columns * Lanes;
-        for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
-            const auto item = block * Lanes + lane;
-            if (item >= batch) {
-                for (std::uint32_t column = 0; column < columns; ++column) {
-                    destination[static_cast<std::size_t>(column) * Lanes +
-                                lane] = 0.0F;
-                }
-                continue;
-            }
-            const float *source =
-                inputs + static_cast<std::size_t>(item) * columns;
-            for (std::uint32_t column = 0; column < columns; ++column) {
-                destination[static_cast<std::size_t>(column) * Lanes + lane] =
-                    source[column];
-            }
-        }
-    }
-}
 
 // Accumulates one tile row of the matrix for Blocks batch blocks.
 //
@@ -148,7 +117,7 @@ void ne_tiles_batch(
     const auto blocks = (batch + lanes - 1) / lanes;
     const auto block_stride = static_cast<std::size_t>(columns) * lanes;
 
-    ne_pack_inputs<lanes>(inputs.data(), batch, columns, packed.data());
+    pack_batch_inputs<lanes>(inputs.data(), batch, columns, packed.data());
 
     for (std::uint32_t base = 0; base < blocks; base += ne_batch_max_group) {
         const auto group = std::min(ne_batch_max_group, blocks - base);
