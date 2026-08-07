@@ -191,3 +191,47 @@ multiply and add are never fused; the objects contain no FMA instruction. The
 scalar path is retained and still runs below batch 4 and on ISAs without a
 batch kernel. The full suite passes under `ADI_CPU_ISA` of scalar, avx2, and
 avx512.
+
+## Expert dispatch scheduling
+
+Measured on 2026-08-07, same machine and build as the section above.
+
+The batched MoE was 96% of prefill time, and only 47% of the worker time
+inside its expert dispatch was spent computing. Routing is skewed: a layer has
+about 85 active experts holding 512 rows between them, roughly a third holding
+one row while the largest holds around 56. Contiguous task blocks handed that
+out by position rather than by cost.
+
+`mach_expert_matmul` also reads its input column-major over a row-major array,
+so its cost per row depends on how many rows it is given:
+
+| rows | 2 | 4 | 8 | 12 | 16 | 24 | 32 | 48 | 64 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ms/row | 1.51 | 0.97 | 0.66 | 0.55 | 0.72 | 0.91 | 1.15 | 1.52 | 1.88 |
+
+Splitting a large expert into evenly sized chunks of at most twelve rows is
+therefore faster in absolute terms as well as better balanced, and
+`parallel_dynamic` hands the chunks out on demand so imbalance is bounded by
+one chunk.
+
+| | before | after |
+| --- | ---: | ---: |
+| prefill, 64 tokens at microbatch 64 | 20.11 s | 7.09 s |
+| tokens/s | 3.18 | 9.03 |
+| expert-kernel CPU | 71.7 s | 46.6 s |
+| dispatch parallel efficiency | 0.47 | 0.933 |
+
+Decode, medians of seven runs, sequences/second:
+
+| batch | 1 | 4 | 8 | 16 | 32 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| before | 1.97 | 4.25 | 5.89 | 6.69 | 4.60 |
+| after | 1.97 | 4.83 | 6.16 | 6.29 | 7.45 |
+
+Throughput now climbs from batch 4 through 32 rather than peaking at 16. Batch
+1 is unchanged because single-sequence decode uses `moe_forward`, not the
+batched path. Batch 16 is nominally lower but the two ranges overlap.
+
+Checksums are unchanged and the wide microbatch matrix is exact in all twenty
+cases. The twelve-row cap exists only because of the expert kernel's current
+batch behaviour; re-measure it if that kernel gains a batch-lane path.
