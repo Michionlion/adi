@@ -77,6 +77,25 @@ void check_tile(const std::uint16_t *words) {
     const std::uint32_t wrapped =
         ((expected[126] << 8) & 0xFFFFU) | (words[0] >> 8);
     assert(expected[127] == wrapped);
+
+    // The row-grouped walk must visit the same states in the same order, and
+    // must report the local row and step that the flat index decomposes into.
+    // The single-vector kernel relies on both: on the order for its exact
+    // arithmetic, and on the grouping to hold a row's sum in a register.
+    std::vector<std::uint32_t> grouped;
+    grouped.reserve(expected.size());
+    adi::detail::for_each_ne_row_state(
+        words,
+        [&](std::uint32_t local_row, std::uint32_t step, std::uint32_t state) {
+            const auto index = static_cast<std::uint32_t>(grouped.size());
+            assert(local_row == index >> 3);
+            assert(step == (index & 7U));
+            assert(local_row < adi::detail::ne_rows_per_tile);
+            assert(step < adi::detail::ne_states_per_row);
+            assert(state <= 0xFFFFU);
+            grouped.push_back(state);
+        });
+    assert(grouped == expected);
 }
 
 } // namespace

@@ -588,11 +588,20 @@ void mach_ne_matvec(
                     matrix.trellis.data() + tile_index * ne_words_per_tile;
                 const auto *tile_input =
                     scratch.input.data() + tile_column * tile_size;
-                detail::for_each_ne_state(
+                // The eight states of a local row arrive together, so the
+                // row's running sum stays in a register across them and only
+                // touches row_sums once on each side. The adds themselves keep
+                // the flat walk's order exactly, so the result is unchanged.
+                float row_sum = 0.0F;
+                detail::for_each_ne_row_state(
                     words,
-                    [&](std::uint32_t state_index, std::uint32_t state) {
-                        const auto local_row = state_index >> 3;
-                        const auto local_column = (state_index & 7U) << 1;
+                    [&](std::uint32_t local_row,
+                        std::uint32_t step,
+                        std::uint32_t state) {
+                        if (step == 0) {
+                            row_sum = row_sums[local_row];
+                        }
+                        const auto local_column = step << 1;
                         // Two separate accumulations in this order: folding
                         // the pair into one expression changes the rounding.
                         const float weight0 =
@@ -606,10 +615,11 @@ void mach_ne_matvec(
                                     ne_values_per_state +
                                 1] *
                             matrix.weight_scale;
-                        row_sums[local_row] +=
-                            weight0 * tile_input[local_column];
-                        row_sums[local_row] +=
-                            weight1 * tile_input[local_column + 1];
+                        row_sum += weight0 * tile_input[local_column];
+                        row_sum += weight1 * tile_input[local_column + 1];
+                        if (step == detail::ne_states_per_row - 1) {
+                            row_sums[local_row] = row_sum;
+                        }
                     });
             }
             std::copy_n(
