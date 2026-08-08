@@ -930,3 +930,28 @@ worker is not retained either. It reused each key/value span while preserving
 each head's token-order arithmetic, but attention work excluding projections
 rose from a 703 ms median to 888 ms over the 2,048-token benchmark. The
 existing one-head-at-a-time loop has the better compiler schedule.
+
+## One-exponential online softmax
+
+Measured on 2026-08-08 on the same eight-core EPYC 9645 VM and Release build.
+The online-softmax update now evaluates one exponential per score. When a
+score does not exceed the running maximum, the previous accumulator needs no
+rescaling. When it does, the new score's weight is exactly one. This removes
+the exponential that was one in either branch without changing accumulation
+order.
+
+On the 2,048-position `bench-attention` workload, warmed medians moved from
+2.234 to 2.197 milliseconds/token, a 1.7% whole-layer reduction. Attention
+work excluding packed projections moved from approximately 783 to 688 ms,
+about 12%. The component timings are noisier than the whole-layer result, so
+the latter is the conservative effect to expect.
+
+The attention test compares the branch-specialized update bit-for-bit with the
+former two-exponential formulation on a score sequence that exercises both
+branches.
+
+Caching the 32 per-layer Gated DeltaNet `alpha_bias` and `exp(A_log)` values
+was also tested and is not retained. The 2,048-token linear-attention
+benchmark moved from a 2.553 milliseconds/token baseline to a 2.595 ms median,
+which is noise in the wrong direction and does not justify another model-data
+representation.

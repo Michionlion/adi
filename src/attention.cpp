@@ -10,6 +10,32 @@
 #include <stdexcept>
 
 namespace adi::detail {
+namespace {
+
+void update_online_softmax(
+    float score,
+    std::span<const float> value,
+    float &maximum,
+    float &denominator,
+    std::span<float> attended) {
+    if (score <= maximum) {
+        const float weight = std::exp(score - maximum);
+        denominator += weight;
+        for (std::size_t index = 0; index < attended.size(); ++index) {
+            attended[index] += value[index] * weight;
+        }
+        return;
+    }
+
+    const float previous_scale = std::exp(maximum - score);
+    denominator = denominator * previous_scale + 1.0F;
+    for (std::size_t index = 0; index < attended.size(); ++index) {
+        attended[index] = attended[index] * previous_scale + value[index];
+    }
+    maximum = score;
+}
+
+} // namespace
 
 void grouped_query_online_attention(
     std::span<const float> queries,
@@ -75,26 +101,15 @@ void grouped_query_online_attention(
                                 query_stride,
                             head_size);
                         const float score = dot(query, key) * score_scale;
-                        const float next_maximum =
-                            std::max(maxima[group_head], score);
-                        const float previous_scale =
-                            std::exp(maxima[group_head] - next_maximum);
-                        const float weight =
-                            std::exp(score - next_maximum);
                         auto attended = output.subspan(
                             static_cast<std::size_t>(query_head) * head_size,
                             head_size);
-                        for (std::uint32_t index = 0;
-                             index < head_size;
-                             ++index) {
-                            attended[index] =
-                                attended[index] * previous_scale +
-                                value[index] * weight;
-                        }
-                        denominators[group_head] =
-                            denominators[group_head] * previous_scale +
-                            weight;
-                        maxima[group_head] = next_maximum;
+                        update_online_softmax(
+                            score,
+                            value,
+                            maxima[group_head],
+                            denominators[group_head],
+                            attended);
                     }
                 }
                 for (std::uint32_t group_head = 0;
@@ -139,22 +154,12 @@ void grouped_query_online_attention(
                         const auto value =
                             values.subspan(state_offset, head_size);
                         const float score = dot(query, key) * score_scale;
-                        const float next_maximum =
-                            std::max(maximum, score);
-                        const float previous_scale =
-                            std::exp(maximum - next_maximum);
-                        const float weight =
-                            std::exp(score - next_maximum);
-                        for (std::uint32_t index = 0;
-                             index < head_size;
-                             ++index) {
-                            attended[index] =
-                                attended[index] * previous_scale +
-                                value[index] * weight;
-                        }
-                        denominator =
-                            denominator * previous_scale + weight;
-                        maximum = next_maximum;
+                        update_online_softmax(
+                            score,
+                            value,
+                            maximum,
+                            denominator,
+                            attended);
                     }
                     const float inverse = 1.0F / denominator;
                     for (auto &value : attended) {

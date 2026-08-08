@@ -1,7 +1,9 @@
 #include "adi/executor.hpp"
 #include "attention.hpp"
+#include "simd.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <limits>
@@ -134,4 +136,78 @@ int main() {
     for (std::size_t index = 0; index < reference.size(); ++index) {
         assert(std::abs(reference[index] - online[index]) < 2.0e-6F);
     }
+
+    // Compare against the former two-exponential online update exactly. The
+    // score sequence makes each head take both the new-maximum and existing-
+    // maximum branches several times.
+    constexpr std::uint32_t branch_heads = 2;
+    constexpr std::uint32_t branch_head_size = 8;
+    constexpr std::uint32_t branch_tokens = 6;
+    const std::vector<float> branch_queries{
+        1.0F, 1.0F, 1.0F, 1.0F, 1.0F, 1.0F, 1.0F, 1.0F,
+        -1.0F, -1.0F, -1.0F, -1.0F, -1.0F, -1.0F, -1.0F, -1.0F,
+    };
+    const std::array<float, branch_tokens> key_levels{
+        0.0F, 1.0F, -1.0F, 2.0F, 1.0F, 3.0F};
+    std::vector<float> branch_keys(branch_tokens * branch_head_size);
+    std::vector<float> branch_values(branch_keys.size());
+    for (std::uint32_t token = 0; token < branch_tokens; ++token) {
+        for (std::uint32_t index = 0; index < branch_head_size; ++index) {
+            const auto offset =
+                static_cast<std::size_t>(token) * branch_head_size + index;
+            branch_keys[offset] = key_levels[token];
+            branch_values[offset] =
+                static_cast<float>(token * branch_head_size + index) * 0.03125F;
+        }
+    }
+    std::vector<float> one_exp(branch_heads * branch_head_size);
+    adi::detail::grouped_query_online_attention(
+        branch_queries,
+        branch_keys,
+        branch_values,
+        branch_heads,
+        1,
+        branch_head_size,
+        branch_head_size,
+        false,
+        one_exp);
+    std::vector<float> two_exp(one_exp.size());
+    const auto branch_dot = adi::detail::selected_f32_dot_kernel();
+    const float branch_scale =
+        1.0F / std::sqrt(static_cast<float>(branch_head_size));
+    for (std::uint32_t head = 0; head < branch_heads; ++head) {
+        const auto query = std::span<const float>(branch_queries).subspan(
+            static_cast<std::size_t>(head) * branch_head_size,
+            branch_head_size);
+        auto attended = std::span<float>(two_exp).subspan(
+            static_cast<std::size_t>(head) * branch_head_size,
+            branch_head_size);
+        float online_maximum = -std::numeric_limits<float>::infinity();
+        float online_denominator = 0.0F;
+        for (std::uint32_t token = 0; token < branch_tokens; ++token) {
+            const auto key = std::span<const float>(branch_keys).subspan(
+                static_cast<std::size_t>(token) * branch_head_size,
+                branch_head_size);
+            const auto value = std::span<const float>(branch_values).subspan(
+                static_cast<std::size_t>(token) * branch_head_size,
+                branch_head_size);
+            const float score = branch_dot(query, key) * branch_scale;
+            const float next_maximum = std::max(online_maximum, score);
+            const float previous_scale =
+                std::exp(online_maximum - next_maximum);
+            const float weight = std::exp(score - next_maximum);
+            for (std::uint32_t index = 0; index < branch_head_size; ++index) {
+                attended[index] = attended[index] * previous_scale +
+                                  value[index] * weight;
+            }
+            online_denominator =
+                online_denominator * previous_scale + weight;
+            online_maximum = next_maximum;
+        }
+        const float inverse = 1.0F / online_denominator;
+        for (auto &value : attended) {
+            value *= inverse;
+        }
+    }
+    assert(one_exp == two_exp);
 }
