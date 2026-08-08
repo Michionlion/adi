@@ -83,7 +83,7 @@ std::size_t decoder_scratch_bytes(const adi::DecoderScratch &scratch) {
                         vector_bytes(scratch.feed_forward);
     const auto &full = scratch.full_attention;
     bytes += expert_scratch_bytes(full.codec) + vector_bytes(full.query_gate) +
-             vector_bytes(full.contiguous_queries) + vector_bytes(full.key) +
+             vector_bytes(full.key) +
              vector_bytes(full.value) + vector_bytes(full.attended) +
              vector_bytes(full.scores);
     const auto &linear = scratch.linear_attention;

@@ -14,6 +14,8 @@ void grouped_query_online_attention(
     std::uint32_t query_heads,
     std::uint32_t kv_heads,
     std::uint32_t head_size,
+    std::uint32_t query_stride,
+    bool parallel_query_heads,
     std::span<float> output);
 
 } // namespace adi::detail

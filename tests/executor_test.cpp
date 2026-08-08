@@ -64,7 +64,7 @@ int main() {
     constexpr std::uint32_t query_heads = 4;
     constexpr std::uint32_t kv_heads = 2;
     constexpr std::uint32_t head_size = 5;
-    constexpr std::uint32_t tokens = 7;
+    constexpr std::uint32_t tokens = 67;
     std::vector<float> queries(query_heads * head_size);
     std::vector<float> keys(tokens * kv_heads * head_size);
     std::vector<float> values(keys.size());
@@ -83,7 +83,21 @@ int main() {
         query_heads,
         kv_heads,
         head_size,
+        head_size,
+        false,
         online);
+    std::vector<float> parallel_online(queries.size());
+    adi::detail::grouped_query_online_attention(
+        queries,
+        keys,
+        values,
+        query_heads,
+        kv_heads,
+        head_size,
+        head_size,
+        true,
+        parallel_online);
+    assert(parallel_online == online);
 
     std::vector<float> reference(queries.size());
     std::vector<float> scores(tokens);

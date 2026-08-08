@@ -1,12 +1,13 @@
 #include "attention.hpp"
 
+#include "parallel.hpp"
 #include "simd.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
-#include <vector>
 
 namespace adi::detail {
 
@@ -17,13 +18,20 @@ void grouped_query_online_attention(
     std::uint32_t query_heads,
     std::uint32_t kv_heads,
     std::uint32_t head_size,
+    std::uint32_t query_stride,
+    bool parallel_query_heads,
     std::span<float> output) {
+    constexpr std::uint32_t maximum_heads_per_group = 8;
+    constexpr std::size_t minimum_parallel_tokens = 64;
     if (query_heads == 0 || kv_heads == 0 || head_size == 0 ||
+        query_stride < head_size ||
         query_heads % kv_heads != 0 ||
-        queries.size() != static_cast<std::size_t>(query_heads) * head_size ||
+        query_heads / kv_heads > maximum_heads_per_group ||
+        queries.size() !=
+            static_cast<std::size_t>(query_heads) * query_stride ||
         keys.size() != values.size() ||
         keys.size() % (static_cast<std::size_t>(kv_heads) * head_size) != 0 ||
-        output.size() != queries.size()) {
+        output.size() != static_cast<std::size_t>(query_heads) * head_size) {
         throw std::invalid_argument("grouped attention shape mismatch");
     }
     const auto tokens =
@@ -37,61 +45,125 @@ void grouped_query_online_attention(
         1.0F / std::sqrt(static_cast<float>(head_size));
     const auto dot = selected_f32_dot_kernel();
     std::fill(output.begin(), output.end(), 0.0F);
-    std::vector<float> maxima(heads_per_group);
-    std::vector<float> denominators(heads_per_group);
+    const auto attend_heads =
+        [&](std::uint32_t head_begin, std::uint32_t head_end) {
+            std::array<float, maximum_heads_per_group> maxima;
+            std::array<float, maximum_heads_per_group> denominators;
+            for (std::uint32_t kv_head = head_begin;
+                 kv_head < head_end;
+                 ++kv_head) {
+                std::fill_n(
+                    maxima.begin(),
+                    heads_per_group,
+                    -std::numeric_limits<float>::infinity());
+                std::fill_n(
+                    denominators.begin(), heads_per_group, 0.0F);
 
-    for (std::uint32_t kv_head = 0; kv_head < kv_heads; ++kv_head) {
-        std::fill(
-            maxima.begin(),
-            maxima.end(),
-            -std::numeric_limits<float>::infinity());
-        std::fill(denominators.begin(), denominators.end(), 0.0F);
-
-        for (std::size_t token = 0; token < tokens; ++token) {
-            const auto state_offset =
-                (token * kv_heads + kv_head) * head_size;
-            const auto key = keys.subspan(state_offset, head_size);
-            const auto value = values.subspan(state_offset, head_size);
-            for (std::uint32_t group_head = 0;
-                 group_head < heads_per_group;
-                 ++group_head) {
-                const auto query_head =
-                    kv_head * heads_per_group + group_head;
-                const auto query = queries.subspan(
-                    static_cast<std::size_t>(query_head) * head_size,
-                    head_size);
-                const float score = dot(query, key) * score_scale;
-                const float next_maximum =
-                    std::max(maxima[group_head], score);
-                const float previous_scale =
-                    std::exp(maxima[group_head] - next_maximum);
-                const float weight = std::exp(score - next_maximum);
-                auto attended = output.subspan(
-                    static_cast<std::size_t>(query_head) * head_size,
-                    head_size);
-                for (std::uint32_t index = 0; index < head_size; ++index) {
-                    attended[index] =
-                        attended[index] * previous_scale +
-                        value[index] * weight;
+                for (std::size_t token = 0; token < tokens; ++token) {
+                    const auto state_offset =
+                        (token * kv_heads + kv_head) * head_size;
+                    const auto key = keys.subspan(state_offset, head_size);
+                    const auto value =
+                        values.subspan(state_offset, head_size);
+                    for (std::uint32_t group_head = 0;
+                         group_head < heads_per_group;
+                         ++group_head) {
+                        const auto query_head =
+                            kv_head * heads_per_group + group_head;
+                        const auto query = queries.subspan(
+                            static_cast<std::size_t>(query_head) *
+                                query_stride,
+                            head_size);
+                        const float score = dot(query, key) * score_scale;
+                        const float next_maximum =
+                            std::max(maxima[group_head], score);
+                        const float previous_scale =
+                            std::exp(maxima[group_head] - next_maximum);
+                        const float weight =
+                            std::exp(score - next_maximum);
+                        auto attended = output.subspan(
+                            static_cast<std::size_t>(query_head) * head_size,
+                            head_size);
+                        for (std::uint32_t index = 0;
+                             index < head_size;
+                             ++index) {
+                            attended[index] =
+                                attended[index] * previous_scale +
+                                value[index] * weight;
+                        }
+                        denominators[group_head] =
+                            denominators[group_head] * previous_scale +
+                            weight;
+                        maxima[group_head] = next_maximum;
+                    }
                 }
-                denominators[group_head] =
-                    denominators[group_head] * previous_scale + weight;
-                maxima[group_head] = next_maximum;
+                for (std::uint32_t group_head = 0;
+                     group_head < heads_per_group;
+                     ++group_head) {
+                    const auto query_head =
+                        kv_head * heads_per_group + group_head;
+                    auto attended = output.subspan(
+                        static_cast<std::size_t>(query_head) * head_size,
+                        head_size);
+                    const float inverse =
+                        1.0F / denominators[group_head];
+                    for (auto &value : attended) {
+                        value *= inverse;
+                    }
+                }
             }
-        }
-        for (std::uint32_t group_head = 0;
-             group_head < heads_per_group;
-             ++group_head) {
-            const auto query_head =
-                kv_head * heads_per_group + group_head;
-            auto attended = output.subspan(
-                static_cast<std::size_t>(query_head) * head_size,
-                head_size);
-            const float inverse = 1.0F / denominators[group_head];
-            for (auto &value : attended) {
-                value *= inverse;
-            }
-        }
+        };
+    if (parallel_query_heads && tokens >= minimum_parallel_tokens) {
+        parallel_ranges(
+            query_heads,
+            1,
+            [&](std::uint32_t head_begin, std::uint32_t head_end) {
+                for (std::uint32_t query_head = head_begin;
+                     query_head < head_end;
+                     ++query_head) {
+                    const auto kv_head = query_head / heads_per_group;
+                    const auto query = queries.subspan(
+                        static_cast<std::size_t>(query_head) * query_stride,
+                        head_size);
+                    auto attended = output.subspan(
+                        static_cast<std::size_t>(query_head) * head_size,
+                        head_size);
+                    float maximum =
+                        -std::numeric_limits<float>::infinity();
+                    float denominator = 0.0F;
+                    for (std::size_t token = 0; token < tokens; ++token) {
+                        const auto state_offset =
+                            (token * kv_heads + kv_head) * head_size;
+                        const auto key =
+                            keys.subspan(state_offset, head_size);
+                        const auto value =
+                            values.subspan(state_offset, head_size);
+                        const float score = dot(query, key) * score_scale;
+                        const float next_maximum =
+                            std::max(maximum, score);
+                        const float previous_scale =
+                            std::exp(maximum - next_maximum);
+                        const float weight =
+                            std::exp(score - next_maximum);
+                        for (std::uint32_t index = 0;
+                             index < head_size;
+                             ++index) {
+                            attended[index] =
+                                attended[index] * previous_scale +
+                                value[index] * weight;
+                        }
+                        denominator =
+                            denominator * previous_scale + weight;
+                        maximum = next_maximum;
+                    }
+                    const float inverse = 1.0F / denominator;
+                    for (auto &value : attended) {
+                        value *= inverse;
+                    }
+                }
+            });
+    } else {
+        attend_heads(0, kv_heads);
     }
 }
 

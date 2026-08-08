@@ -382,25 +382,15 @@ void full_attention_forward(
     state.keys.insert(state.keys.end(), scratch.key.begin(), scratch.key.end());
     state.values.insert(state.values.end(), scratch.value.begin(), scratch.value.end());
 
-    scratch.contiguous_queries.resize(
-        static_cast<std::size_t>(query_heads) * head_size);
-    for (std::uint32_t query_head = 0;
-         query_head < query_heads;
-         ++query_head) {
-        std::copy_n(
-            scratch.query_gate.begin() +
-                static_cast<std::size_t>(query_head) * query_stride,
-            head_size,
-            scratch.contiguous_queries.begin() +
-                static_cast<std::size_t>(query_head) * head_size);
-    }
     detail::grouped_query_online_attention(
-        scratch.contiguous_queries,
+        scratch.query_gate,
         state.keys,
         state.values,
         query_heads,
         kv_heads,
         head_size,
+        query_stride,
+        true,
         scratch.attended);
     for (std::uint32_t query_head = 0; query_head < query_heads; ++query_head) {
         auto attended = std::span<float>(
@@ -626,22 +616,19 @@ void full_attention_forward_batch(
                 static_cast<std::size_t>(position) * kv_heads * head_size) {
             throw std::invalid_argument("full attention batch state mismatch");
         }
-        scratch.query_gate.assign(
-            batch_scratch.projection_0.begin() +
-                batch_index * query_heads * query_stride,
-            batch_scratch.projection_0.begin() +
-                (batch_index + 1) * query_heads * query_stride);
-        scratch.key.assign(
-            batch_scratch.projection_1.begin() +
-                batch_index * kv_heads * head_size,
-            batch_scratch.projection_1.begin() +
-                (batch_index + 1) * kv_heads * head_size);
-        scratch.value.assign(
-            batch_scratch.projection_2.begin() +
-                batch_index * kv_heads * head_size,
-            batch_scratch.projection_2.begin() +
-                (batch_index + 1) * kv_heads * head_size);
-        scratch.attended.resize(query_heads * head_size);
+        auto query_gate = std::span<float>(batch_scratch.projection_0)
+                              .subspan(
+                                  batch_index * query_heads * query_stride,
+                                  query_heads * query_stride);
+        auto key = std::span<float>(batch_scratch.projection_1)
+                       .subspan(
+                           batch_index * kv_heads * head_size,
+                           kv_heads * head_size);
+        const auto value =
+            std::span<const float>(batch_scratch.projection_2)
+                .subspan(
+                    batch_index * kv_heads * head_size,
+                    kv_heads * head_size);
         if (!rope_cosine.empty()) {
             std::copy_n(
                 rope_cosine.begin() + batch_index * 32,
@@ -656,7 +643,7 @@ void full_attention_forward_batch(
         prepare_rope(model, position, scratch);
         for (std::uint32_t head = 0; head < query_heads; ++head) {
             auto query = std::span<float>(
-                scratch.query_gate.data() +
+                query_gate.data() +
                     static_cast<std::size_t>(head) * query_stride,
                 head_size);
             normalize_head(query, descriptor.query_norm, epsilon);
@@ -664,57 +651,70 @@ void full_attention_forward_batch(
         }
         for (std::uint32_t head = 0; head < kv_heads; ++head) {
             auto key = std::span<float>(
-                scratch.key.data() +
+                batch_scratch.projection_1.data() +
+                    batch_index * kv_heads * head_size +
                     static_cast<std::size_t>(head) * head_size,
                 head_size);
             normalize_head(key, descriptor.key_norm, epsilon);
             apply_rope(key, scratch);
         }
-        state.keys.insert(
-            state.keys.end(),
-            scratch.key.begin(),
-            scratch.key.end());
-        state.values.insert(
-            state.values.end(),
-            scratch.value.begin(),
-            scratch.value.end());
-        scratch.contiguous_queries.resize(query_heads * head_size);
-        for (std::uint32_t query_head = 0;
-             query_head < query_heads;
-             ++query_head) {
-            std::copy_n(
-                scratch.query_gate.begin() +
-                    static_cast<std::size_t>(query_head) * query_stride,
-                head_size,
-                scratch.contiguous_queries.begin() +
-                    static_cast<std::size_t>(query_head) * head_size);
-        }
-        detail::grouped_query_online_attention(
-            scratch.contiguous_queries,
-            state.keys,
-            state.values,
-            query_heads,
-            kv_heads,
-            head_size,
-            scratch.attended);
-        for (std::uint32_t query_head = 0;
-             query_head < query_heads;
-             ++query_head) {
-            const auto gate_offset =
-                static_cast<std::size_t>(query_head) * query_stride +
-                head_size;
-            for (std::uint32_t index = 0; index < head_size; ++index) {
-                scratch.attended[
-                    static_cast<std::size_t>(query_head) * head_size +
-                    index] *= sigmoid(scratch.query_gate[gate_offset + index]);
-            }
-        }
-        std::copy(
-            scratch.attended.begin(),
-            scratch.attended.end(),
-            batch_scratch.projection_3.begin() +
-                batch_index * query_heads * head_size);
+        state.keys.insert(state.keys.end(), key.begin(), key.end());
+        state.values.insert(state.values.end(), value.begin(), value.end());
     }
+
+    // The projections and state updates above must stay in token order, but
+    // each causal query only reads the now-immutable prefix ending at its own
+    // position. Evaluate those prefixes across workers. This also avoids
+    // copying the interleaved [query, gate] projection into a contiguous
+    // query buffer: grouped attention accepts the projection's stride.
+    detail::parallel_dynamic(
+        static_cast<std::uint32_t>(batch),
+        [&](std::uint32_t work_index) {
+            // Causal attention grows with the history. Start with the longest
+            // queries so dynamic scheduling cannot leave one worker holding
+            // the expensive tail after the others finish.
+            const auto batch_index = static_cast<std::uint32_t>(batch) -
+                                     work_index - 1;
+            const auto history =
+                (static_cast<std::size_t>(positions[batch_index]) + 1) *
+                kv_heads * head_size;
+            const auto queries =
+                std::span<const float>(batch_scratch.projection_0)
+                    .subspan(
+                        static_cast<std::size_t>(batch_index) * query_heads *
+                            query_stride,
+                        query_heads * query_stride);
+            auto attended =
+                std::span<float>(batch_scratch.projection_3)
+                    .subspan(
+                        static_cast<std::size_t>(batch_index) * query_heads *
+                            head_size,
+                        query_heads * head_size);
+            const auto &state = *states[batch_index];
+            detail::grouped_query_online_attention(
+                queries,
+                std::span<const float>(state.keys).first(history),
+                std::span<const float>(state.values).first(history),
+                query_heads,
+                kv_heads,
+                head_size,
+                query_stride,
+                batch == 1,
+                attended);
+            for (std::uint32_t query_head = 0;
+                 query_head < query_heads;
+                 ++query_head) {
+                const auto gate_offset =
+                    static_cast<std::size_t>(query_head) * query_stride +
+                    head_size;
+                const auto output_offset =
+                    static_cast<std::size_t>(query_head) * head_size;
+                for (std::uint32_t index = 0; index < head_size; ++index) {
+                    attended[output_offset + index] *=
+                        sigmoid(queries[gate_offset + index]);
+                }
+            }
+        });
     backend.ne_matmul(
         descriptor.output,
         batch_scratch.projection_3,

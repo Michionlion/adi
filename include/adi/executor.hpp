@@ -41,7 +41,6 @@ struct FullAttentionState {
 struct FullAttentionScratch {
     ExpertScratch codec;
     std::vector<float> query_gate;
-    std::vector<float> contiguous_queries;
     std::vector<float> key;
     std::vector<float> value;
     std::vector<float> attended;
