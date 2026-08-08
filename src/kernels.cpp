@@ -400,34 +400,42 @@ void mach_expert_matvec(
     for (std::uint32_t tile_row = 0; tile_row < tile_rows; ++tile_row) {
         float row_sums[tile_size] = {};
         for (std::uint32_t tile_column = 0; tile_column < tile_columns; ++tile_column) {
-            float partial[tile_size] = {};
             const auto tile_index =
                 static_cast<std::size_t>(tile_row) * tile_columns + tile_column;
             const auto *words = matrix.trellis.data() + tile_index * words_per_tile;
-            detail::for_each_expert_state(
+            const float gamma = wave_gamma[wave_indexes[tile_index]];
+            // A row's partial sum is built from zero by the two states that
+            // cover it and then used once, so it never needs to reach memory:
+            // it stays in a register and folds straight into row_sums. The
+            // adds keep their order, sixteen into the partial and then one
+            // scaled add per row per tile column, so the result is unchanged.
+            float partial = 0.0F;
+            detail::for_each_expert_row_state(
                 words,
-                [&](std::uint32_t state_index, std::uint32_t state) {
-                    // State i covers tile elements 8i..8i+7, which is half of
-                    // local row i >> 1: the low half when i is even, the high
-                    // half when it is odd.
-                    const auto local_row = state_index >> 1;
-                    const auto column = tile_column * tile_size +
-                                        ((state_index & 1U) << 3);
+                [&](std::uint32_t local_row,
+                    std::uint32_t step,
+                    std::uint32_t state) {
+                    // Step 0 covers the low half of the row, step 1 the high
+                    // half, eight tile elements each.
+                    if (step == 0) {
+                        partial = 0.0F;
+                    }
+                    const auto column =
+                        tile_column * tile_size + (step << 3);
                     for (std::uint32_t component = 0;
                          component < values_per_state;
                          ++component) {
-                        partial[local_row] +=
+                        partial +=
                             state_values[
                                 static_cast<std::size_t>(state) *
                                     values_per_state +
                                 component] *
                             scratch.input[column + component];
                     }
+                    if (step == detail::expert_states_per_row - 1) {
+                        row_sums[local_row] += partial * gamma;
+                    }
                 });
-            const float gamma = wave_gamma[wave_indexes[tile_index]];
-            for (std::uint32_t row = 0; row < tile_size; ++row) {
-                row_sums[row] += partial[row] * gamma;
-            }
         }
         std::copy_n(row_sums, tile_size, scratch.output.begin() + tile_row * tile_size);
     }

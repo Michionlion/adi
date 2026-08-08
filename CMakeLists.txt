@@ -140,6 +140,11 @@ if(ADI_BUILD_TESTS)
     target_include_directories(adi_ne_trellis_test PRIVATE src)
     add_test(NAME ne_trellis COMMAND adi_ne_trellis_test)
 
+    add_executable(adi_expert_trellis_test tests/expert_trellis_test.cpp)
+    target_link_libraries(adi_expert_trellis_test PRIVATE adi_runtime)
+    target_include_directories(adi_expert_trellis_test PRIVATE src)
+    add_test(NAME expert_trellis COMMAND adi_expert_trellis_test)
+
     add_executable(adi_ne_batch_test tests/ne_batch_test.cpp)
     target_link_libraries(adi_ne_batch_test PRIVATE adi_runtime)
     target_include_directories(adi_ne_batch_test PRIVATE src)
@@ -247,6 +252,7 @@ if(ADI_BUILD_TESTS)
             adi_int5_batch_test
             adi_parallel_test
             adi_ne_trellis_test
+            adi_expert_trellis_test
             adi_ne_batch_test
             adi_expert_batch_test
             adi_codec_cache_test
