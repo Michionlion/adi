@@ -122,9 +122,10 @@ checksum `0xc75f92166aad6875`.
 
 ### Microbatch sweep
 
-Superseded by the sweep under "Expert dispatch scheduling" below: splitting
-expert work into twelve-row chunks inverted this curve. The table records what
-this increment measured, not the current default.
+Superseded twice, by "Expert dispatch scheduling" and then by "Expert codec
+batch lanes" below. Both of the reasons this curve peaked at sixteen have since
+been removed, so the table records what this increment measured, not the
+current default.
 
 A 256-token prompt. Peak scratch is the summed capacity of every prefill
 scratch buffer after the run.
@@ -251,11 +252,144 @@ before and after that change:
 | tokens/s, twelve-row chunks | 6.31 | 7.70 | 8.40 |
 | peak scratch (MB) | 8.0 | 16.0 | 31.8 |
 
-`ExecutionOptions::prefill_ubatch` moves from 16 to 64, which is 33% more
-prompt throughput for 31.8 MB of prefill scratch against 8.0 MB. Callers who
-want the smaller footprint set `--ubatch 16`; the choice never changes what a
-request returns.
+`ExecutionOptions::prefill_ubatch` moved from 16 to 64 on this measurement,
+which was 33% more prompt throughput for 31.8 MB of prefill scratch against
+8.0 MB. It moves again in the next section, once the expert codec stops
+penalizing a wide microbatch at all.
 
-This is interim. `mach_expert_matmul` is still a scalar batch loop, so the
-sweep above stops at 64 and the full range including 128 and beyond is measured
-after that kernel gains a batch-lane path.
+## Expert codec batch lanes
+
+Measured on 2026-08-07, same machine and build as the sections above: a
+Release build, GCC 14.2, eight EPYC 9645 cores one thread per core, AVX-512
+selected, and the model warm in the page cache. Every figure is the median of
+seven runs, with the spread given where it decides anything.
+
+`mach_expert_matmul` was the last scalar batch loop in the prefill. It decoded
+a packed weight and then walked the batch dimension one multiply-add at a time,
+reading `scratch.input[batch_index * columns + column]` column-major over a
+row-major array, so its cost per row was U-shaped: 1.51, 0.66, 0.55, 0.72,
+1.15, and 1.88 ms per row at 2, 8, 12, 16, 32, and 64 rows. The runtime worked
+around that by capping expert tasks at twelve rows.
+
+It now gets the treatment `ne_batch` already gave the K=4/V=2 non-expert
+codec. Inputs pack to `[block][column][lane]`, each decoded weight broadcasts
+across 8 (AVX2) or 16 (AVX-512) independent batch items, and only the batch
+dimension is vectorized, never the reduction.
+
+### What each change is worth
+
+A 64-token prompt at microbatch 64, so every row is like-for-like. Kernel
+columns are the wall time attributed to that kernel across the whole prefill.
+
+| Stage | tokens/s | expert matvec | expert batch |
+| --- | ---: | ---: | ---: |
+| Before | 8.896 | 7.00 s | 39.34 s |
+| Shared trellis walk | 9.653 | 2.84 s | 39.3 s |
+| Expert batch lanes | 27.552 | 2.84 s | 7.06 s |
+| Task cap at 32 rows | 29.843 | | |
+
+Run-to-run spread was within ±1.6% on every row, so each step is far outside
+it.
+
+This is two separable changes and they are credited separately. Sharing one
+trellis walk between `mach_expert_matvec` and `mach_expert_matmul` inlines the
+twelve-bit window extraction over compile-time constants and replaces a
+per-element division and modulo with a shift. That is worth 8.5% by itself,
+and it lands on the single-vector kernel, which has no SIMD path and still
+runs 4002 of the calls in a prefill. The batch lanes are worth 2.85x on top.
+
+The expert kernel gains less than the non-expert kernel's 39x because this
+codec has more per-state work to amortize: eight values per state against two,
+wave indexes, a per-tile gamma, and a 2 MB state-value table rather than
+512 KB.
+
+### Expert kernel cost per row
+
+Serial, one thread, the 512x2048 gate projection, which is the cost a single
+`parallel_dynamic` task sees:
+
+| rows | 1 | 2 | 4 | 8 | 12 | 16 | 32 | 64 | 128 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ms/call | 0.75 | 0.70 | 0.68 | 0.75 | 0.75 | 0.80 | 1.27 | 2.76 | 5.18 |
+| ms/row | 0.753 | 0.351 | 0.171 | 0.094 | 0.063 | 0.050 | 0.040 | 0.043 | 0.041 |
+
+The U-shape is gone. A call costs about the same for any batch that fits one
+SIMD block, so cost per row falls monotonically and splitting an expert is now
+pure overhead beyond what load balance needs. `expert_rows_per_task` moves
+from 12 to 32, two full blocks: 28.0 tokens/second at twelve, 29.2 at sixteen,
+29.8 at thirty-two, 27.8 at sixty-four, and 28.3 with no cap at all. Past two
+blocks the dispatch runs out of tasks to balance across eight workers.
+
+Row 1 is `mach_expert_matvec`, which single-row experts still use and which
+accounts for 4002 of the calls in a prefill. Routing them through the lane
+kernel instead measured 29.783 against 29.388 tokens/second, inside the
+run-to-run spread, so the simpler path stays. A single row has nothing to
+vectorize across; the lane kernel would fill one lane of sixteen.
+
+### Microbatch sweep, re-measured
+
+The expert codec was the reason a wide microbatch lost. With that gone,
+throughput is monotonic in the microbatch at both prompt lengths.
+
+A 256-token prompt:
+
+| Microbatch | 16 | 32 | 64 | 128 | 256 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| tokens/s | 18.16 | 23.85 | 29.05 | 33.28 | 37.14 |
+| peak scratch (MB) | 8.0 | 15.9 | 31.8 | 63.5 | 126.9 |
+
+A 1024-token prompt, which is what decides the default now that there is no
+falloff to find:
+
+| Microbatch | 64 | 128 | 256 | 512 | 1024 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| tokens/s | 25.57 | 29.33 | 32.43 | 34.67 | 36.06 |
+| peak scratch (MB) | 31.8 | 63.5 | 126.9 | 253.6 | 507.2 |
+| gain over previous | | +14.7% | +10.5% | +6.9% | +4.0% |
+
+Every point is on the Pareto front, so the default is an exchange rate rather
+than an optimum. Scratch doubles at every step while the gain shrinks, and 128
+is the last step that buys more than 10%. `ExecutionOptions::prefill_ubatch`
+moves from 64 to 128: 14.7% more prompt throughput for 63.5 MB of prefill
+scratch against 31.8 MB.
+
+Scratch is allocated for the microbatch actually used, which is the smaller of
+the setting and the prompt length. A 64-token prompt costs 31.8 MB at
+`--ubatch 512` exactly as it does at `--ubatch 64`, so only a caller sending
+long prompts pays for a large value. On a machine with memory to spare and
+long prompts to run, 256 or 512 is a reasonable `--ubatch`.
+
+### Decode
+
+`adi decode-batch`, sequences/second, medians of seven runs. Spread here is
+much wider than in prefill, roughly ±10% and up to ±16% at batch 1, so treat
+the smaller differences as ties.
+
+| Batch | 1 | 4 | 8 | 16 | 32 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Before | 1.97 | 4.83 | 6.16 | 6.29 | 7.45 |
+| After | 2.96 | 8.82 | 12.83 | 17.13 | 18.82 |
+
+Batch 1 gains 50% without touching a batch kernel at all: single-sequence
+decode routes through `moe_forward` and `mach_expert_matvec`, so what it picks
+up is the shared trellis walk. Everything above batch 1 gains from the lanes
+as well, and the curve no longer flattens after batch 16.
+
+### Exactness
+
+Bit-exact, not tolerance-bounded:
+
+- the 64-token prefill keeps logits checksum `0x8c24a3f4644e03d3` and state
+  checksum `0xc75f92166aad6875` through every change above;
+- the 256-token prefill keeps `0x35a5f9bc4d1133d2` and `0xd3861b9b0d49fdd`,
+  and the 1024-token prefill keeps `0xf53711345a669617` and
+  `0x17a85ab867215ab`, at every microbatch in the sweeps;
+- the SIMD batch kernel equals the scalar kernel at batches {1, 2, 3, 4, 5, 7,
+  8, 15, 16, 17, 33, 64, 127} on three matrix shapes under both AVX2 and
+  AVX-512, and each batch row equals the single-vector kernel;
+- both ISA translation units compile with FP contraction disabled and contain
+  no FMA instruction, so every lane performs the same scalar accumulation
+  sequence, in the same order, as the scalar reference;
+- the scalar loop is retained as `expert_accumulate_tiles_scalar` and runs on
+  ISAs without a batch kernel;
+- the full suite passes under `ADI_CPU_ISA` of scalar, avx2, and avx512.

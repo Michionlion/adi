@@ -88,20 +88,22 @@ build/adi bench-prefill MODEL.gguf 256 16
 `--ubatch` sets how many prompt tokens share one packed-weight decode pass.
 It is a throughput and scratch-memory choice only: every microbatch produces
 identical logits and identical state, so it never changes what a request
-returns. The default is 64, chosen by measurement on eight EPYC 9645 cores; a
-smaller value trades prompt throughput for prefill scratch, and a machine with
-a different cache or core count may prefer one. See
+returns. Prompt throughput rises with it and so does prefill scratch, which
+doubles at every step while the gain shrinks; the default of 128 is where that
+stops paying for itself. Scratch is allocated for the microbatch actually
+used, so short prompts cost the same whatever it is set to. Raise it to 256 or
+512 on a machine with memory to spare and long prompts to run. See
 [`docs/benchmarks.md`](docs/benchmarks.md).
 
 ```bash
-build/adi generate MODEL.gguf "prompt" 64 --ubatch 64
+build/adi generate MODEL.gguf "prompt" 64 --ubatch 128
 ```
 
 Start the Responses API:
 
 ```bash
 ./build/adi serve --model models/Mach-1-Additive-35B.gguf \
-  --host 127.0.0.1 --port 9932 --ubatch 64
+  --host 127.0.0.1 --port 9932 --ubatch 128
 ```
 
 On Windows:
