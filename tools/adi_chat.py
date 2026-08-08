@@ -29,7 +29,7 @@ from typing import Any, Callable, Optional
 try:
     import httpx
     import typer
-    from rich.console import Console
+    from rich.console import Console, Group
     from rich.live import Live
     from rich.table import Table
     from rich.text import Text
@@ -61,7 +61,11 @@ console = Console()
 THINK_OPEN_TAG = "<think>"
 THINK_CLOSE_TAG = "</think>"
 THINK_SUFFIX_GUARD = max(len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG)) - 1
-DIM_REASONING_STYLE = "dim"
+DIM_REASONING_STYLE = "dim italic"
+REASONING_GUTTER_STYLE = "bold cyan"
+REASONING_LABEL_STYLE = "bold white on #374151"
+ANSWER_LABEL_STYLE = "bold white on #0f766e"
+STATUS_BAR_STYLE = "bold white on #334155"
 READLINE_PROMPT = "\x01\x1b[32m\x02user\x01\x1b[0m\x02 > "
 RATE_WINDOW_SECONDS = 5.0
 
@@ -660,11 +664,15 @@ def parse_response_object(body: dict[str, Any]) -> ResponseResult:
 
 
 class ReasoningRenderer:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        emit: Optional[Callable[[str, bool], None]] = None,
+    ) -> None:
         # ADI prompts assistant responses from "<think>\\n", so the first streamed
         # characters are reasoning content unless a prior close token is received.
         self.in_reasoning = True
         self.pending = ""
+        self.emit = emit
 
     def feed(self, text: str, *, final: bool = False) -> None:
         buffered = self.pending + text
@@ -709,6 +717,9 @@ class ReasoningRenderer:
 
     def _print(self, text: str) -> None:
         if text:
+            if self.emit is not None:
+                self.emit(text, False)
+                return
             console.print(
                 text,
                 end="",
@@ -719,6 +730,9 @@ class ReasoningRenderer:
 
     def _print_dim(self, text: str) -> None:
         if text:
+            if self.emit is not None:
+                self.emit(text, True)
+                return
             console.print(
                 text,
                 end="",
@@ -823,10 +837,10 @@ class StreamingStatus:
 
     def __rich__(self) -> Text:
         if self.metrics.first_token_at is None:
-            message = f"Prefilling  •  {self.metrics.elapsed():.1f}s elapsed"
+            message = f"PREFILLING  •  {self.metrics.elapsed():.1f}s elapsed"
         else:
             tokens = self.metrics.streamed_tokens
-            parts = [plural(tokens, "token")]
+            parts = ["GENERATING", plural(tokens, "token")]
             current_rate = self.metrics.current_tokens_per_second()
             if current_rate is None:
                 parts.append("measuring rate…")
@@ -839,7 +853,85 @@ class StreamingStatus:
                 parts.append(f"{average_rate:.2f} tok/s avg")
             parts.append(f"{self.metrics.elapsed():.1f}s elapsed")
             message = "  •  ".join(parts)
-        return Text(message, style="dim")
+        return Text(
+            f"  {message}  ",
+            style=STATUS_BAR_STYLE,
+            justify="left",
+            overflow="ellipsis",
+            no_wrap=True,
+        )
+
+
+class StreamingDisplay:
+    """Own the incomplete response line and status as one Rich live region."""
+
+    def __init__(self, metrics: TurnMetrics) -> None:
+        self.metrics = metrics
+        self.partial_line = Text()
+        self.partial_reasoning: Optional[bool] = None
+        self.reasoning_started = False
+        self.answer_started = False
+
+    def __rich__(self) -> Group:
+        return Group(
+            self.partial_line,
+            Text(""),
+            StreamingStatus(self.metrics).__rich__(),
+        )
+
+    def _start_phase(self, reasoning: bool) -> None:
+        if reasoning:
+            if not self.reasoning_started:
+                console.print(Text("  REASONING  ", style=REASONING_LABEL_STYLE))
+                self.reasoning_started = True
+            return
+        if self.answer_started:
+            return
+        if self.reasoning_started:
+            console.print()
+        console.print(Text("  ANSWER  ", style=ANSWER_LABEL_STYLE))
+        self.answer_started = True
+
+    def _start_line(self, reasoning: bool) -> None:
+        self._start_phase(reasoning)
+        self.partial_reasoning = reasoning
+        if reasoning:
+            self.partial_line.append("  │ ", style=REASONING_GUTTER_STYLE)
+
+    def _commit_line(self) -> None:
+        console.print(self.partial_line, highlight=False, soft_wrap=True)
+        self.partial_line = Text()
+        self.partial_reasoning = None
+
+    def write(self, text: str, reasoning: bool) -> None:
+        style = DIM_REASONING_STYLE if reasoning else None
+        while text:
+            newline = text.find("\n")
+            segment = text if newline == -1 else text[:newline]
+            if segment:
+                if self.partial_reasoning is None:
+                    self._start_line(reasoning)
+                elif self.partial_reasoning != reasoning:
+                    self._commit_line()
+                    self._start_line(reasoning)
+                self.partial_line.append(segment, style=style)
+            if newline == -1:
+                return
+            if self.partial_reasoning is None and reasoning:
+                self._start_line(True)
+            self._commit_line()
+            text = text[newline + 1 :]
+
+    def finish(self) -> None:
+        if self.partial_line:
+            console.print(
+                self.partial_line,
+                end="",
+                highlight=False,
+                soft_wrap=True,
+            )
+            self.partial_line = Text()
+            self.partial_reasoning = None
 
 
 def plural(count: int, noun: str) -> str:
@@ -1080,8 +1172,12 @@ def send_turn(
     totals: UsageTotals,
 ) -> ResponseResult:
     console.print("[bold cyan]assistant[/bold cyan]")
-    renderer = ReasoningRenderer()
     metrics = TurnMetrics()
+    show_live_status = stream and bool(getattr(console, "is_terminal", False))
+    streaming_display = StreamingDisplay(metrics) if show_live_status else None
+    renderer = ReasoningRenderer(
+        streaming_display.write if streaming_display is not None else None
+    )
     printed_delta = False
 
     def on_delta(delta: str) -> None:
@@ -1091,10 +1187,9 @@ def send_turn(
         printed_delta = printed_delta or bool(delta)
         renderer.feed(delta)
 
-    show_live_status = stream and bool(getattr(console, "is_terminal", False))
     live_context = (
         Live(
-            StreamingStatus(metrics),
+            streaming_display,
             console=console,
             refresh_per_second=4,
             transient=True,
@@ -1111,16 +1206,34 @@ def send_turn(
                 on_delta=on_delta,
             )
             metrics.finish()
+            if streaming_display is not None:
+                if not printed_delta and result.text:
+                    renderer.feed(result.text, final=True)
+                else:
+                    renderer.feed("", final=True)
     except KeyboardInterrupt:
+        if streaming_display is not None:
+            renderer.feed("", final=True)
+            streaming_display.finish()
         if printed_delta:
             console.print()
         console.print("[yellow]Generation interrupted; the turn was not saved.[/yellow]")
         raise
-    if stream:
-        if not printed_delta and result.text:
-            renderer.feed(result.text, final=True)
-        else:
+    except ClientError:
+        if streaming_display is not None:
             renderer.feed("", final=True)
+            streaming_display.finish()
+        if printed_delta:
+            console.print()
+        raise
+    if stream:
+        if streaming_display is not None:
+            streaming_display.finish()
+        else:
+            if not printed_delta and result.text:
+                renderer.feed(result.text, final=True)
+            else:
+                renderer.feed("", final=True)
         console.print()
     else:
         renderer.feed(result.text, final=True)

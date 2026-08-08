@@ -57,6 +57,12 @@ def install_dependency_stubs() -> None:
     rich.__path__ = []  # type: ignore[attr-defined]
     rich_console = types.ModuleType("rich.console")
     rich_console.Console = StubConsole  # type: ignore[attr-defined]
+
+    class Group:
+        def __init__(self, *renderables: object) -> None:
+            self.renderables = renderables
+
+    rich_console.Group = Group  # type: ignore[attr-defined]
     rich_live = types.ModuleType("rich.live")
 
     class Live:
@@ -86,8 +92,14 @@ def install_dependency_stubs() -> None:
     rich_text = types.ModuleType("rich.text")
 
     class Text:
-        def __init__(self, value: str, *_: object, **__: object) -> None:
+        def __init__(self, value: str = "", *_: object, **__: object) -> None:
             self.value = value
+
+        def append(self, value: str, *_: object, **__: object) -> None:
+            self.value += value
+
+        def __bool__(self) -> bool:
+            return bool(self.value)
 
         def __str__(self) -> str:
             return self.value
@@ -227,6 +239,73 @@ class AdiChatTests(unittest.TestCase):
         metrics.finish(22.0)
         self.assertEqual(metrics.elapsed(), 12.0)
         self.assertEqual(metrics.decode_tokens_per_second(5), 0.4)
+
+    def test_streaming_display_commits_only_complete_lines(self) -> None:
+        console = StubConsole()
+        adi_chat.console = console
+        display = adi_chat.StreamingDisplay(adi_chat.TurnMetrics(started_at=0.0))
+
+        display.write("one", True)
+        display.write(" two", True)
+        self.assertEqual(
+            [text for text, _ in console.output],
+            ["  REASONING  "],
+        )
+
+        display.write("\nthree", False)
+        self.assertEqual(
+            [text for text, _ in console.output],
+            ["  REASONING  ", "  │ one two", "", "  ANSWER  "],
+        )
+        display.write(" four", False)
+        self.assertEqual(len(console.output), 4)
+
+        display.finish()
+        self.assertEqual(
+            [text for text, _ in console.output],
+            [
+                "  REASONING  ",
+                "  │ one two",
+                "",
+                "  ANSWER  ",
+                "three four",
+            ],
+        )
+
+    def test_tty_stream_does_not_print_token_fragments_as_lines(self) -> None:
+        class FakeClient:
+            def create(self, messages, settings, *, stream, on_delta):
+                del messages, settings, stream
+                for delta in ("thin", "king</think>", "an", "swer"):
+                    on_delta(delta)
+                return adi_chat.ResponseResult(
+                    text="thinking</think>answer",
+                    input_tokens=7,
+                    output_tokens=4,
+                    total_tokens=11,
+                )
+
+        console = StubConsole()
+        console.is_terminal = True
+        adi_chat.console = console
+        adi_chat.send_turn(
+            FakeClient(),
+            adi_chat.Conversation(),
+            adi_chat.GenerationSettings(None, 0.7, 0.9, 0),
+            "hello",
+            stream=True,
+            totals=adi_chat.UsageTotals(),
+        )
+
+        printed = [text for text, _ in console.output]
+        self.assertIn("  REASONING  ", printed)
+        self.assertIn("  │ thinking", printed)
+        self.assertIn("  ANSWER  ", printed)
+        self.assertIn("answer", printed)
+        self.assertNotIn("thin", printed)
+        self.assertNotIn("king", printed)
+        self.assertNotIn("an", printed)
+        self.assertNotIn("swer", printed)
 
     def test_incomplete_reason_describes_output_limit(self) -> None:
         result = adi_chat.ResponseResult(
