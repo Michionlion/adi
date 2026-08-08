@@ -720,6 +720,30 @@ Across all three changes a batch-1 step went 0.3682 s to about 0.2100 s,
 **1.75x**, and 2.72 to 4.8 tokens/second. MoE was the largest stage after the
 non-expert work and is second again behind it.
 
+### The twelve-bit stride
+
+The twelve is not a tunable. It is K*V for this codec, `adi.expert.k_num` 3
+over `adi.expert.k_den` 2 times `adi.expert.v` 8, and the loader rejects any
+other value, so changing it changes what the packed weights decode to rather
+than how fast they decode.
+
+The stride the reader uses is a choice, though. A 12-bit stride against 16-bit
+words realigns every 48 bits, so four states span exactly three words and
+their offsets within a group are always 0, 12, 24 and 36. One 64-bit
+big-endian assembly of four words then yields all four states by fixed shifts,
+halving the word loads from eight per four states to four. That was built and
+is bit-exact, and it is 13% slower: 0.5006 ms against 0.4444 on
+`bench-expert`, minima 0.4951 against 0.4302, so not noise.
+
+The reason is that state extraction is not what this kernel loads. Every state
+drives eight components, each of which loads a value and an input, so a state
+costs about eighteen loads and only two of them fetch the stream. Halving
+those two caps the win near 6% before the 64-bit assembly's own shifts and
+its serial chain of ors are paid for, and they cost more than that. The
+non-expert kernel is the opposite case -- two of its four loads per state are
+the value lookup -- which is why load-shaped reasoning transfers between these
+two kernels badly. It is reverted.
+
 ### Re-measuring the thresholds against the faster kernels
 
 Every tuned constant on this path was set against single-vector kernels that
