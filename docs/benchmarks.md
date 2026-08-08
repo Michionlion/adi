@@ -467,10 +467,9 @@ is what costs. `adi bench-linear MODEL 0 1`, one layer, one token:
 
 The gated-delta recurrence is not the problem. `mach_ne_matvec` is. Its
 `KernelTimer` runs on the calling thread and wraps its own `parallel_ranges`,
-so its 243.4 ms across 250 calls is directly comparable to the 370 ms token:
-**two thirds of a batch-1 decode step is the single-vector non-expert
-kernel**, and it moves 6.4 million weight elements per millisecond because
-its accumulation is scalar per element.
+so its total across 250 calls is directly comparable to the step: 188 ms of a
+332 ms token, or **57% of a batch-1 decode step**. It moves 6.4 million weight
+elements per millisecond because its accumulation is scalar per element.
 
 It has no SIMD path because the obvious axis is illegal: the eight states of
 a tile row accumulate into one scalar, and reassociating that reduction would
@@ -482,10 +481,42 @@ rows are sixteen independent accumulators, which is exactly one AVX-512
 register: broadcast the two input scalars, gather the sixteen weight pairs,
 and each lane performs its row's adds in the scalar kernel's order.
 
-That is the same bargain the batch kernels struck, on a different axis, and
-it is bit-exactly reachable. It is not a small change -- it needs a gather
-per step against the 512 KB state table -- and its ceiling is set by trellis
-streaming rather than arithmetic, so it wants a prototype before a promise.
+That kernel was built and measured. It is bit-exact -- the whole suite passes
+under it on both AVX2 and AVX-512, including the existing check that every
+batch row of the SIMD matmul equals the single-vector kernel -- and it is not
+faster. One linear-attention layer went from 5.228 to 5.195 ms, and the
+non-expert total over a decode step from 188.3 to 184.7 ms. It is reverted.
+
+The reason is the gather. Sixteen rows need sixteen different weight pairs
+drawn from sixteen different states, so each step needs
+`vgatherdps`, and a tile gathers 256 elements -- exactly the 256 values the
+scalar path loads. Gather throughput on this core is about one element per
+cycle, against two scalar loads per cycle, so vectorizing the arithmetic
+removes work that was never the constraint. Shrinking the state table would
+not change it either: the table is a single shared 512 KB array, not one per
+matrix, and the cost is the instruction rather than the miss.
+
+Hoisting the trellis walk out of the arithmetic was also tried, on the theory
+that the walk's serial chain was blocking the state-table loads. It is worse:
+2.687 against 3.003 sequences/second, and the non-expert total rises from 188
+to 226 ms. Staging 128 states through a 256-byte array costs more than the
+dependency it breaks.
+
+Both results are worth knowing before anyone tries again. What would change
+the picture is a lookup that is not a gather -- fewer, wider loads, or a
+representation whose weights are computed rather than looked up.
+
+### Measuring batch-1 decode
+
+Batch-1 decode is far noisier than prefill and noisier than the rest of
+decode. Twenty-one runs of the same binary give a median of 2.770
+sequences/second with a spread of -14.5% to +7.3%, and separate sessions of
+*identical* code have produced medians of 2.66, 2.77, 2.91 and 3.00.
+
+Anything below about 15% is therefore not resolvable end to end at batch 1,
+which is what made the row-kernel A/B inconclusive until it was measured at
+the kernel instead. Use `adi bench-linear` and the `non_expert` counter, not
+`decode-batch`, to judge a change aimed at this path.
 
 ### Exactness
 
