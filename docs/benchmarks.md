@@ -925,11 +925,11 @@ baseline to medians of 3.41 ms and 1.64 ms respectively. The extra live
 accumulators and trellis streams cost more than sharing the transformed input
 loads saves.
 
-Pairing the two query heads already assigned to each long-context attention
-worker is not retained either. It reused each key/value span while preserving
-each head's token-order arithmetic, but attention work excluding projections
-rose from a 703 ms median to 888 ms over the 2,048-token benchmark. The
-existing one-head-at-a-time loop has the better compiler schedule.
+Pairing the two query heads assigned to each attention worker throughout the
+2,048-token benchmark is not retained. It reused each key/value span while
+preserving each head's token-order arithmetic, but attention work excluding
+projections rose from a 703 ms median to 888 ms. This measurement establishes
+the lower bound for the long-context threshold described below.
 
 ## One-exponential online softmax
 
@@ -1050,3 +1050,26 @@ also a 7.2% reduction. Final-logit and complete-state checksums match at both
 widths. The direct equivalence test starts with nonzero convolution and
 recurrent state and compares token-at-a-time execution bit-for-bit for chunks
 of 1, 2, 7, 16, 64, and 65 tokens.
+
+## Paired query heads above 4K context
+
+Measured on 2026-08-08 on the same eight-core EPYC 9645 VM and Release build.
+Once a query reaches 4,096 cached tokens, each worker advances its two
+adjacent query heads together. The heads share a KV stream, so this halves
+that worker's key/value reads while retaining the token-order arithmetic and
+online-softmax state of each head independently. Shorter histories keep the
+faster one-head compiler schedule documented above.
+
+| 8,192-position full-attention layer | before | after | change |
+| --- | ---: | ---: | ---: |
+| milliseconds/token | 3.637 | 3.389 | -6.8% |
+| attention excluding packed projections | 15.67 s | 13.93 s | -11.1% |
+
+These are medians of three interleaved pairs, all with output checksum
+`4.41082`. The benchmark grows the KV history from 1 to 8,192 positions, so
+only its latter half uses the paired path. A direct test crosses the 4,096-
+token threshold with the production 16-query/2-KV head grouping and compares
+parallel paired execution bit-for-bit with the serial grouped reference.
+This is an 8K proxy, not a measured 32K result; the increasingly large shared
+KV stream makes the direction promising, but extrapolation beyond 8K remains
+unverified on this machine.

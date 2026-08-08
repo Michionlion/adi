@@ -49,6 +49,7 @@ void grouped_query_online_attention(
     std::span<float> output) {
     constexpr std::uint32_t maximum_heads_per_group = 8;
     constexpr std::size_t minimum_parallel_tokens = 64;
+    constexpr std::size_t minimum_paired_tokens = 4096;
     if (query_heads == 0 || kv_heads == 0 || head_size == 0 ||
         query_stride < head_size ||
         query_heads % kv_heads != 0 ||
@@ -127,15 +128,18 @@ void grouped_query_online_attention(
                     }
                 }
             }
-        };
+    };
     if (parallel_query_heads && tokens >= minimum_parallel_tokens) {
+        // At long context, keep adjacent query heads on one worker so the
+        // paired path can consume their shared KV stream once.
+        const auto minimum_heads_per_worker =
+            tokens >= minimum_paired_tokens ? 2U : 1U;
         parallel_ranges(
             query_heads,
-            1,
+            minimum_heads_per_worker,
             [&](std::uint32_t head_begin, std::uint32_t head_end) {
                 for (std::uint32_t query_head = head_begin;
-                     query_head < head_end;
-                     ++query_head) {
+                     query_head < head_end;) {
                     const auto kv_head = query_head / heads_per_group;
                     const auto query = queries.subspan(
                         static_cast<std::size_t>(query_head) * query_stride,
@@ -143,6 +147,56 @@ void grouped_query_online_attention(
                     auto attended = output.subspan(
                         static_cast<std::size_t>(query_head) * head_size,
                         head_size);
+                    const bool pair =
+                        tokens >= minimum_paired_tokens &&
+                        query_head + 1 < head_end &&
+                        (query_head + 1) / heads_per_group == kv_head;
+                    if (pair) {
+                        const auto next_query = queries.subspan(
+                            static_cast<std::size_t>(query_head + 1) *
+                                query_stride,
+                            head_size);
+                        auto next_attended = output.subspan(
+                            static_cast<std::size_t>(query_head + 1) *
+                                head_size,
+                            head_size);
+                        float maximum =
+                            -std::numeric_limits<float>::infinity();
+                        float next_maximum = maximum;
+                        float denominator = 0.0F;
+                        float next_denominator = 0.0F;
+                        for (std::size_t token = 0; token < tokens; ++token) {
+                            const auto state_offset =
+                                (token * kv_heads + kv_head) * head_size;
+                            const auto key =
+                                keys.subspan(state_offset, head_size);
+                            const auto value =
+                                values.subspan(state_offset, head_size);
+                            update_online_softmax(
+                                dot(query, key) * score_scale,
+                                value,
+                                maximum,
+                                denominator,
+                                attended);
+                            update_online_softmax(
+                                dot(next_query, key) * score_scale,
+                                value,
+                                next_maximum,
+                                next_denominator,
+                                next_attended);
+                        }
+                        const float inverse = 1.0F / denominator;
+                        const float next_inverse =
+                            1.0F / next_denominator;
+                        for (std::size_t index = 0;
+                             index < attended.size();
+                             ++index) {
+                            attended[index] *= inverse;
+                            next_attended[index] *= next_inverse;
+                        }
+                        query_head += 2;
+                        continue;
+                    }
                     float maximum =
                         -std::numeric_limits<float>::infinity();
                     float denominator = 0.0F;
@@ -165,6 +219,7 @@ void grouped_query_online_attention(
                     for (auto &value : attended) {
                         value *= inverse;
                     }
+                    ++query_head;
                 }
             });
     } else {

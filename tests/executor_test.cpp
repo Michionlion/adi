@@ -101,6 +101,53 @@ int main() {
         parallel_online);
     assert(parallel_online == online);
 
+    // Cross the paired-head threshold with the production head grouping.
+    // The serial grouped loop is the bit-exact reference for each head.
+    constexpr std::uint32_t paired_query_heads = 16;
+    constexpr std::uint32_t paired_kv_heads = 2;
+    constexpr std::uint32_t paired_head_size = 7;
+    constexpr std::uint32_t paired_stride = 9;
+    constexpr std::uint32_t paired_tokens = 4096;
+    std::vector<float> paired_queries(
+        paired_query_heads * paired_stride);
+    std::vector<float> paired_keys(
+        paired_tokens * paired_kv_heads * paired_head_size);
+    std::vector<float> paired_values(paired_keys.size());
+    for (std::size_t index = 0; index < paired_queries.size(); ++index) {
+        paired_queries[index] =
+            std::sin(static_cast<float>(index) * 0.03125F);
+    }
+    for (std::size_t index = 0; index < paired_keys.size(); ++index) {
+        paired_keys[index] =
+            std::cos(static_cast<float>(index) * 0.0078125F);
+        paired_values[index] =
+            std::sin(static_cast<float>(index) * 0.00390625F);
+    }
+    std::vector<float> paired_reference(
+        paired_query_heads * paired_head_size);
+    adi::detail::grouped_query_online_attention(
+        paired_queries,
+        paired_keys,
+        paired_values,
+        paired_query_heads,
+        paired_kv_heads,
+        paired_head_size,
+        paired_stride,
+        false,
+        paired_reference);
+    std::vector<float> paired_output(paired_reference.size());
+    adi::detail::grouped_query_online_attention(
+        paired_queries,
+        paired_keys,
+        paired_values,
+        paired_query_heads,
+        paired_kv_heads,
+        paired_head_size,
+        paired_stride,
+        true,
+        paired_output);
+    assert(paired_output == paired_reference);
+
     std::vector<float> reference(queries.size());
     std::vector<float> scores(tokens);
     const float scale = 1.0F / std::sqrt(static_cast<float>(head_size));
