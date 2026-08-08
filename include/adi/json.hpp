@@ -34,5 +34,6 @@ class Json {
 
 [[nodiscard]] Json parse_json(std::string_view input);
 [[nodiscard]] std::string json_string(std::string_view input);
+[[nodiscard]] std::string json_dump(const Json &value);
 
 } // namespace adi

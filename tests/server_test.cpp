@@ -1,6 +1,7 @@
 #include "adi/json.hpp"
 #include "adi/server.hpp"
 #include "server_internal.hpp"
+#include "tool_call.hpp"
 
 #include <cassert>
 #include <chrono>
@@ -144,6 +145,32 @@ int main() {
     const auto completed_response = adi::parse_json(
         adi::server_detail::response_json("model", completed, identity));
     assert(completed_response.find("incomplete_details")->is_null());
+
+    const adi::ParsedModelOutput tool_output{
+        "",
+        {{"calculator",
+          adi::parse_json(R"({"operation":"add","a":2,"b":3})"),
+          R"({"operation":"add","a":2,"b":3})"}},
+    };
+    const adi::server_detail::ResponseConfiguration tool_configuration{
+        true,
+        "auto",
+        {adi::parse_json(
+            R"({"type":"function","name":"calculator","parameters":{"type":"object"},"strict":false})")},
+    };
+    const auto tool_response = adi::parse_json(
+        adi::server_detail::response_json(
+            "model", completed, identity, tool_output, tool_configuration));
+    assert(*tool_response.find("parallel_tool_calls")->boolean());
+    assert(*tool_response.find("tool_choice")->string() == "auto");
+    assert(tool_response.find("tools")->array()->size() == 1);
+    assert(tool_response.find("output")->array()->size() == 1);
+    const auto &function_item = tool_response.find("output")->array()->front();
+    assert(*function_item.find("type")->string() == "function_call");
+    assert(*function_item.find("call_id")->string() == "call_test_0");
+    assert(*function_item.find("name")->string() == "calculator");
+    assert(*function_item.find("arguments")->string() ==
+           R"({"operation":"add","a":2,"b":3})");
 
     TestSocket client;
     TestSocket server;

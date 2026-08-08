@@ -3,12 +3,14 @@
 `tools/adi_chat.py` is a small cross-platform client for ADI's Responses API. It
 can start `adi serve`, wait for the model to finish loading, stream a
 conversation in the terminal, persist message history, and stop the child
-server when the client exits.
+server when the client exits. It advertises a safe in-process calculator and
+local-time function, executes calls returned by the model, and continues the
+Responses turn with `function_call_output` items.
 
 The client intentionally uses a tiny in-process conversation harness rather
-than a general coding-agent framework. ADI currently accepts text messages but
-rejects tool definitions, so a full tool-calling agent loop would add another
-runtime without adding usable capabilities.
+than a general coding-agent framework. Its two example tools have no shell,
+filesystem, network, or subprocess access. They demonstrate the complete
+client-executed tool protocol without turning ADI itself into an executor.
 
 ## Quick start with uv
 
@@ -58,6 +60,7 @@ uv run tools/adi_chat.py --connect http://127.0.0.1:9932
 --session chat.json      load and save conversation history
 --max-tokens 512         set the output limit for each turn
 --no-stream              use a normal JSON response instead of SSE
+--no-tools               start without tools; also applies to --prompt
 --prompt "Hello"         send one request and exit
 --server-log             mirror ADI's output into the terminal
 ```
@@ -82,14 +85,22 @@ output omits the changing footer but keeps the final summary.
 /save PATH            save a session
 /load PATH            load a session
 /paste                enter a multi-line message; finish with a single `.`
+/tools [on|off]       show, enable, or disable tools for later turns
 /stats                show cumulative token usage, request time, and throughput
 /settings             show the endpoint and generation settings
 /exit                 exit and stop the ADI child process
 ```
 
-A turn is committed to history only after a complete response. Interrupting a
-stream with Ctrl+C closes the HTTP request, leaves the local history unchanged,
-and allows ADI to observe the disconnect through its normal cancellation path.
+Tools start enabled unless `--no-tools` is supplied. `/tools off` stops
+advertising them on subsequent REPL turns, and `/tools on` makes them available
+again without restarting ADI or clearing conversation history. For one-shot
+`--prompt` runs, `--no-tools` sends the single request without tools.
+
+A turn is committed to history only after a complete response, including every
+tool call and output needed to reconstruct the next prompt. At most eight model
+responses are allowed in one tool loop. Interrupting a stream with Ctrl+C
+closes the HTTP request, leaves the local history unchanged, and allows ADI to
+observe the disconnect through its normal cancellation path.
 Ctrl+C at the input prompt exits the client. On Windows, a managed ADI server is
 also placed in a kill-on-close job so it cannot survive an interrupted client or
 its `uv run` wrapper.

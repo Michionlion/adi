@@ -7,6 +7,7 @@ import importlib.util
 import os
 import subprocess
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -199,6 +200,226 @@ class AdiChatTests(unittest.TestCase):
         self.assertIn("4.60s total", terminal_output)
         self.assertEqual(totals.prefill_seconds, 2.0)
         self.assertEqual(totals.decode_seconds, 2.5)
+
+    def test_response_parser_reads_function_calls(self) -> None:
+        item = {
+            "id": "fc_test",
+            "call_id": "call_test",
+            "type": "function_call",
+            "name": "calculator",
+            "arguments": '{"operation":"multiply","a":6,"b":7}',
+            "status": "completed",
+        }
+        result = adi_chat.parse_response_object(
+            {"status": "completed", "output": [item]}
+        )
+        self.assertEqual(result.output_items, [item])
+        self.assertEqual(
+            result.tool_calls,
+            [
+                adi_chat.ToolCall(
+                    "fc_test",
+                    "call_test",
+                    "calculator",
+                    '{"operation":"multiply","a":6,"b":7}',
+                )
+            ],
+        )
+
+    def test_basic_calculator_is_safe_and_structured(self) -> None:
+        call = adi_chat.ToolCall(
+            "fc_test",
+            "call_test",
+            "calculator",
+            '{"operation":"divide","a":9,"b":3}',
+        )
+        self.assertEqual(
+            adi_chat.execute_basic_tool(call),
+            '{"result": 3.0}',
+        )
+        divide_by_zero = adi_chat.ToolCall(
+            "fc_test",
+            "call_test",
+            "calculator",
+            '{"operation":"divide","a":9,"b":0}',
+        )
+        self.assertIn("division by zero", adi_chat.execute_basic_tool(divide_by_zero))
+
+    def test_tool_loop_executes_and_returns_output_to_model(self) -> None:
+        requests: list[list[dict[str, object]]] = []
+
+        class FakeClient:
+            def create(self, messages, settings, *, stream, on_delta, tools):
+                del settings, stream
+                self.assert_tools(tools)
+                requests.append([dict(item) for item in messages])
+                if len(requests) == 1:
+                    call_item = {
+                        "id": "fc_test",
+                        "call_id": "call_test",
+                        "type": "function_call",
+                        "name": "calculator",
+                        "arguments": '{"operation":"add","a":2,"b":3}',
+                        "status": "completed",
+                    }
+                    return adi_chat.ResponseResult(
+                        text="",
+                        output_items=[call_item],
+                        tool_calls=[
+                            adi_chat.ToolCall(
+                                "fc_test",
+                                "call_test",
+                                "calculator",
+                                call_item["arguments"],
+                            )
+                        ],
+                        input_tokens=10,
+                        output_tokens=4,
+                        total_tokens=14,
+                    )
+                on_delta("The result is 5.")
+                message_item = {
+                    "id": "msg_test",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [
+                        {"type": "output_text", "text": "The result is 5."}
+                    ],
+                }
+                return adi_chat.ResponseResult(
+                    text="The result is 5.",
+                    output_items=[message_item],
+                    input_tokens=20,
+                    output_tokens=5,
+                    total_tokens=25,
+                )
+
+            @staticmethod
+            def assert_tools(tools):
+                assert tools == adi_chat.BASIC_TOOLS
+
+        console = StubConsole()
+        adi_chat.console = console
+        conversation = adi_chat.Conversation()
+        result = adi_chat.send_turn(
+            FakeClient(),
+            conversation,
+            adi_chat.GenerationSettings(None, 0.0, 0.9, 0),
+            "What is two plus three?",
+            stream=True,
+            totals=adi_chat.UsageTotals(),
+            tools=adi_chat.BASIC_TOOLS,
+        )
+
+        self.assertEqual(result.text, "The result is 5.")
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[1][-1]["type"], "function_call_output")
+        self.assertEqual(requests[1][-1]["call_id"], "call_test")
+        self.assertEqual(requests[1][-1]["output"], '{"result": 5}')
+        self.assertEqual(conversation.messages[0]["role"], "user")
+        self.assertEqual(conversation.messages[1]["type"], "function_call")
+        self.assertEqual(conversation.messages[2]["type"], "function_call_output")
+        self.assertEqual(conversation.messages[3]["type"], "message")
+
+        with tempfile.TemporaryDirectory() as directory:
+            session = Path(directory) / "session.json"
+            conversation.save(session)
+            self.assertEqual(
+                adi_chat.Conversation.load(session).messages,
+                conversation.messages,
+            )
+
+    def test_old_session_format_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = Path(directory) / "session.json"
+            session.write_text(
+                '{"version":1,"system_prompt":null,"messages":[]}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                adi_chat.ClientError,
+                "unsupported session format",
+            ):
+                adi_chat.Conversation.load(session)
+
+    def test_repl_can_disable_and_reenable_tools(self) -> None:
+        advertised_tools: list[object] = []
+
+        class FakeClient:
+            responses_url = "http://127.0.0.1:9932/v1/responses"
+
+            def create(
+                self,
+                messages,
+                settings,
+                *,
+                stream,
+                on_delta,
+                tools=None,
+            ):
+                del messages, settings, stream, on_delta
+                advertised_tools.append(tools)
+                index = len(advertised_tools)
+                text = f"answer {index}"
+                return adi_chat.ResponseResult(
+                    text=text,
+                    output_items=[
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": text}],
+                        }
+                    ],
+                )
+
+        commands = iter(
+            ["/tools off", "without tools", "/tools on", "with tools", "/exit"]
+        )
+        console = StubConsole()
+        adi_chat.console = console
+        with mock.patch.object(
+            adi_chat,
+            "read_user_input_line",
+            side_effect=lambda: next(commands),
+        ):
+            adi_chat.interactive_loop(
+                FakeClient(),
+                adi_chat.Conversation(),
+                adi_chat.GenerationSettings(None, 0.0, 0.9, 0),
+                stream=False,
+                session_path=None,
+                tools_enabled=True,
+            )
+
+        self.assertIsNone(advertised_tools[0])
+        self.assertEqual(advertised_tools[1], adi_chat.BASIC_TOOLS)
+        terminal_output = "".join(text for text, _ in console.output)
+        self.assertIn("Tools disabled.", terminal_output)
+        self.assertIn("Tools enabled.", terminal_output)
+
+    def test_no_tools_disables_tools_for_one_shot_prompt(self) -> None:
+        class FakeResponsesClient:
+            def __init__(self, base_url: str) -> None:
+                self.responses_url = base_url + "/v1/responses"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                pass
+
+        with (
+            mock.patch.object(adi_chat, "AdiResponsesClient", FakeResponsesClient),
+            mock.patch.object(adi_chat, "send_turn") as send_turn,
+        ):
+            adi_chat.chat(
+                connect="http://127.0.0.1:9932",
+                prompt="hello",
+                tools=False,
+            )
+
+        self.assertIsNone(send_turn.call_args.kwargs["tools"])
 
     def test_reasoning_renderer_handles_split_tags(self) -> None:
         source = "think one</think>\nanswer<think>think two</think>tail"
