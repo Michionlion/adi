@@ -1003,3 +1003,28 @@ linear QKV/gate pairs, 0 of 30 full-attention Q/K/V pairs, 0 of 40 shared
 gate/up pairs, and 0 of 10,240 routed-expert gate/up pairs. Fusing those
 Hadamard preparations would therefore change the weights rather than remove
 duplicate work.
+
+## AVX-512 arithmetic non-expert rows
+
+Measured on 2026-08-08 on the same eight-core EPYC 9645 VM and Release build.
+For batch-one non-expert projections, AVX-512 lanes now represent 16
+independent output rows. The kernel extracts each trellis state, computes its
+lattice index arithmetically, and gathers from an 8 KiB signed TLUT. The
+packed weights remain mmap-backed, and every output row retains the reference
+decoder's state and component accumulation order.
+
+| workload | before | after | change |
+| --- | ---: | ---: | ---: |
+| 8192x2048 QKV, ms/projection | 1.603 | 1.305 | -18.6% |
+| 512x2048 shared gate, ms/projection | 0.1343 | 0.1149 | -14.4% |
+| 30-layer linear path, ms/token | 2.439 | 2.082 | -14.6% |
+| complete decode, seconds/token | 0.2260 | 0.2190 | -3.1% |
+| complete decode, non-expert stage | 107.0 ms | 99.1 ms | -7.4% |
+
+The projection and token figures are medians of five and seven interleaved
+pairs respectively. Direct scalar-versus-AVX-512 tests cover randomized
+16x16, 64x32, and 32x128 matrices, thirteen boundary-crossing batch sizes,
+and all 65,536 possible trellis states. Results are bit-exact. A former
+large-table arithmetic-gather experiment lost to cached state lookup; the
+winning combination amortizes the arithmetic across rows and keeps its much
+smaller signed table hot.

@@ -25,6 +25,16 @@ namespace adi::detail {
 // it is 0.22 ms against 0.39 and 0.48.
 constexpr std::uint32_t ne_batch_minimum = 2;
 
+using NeMatvecRowsKernel = void (*)(
+    const MachNeMatrix &matrix,
+    std::span<const float> signed_tlut,
+    std::span<const float> input,
+    std::span<float> output,
+    std::uint32_t row_begin,
+    std::uint32_t row_end);
+
+[[nodiscard]] NeMatvecRowsKernel selected_ne_matvec_rows_kernel() noexcept;
+
 // Accumulates every packed trellis tile across the batch dimension.
 //
 //   inputs   [batch, matrix.columns], already sign-applied and Hadamard'd
@@ -58,5 +68,13 @@ void x86_ne_tiles_batch_avx512(
     std::uint32_t batch,
     std::span<float> outputs,
     std::span<float> packed);
+
+void x86_ne_matvec_rows_avx512(
+    const MachNeMatrix &matrix,
+    std::span<const float> signed_tlut,
+    std::span<const float> input,
+    std::span<float> output,
+    std::uint32_t row_begin,
+    std::uint32_t row_end);
 
 } // namespace adi::detail

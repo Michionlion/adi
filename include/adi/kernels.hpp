@@ -28,8 +28,10 @@ struct ExpertScratch {
     std::vector<float> batch_packed;
     std::vector<std::uint16_t> wave_indexes;
     std::vector<float> state_values;
+    std::vector<float> ne_signed_tlut;
     std::vector<float> wave_gamma;
     const float *state_values_source = nullptr;
+    const float *ne_signed_tlut_source = nullptr;
     const std::uint16_t *wave_gamma_source = nullptr;
     std::size_t wave_gamma_count = 0;
     std::uint32_t state_value_components = 0;
@@ -46,6 +48,7 @@ struct MachNeMatrix {
     float weight_scale;
     std::span<const float> tlut;
     std::span<const float> state_values{};
+    std::span<const float> signed_tlut{};
 };
 
 struct MachEmbedding {

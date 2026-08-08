@@ -82,6 +82,38 @@ std::vector<float> build_ne_state_values(std::span<const float> tlut) {
     return values;
 }
 
+std::vector<float> build_ne_signed_tlut(std::span<const float> tlut) {
+    if (tlut.size() != 512 * ne_values_per_state) {
+        throw std::invalid_argument("non-expert TLUT shape mismatch");
+    }
+    std::vector<float> values(1024 * ne_values_per_state);
+    // Bits 6..14 of state*(state+1) select the 512-row lattice. Bit 15
+    // negates only the first component, so retaining that bit in the row
+    // index makes the arithmetic decoder a single small-table gather.
+    for (std::uint32_t row = 0; row < 512; ++row) {
+        for (std::uint32_t negative = 0; negative < 2; ++negative) {
+            const auto signed_row = row | (negative << 9);
+            for (std::uint32_t component = 0;
+                 component < ne_values_per_state;
+                 ++component) {
+                // Match the released decoder's f16 round trip before adding
+                // the sign, exactly as build_ne_state_values does.
+                float value = rounded_lattice_value(
+                    tlut[static_cast<std::size_t>(row) *
+                             ne_values_per_state +
+                         component]);
+                if (component == 0 && negative != 0) {
+                    value = -value;
+                }
+                values[static_cast<std::size_t>(signed_row) *
+                           ne_values_per_state +
+                       component] = value;
+            }
+        }
+    }
+    return values;
+}
+
 std::vector<std::uint16_t> build_wave_indexes(
     std::uint32_t tile_rows,
     std::uint32_t tile_columns) {

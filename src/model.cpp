@@ -548,6 +548,7 @@ void MachModel::cache_descriptors() {
         required_tensor(file_, "mach.tlut.ne.tlut", GgmlType::f32));
     expert_state_values_ = detail::build_expert_state_values(expert_tlut);
     ne_state_values_ = detail::build_ne_state_values(ne_tlut);
+    ne_signed_tlut_ = detail::build_ne_signed_tlut(ne_tlut);
     expert_wave_indexes_forward_ = detail::build_wave_indexes(
         config_.expert_hidden / 16,
         config_.hidden / 16);
@@ -564,6 +565,7 @@ void MachModel::cache_descriptors() {
     std::size_t gamma_offset = 0;
     const auto cache_non_expert = [&](MachNeMatrix matrix) {
         matrix.state_values = std::span<const float>(ne_state_values_);
+        matrix.signed_tlut = std::span<const float>(ne_signed_tlut_);
         return matrix;
     };
     const auto cache_expert = [&](MachExpertMatrix matrix) {

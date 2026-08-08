@@ -72,6 +72,27 @@ std::span<const float> ne_state_values(
     return scratch.state_values;
 }
 
+std::span<const float> ne_signed_tlut(
+    const MachNeMatrix &matrix,
+    ExpertScratch &scratch) {
+    constexpr std::size_t expected = 1024 * detail::ne_values_per_state;
+    if (!matrix.signed_tlut.empty()) {
+        if (matrix.signed_tlut.size() != expected) {
+            throw std::invalid_argument(
+                "Mach NE signed TLUT cache shape mismatch");
+        }
+        return matrix.signed_tlut;
+    }
+    if (scratch.ne_signed_tlut_source != matrix.tlut.data()) {
+        scratch.ne_signed_tlut = detail::build_ne_signed_tlut(matrix.tlut);
+        scratch.ne_signed_tlut_source = matrix.tlut.data();
+    }
+    if (scratch.ne_signed_tlut.size() != expected) {
+        throw std::invalid_argument("Mach NE signed TLUT cache shape mismatch");
+    }
+    return scratch.ne_signed_tlut;
+}
+
 // Reference accumulation for the batched non-expert stream. Every SIMD batch
 // kernel must reproduce this bit for bit: tile column by tile column, state
 // by state, first decoded value then second, with the two products added
@@ -583,9 +604,25 @@ void mach_ne_matvec(
         scratch.input[index] = input[index] * static_cast<float>(matrix.su[index]);
     }
     detail::hadamard_transform(scratch.input);
-    const auto state_values = ne_state_values(matrix, scratch);
+    const auto row_kernel = detail::selected_ne_matvec_rows_kernel();
+    const auto state_values = row_kernel == nullptr
+                                  ? ne_state_values(matrix, scratch)
+                                  : std::span<const float>{};
+    const auto signed_tlut = row_kernel != nullptr
+                                 ? ne_signed_tlut(matrix, scratch)
+                                 : std::span<const float>{};
 
     parallel_ranges(tile_rows, 4, [&](std::uint32_t row_begin, std::uint32_t row_end) {
+        if (row_kernel != nullptr) {
+            row_kernel(
+                matrix,
+                signed_tlut,
+                scratch.input,
+                scratch.output,
+                row_begin,
+                row_end);
+            return;
+        }
         for (std::uint32_t tile_row = row_begin; tile_row < row_end; ++tile_row) {
             float row_sums[tile_size] = {};
             for (std::uint32_t tile_column = 0; tile_column < tile_columns;

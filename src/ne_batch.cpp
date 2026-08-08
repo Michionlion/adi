@@ -44,6 +44,12 @@ std::uint32_t ne_batch_lanes() noexcept {
     return selected_batch_kernel().lanes;
 }
 
+NeMatvecRowsKernel selected_ne_matvec_rows_kernel() noexcept {
+    return selected_cpu_isa() == CpuIsa::avx512
+               ? x86_ne_matvec_rows_avx512
+               : nullptr;
+}
+
 void ne_matmul_tiles_batch(
     const MachNeMatrix &matrix,
     std::span<const float> state_values,

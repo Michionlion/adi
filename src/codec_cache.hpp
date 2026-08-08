@@ -16,6 +16,9 @@ constexpr std::uint32_t ne_values_per_state = 2;
 [[nodiscard]] std::vector<float> build_ne_state_values(
     std::span<const float> tlut);
 
+[[nodiscard]] std::vector<float> build_ne_signed_tlut(
+    std::span<const float> tlut);
+
 [[nodiscard]] std::vector<std::uint16_t> build_wave_indexes(
     std::uint32_t tile_rows,
     std::uint32_t tile_columns);
