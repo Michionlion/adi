@@ -64,6 +64,89 @@ void apply_rope(
     }
 }
 
+// One sequence's view of the gated-delta recurrence. Value heads are
+// independent of one another, so a caller holding several sequences can
+// dispatch over sequences and heads together instead of one sequence at a
+// time.
+struct GatedDeltaSequence {
+    std::span<float> recurrent;
+    std::span<const float> query;
+    std::span<const float> key;
+    std::span<const float> value;
+    std::span<const float> alpha;
+    std::span<const float> beta;
+    std::span<float> output;
+};
+
+struct GatedDeltaShape {
+    std::uint32_t key_heads;
+    std::uint32_t value_heads;
+    std::uint32_t head_size;
+};
+
+void validate_gated_delta(
+    const GatedDeltaSequence &sequence,
+    std::span<const std::uint16_t> alpha_bias,
+    std::span<const std::uint16_t> a_log,
+    const GatedDeltaShape &shape) {
+    const auto state_size = static_cast<std::size_t>(shape.value_heads) *
+                            shape.head_size * shape.head_size;
+    const auto value_size =
+        static_cast<std::size_t>(shape.value_heads) * shape.head_size;
+    const auto key_size =
+        static_cast<std::size_t>(shape.key_heads) * shape.head_size;
+    if (sequence.recurrent.size() != state_size ||
+        sequence.query.size() != key_size ||
+        sequence.key.size() != key_size ||
+        sequence.value.size() != value_size ||
+        sequence.alpha.size() != shape.value_heads ||
+        sequence.beta.size() != shape.value_heads ||
+        alpha_bias.size() != shape.value_heads ||
+        a_log.size() != shape.value_heads ||
+        sequence.output.size() != value_size) {
+        throw std::invalid_argument("Gated DeltaNet recurrent shape mismatch");
+    }
+}
+
+// Advances one value head by one token. The head owns its own square block of
+// the recurrent state and its own slice of the output, so heads of the same
+// sequence and heads of different sequences are equally independent.
+void gated_delta_head(
+    const GatedDeltaSequence &sequence,
+    std::span<const std::uint16_t> alpha_bias,
+    std::span<const std::uint16_t> a_log,
+    const GatedDeltaShape &shape,
+    std::uint32_t head) {
+    const auto head_size = shape.head_size;
+    const float output_scale =
+        1.0F / std::sqrt(static_cast<float>(head_size));
+    const auto key_head =
+        gated_delta_key_head(head, shape.value_heads, shape.key_heads);
+    const auto q = sequence.query.subspan(
+        static_cast<std::size_t>(key_head) * head_size, head_size);
+    const auto k = sequence.key.subspan(
+        static_cast<std::size_t>(key_head) * head_size, head_size);
+    const auto v = sequence.value.subspan(
+        static_cast<std::size_t>(head) * head_size, head_size);
+    const float beta_value = sigmoid(sequence.beta[head]);
+    const float biased_alpha =
+        sequence.alpha[head] + bf16_to_f32(alpha_bias[head]);
+    const float softplus = biased_alpha > 20.0F
+                               ? biased_alpha
+                               : std::log1p(std::exp(biased_alpha));
+    const float decay =
+        std::exp(-std::exp(bf16_to_f32(a_log[head])) * softplus);
+    for (std::uint32_t row = 0; row < head_size; ++row) {
+        auto state_row = sequence.recurrent.subspan(
+            (static_cast<std::size_t>(head) * head_size + row) * head_size,
+            head_size);
+        sequence.output[static_cast<std::size_t>(head) * head_size + row] =
+            detail::gated_delta_update(
+                state_row, q, k, v[row], beta_value, decay) *
+            output_scale;
+    }
+}
+
 void gated_delta_recurrent(
     std::span<float> recurrent,
     std::span<const float> query,
@@ -77,22 +160,10 @@ void gated_delta_recurrent(
     std::uint32_t value_heads,
     std::uint32_t head_size,
     std::span<float> output) {
-    const auto state_size =
-        static_cast<std::size_t>(value_heads) * head_size * head_size;
-    const auto value_size =
-        static_cast<std::size_t>(value_heads) * head_size;
-    const auto key_size =
-        static_cast<std::size_t>(key_heads) * head_size;
-    if (recurrent.size() != state_size || query.size() != key_size ||
-        key.size() != key_size || value.size() != value_size ||
-        alpha.size() != value_heads || beta.size() != value_heads ||
-        alpha_bias.size() != value_heads || a_log.size() != value_heads ||
-        output.size() != value_size) {
-        throw std::invalid_argument("Gated DeltaNet recurrent shape mismatch");
-    }
-
-    const float output_scale =
-        1.0F / std::sqrt(static_cast<float>(head_size));
+    const GatedDeltaSequence sequence{
+        recurrent, query, key, value, alpha, beta, output};
+    const GatedDeltaShape shape{key_heads, value_heads, head_size};
+    validate_gated_delta(sequence, alpha_bias, a_log, shape);
     detail::parallel_ranges(
         value_heads,
         1,
@@ -100,41 +171,7 @@ void gated_delta_recurrent(
             for (std::uint32_t head = head_begin;
                  head < head_end;
                  ++head) {
-                const auto key_head =
-                    gated_delta_key_head(head, value_heads, key_heads);
-                const auto q = query.subspan(
-                    static_cast<std::size_t>(key_head) * head_size,
-                    head_size);
-                const auto k = key.subspan(
-                    static_cast<std::size_t>(key_head) * head_size,
-                    head_size);
-                const auto v = value.subspan(
-                    static_cast<std::size_t>(head) * head_size,
-                    head_size);
-                const float beta_value = sigmoid(beta[head]);
-                const float biased_alpha =
-                    alpha[head] + bf16_to_f32(alpha_bias[head]);
-                const float softplus =
-                    biased_alpha > 20.0F
-                        ? biased_alpha
-                        : std::log1p(std::exp(biased_alpha));
-                const float decay = std::exp(
-                    -std::exp(bf16_to_f32(a_log[head])) * softplus);
-                for (std::uint32_t row = 0; row < head_size; ++row) {
-                    auto state_row = recurrent.subspan(
-                        (static_cast<std::size_t>(head) * head_size + row) *
-                            head_size,
-                        head_size);
-                    output[static_cast<std::size_t>(head) * head_size + row] =
-                        detail::gated_delta_update(
-                            state_row,
-                            q,
-                            k,
-                            v[row],
-                            beta_value,
-                            decay) *
-                        output_scale;
-                }
+                gated_delta_head(sequence, alpha_bias, a_log, shape, head);
             }
         });
 }
@@ -740,13 +777,28 @@ void linear_attention_forward_batch(
         static_cast<std::uint32_t>(batch),
         batch_scratch.projection_3);
 
+    // convolved holds query, key, and value back to back, and the recurrence
+    // reads them in place after the causal convolution has written them.
+    const auto sequence_view = [&](LinearAttentionState &state,
+                                   LinearAttentionScratch &scratch) {
+        return GatedDeltaSequence{
+            state.recurrent,
+            std::span<const float>(scratch.convolved.data(), qk_size),
+            std::span<const float>(
+                scratch.convolved.data() + qk_size, qk_size),
+            std::span<const float>(
+                scratch.convolved.data() + 2 * qk_size, value_size),
+            scratch.alpha,
+            scratch.beta,
+            scratch.recurrent_output,
+        };
+    };
+
     // Decode batches are independent sequences: each one owns its convolution
     // and recurrent state and writes only its own slice of the staged output.
-    // Walking them serially meant the convolution, the normalizations and the
-    // gating ran on one thread, and gated_delta_recurrent dispatched the
-    // worker pool once per sequence per layer. One dispatch over sequences
-    // instead leaves that recurrence nested, so it runs in place, and every
-    // value is computed exactly as before.
+    // Walking them serially meant the convolution and the normalizations ran
+    // on one thread, and the recurrence dispatched the worker pool once per
+    // sequence per layer. This phase is per sequence, over channels.
     detail::parallel_tasks(
         static_cast<std::uint32_t>(batch),
         [&](std::uint32_t batch_index) {
@@ -767,7 +819,6 @@ void linear_attention_forward_batch(
             scratch.beta.assign(beta, beta + value_heads);
             scratch.convolved.resize(channels);
             scratch.recurrent_output.resize(value_size);
-            scratch.normalized.resize(value_size);
 
             if (descriptor.convolution.size() !=
                 static_cast<std::size_t>(channels) * convolution_width) {
@@ -845,47 +896,52 @@ void linear_attention_forward_batch(
                 throw std::invalid_argument(
                     "linear attention recurrent state mismatch");
             }
-            gated_delta_recurrent(
-                state.recurrent,
-                query,
-                key,
-                value,
-                scratch.alpha,
-                scratch.beta,
+            validate_gated_delta(
+                sequence_view(*states[batch_index], *scratches[batch_index]),
                 descriptor.alpha_bias,
                 descriptor.a_log,
-                key_heads,
-                value_heads,
-                head_size,
-                scratch.recurrent_output);
+                GatedDeltaShape{key_heads, value_heads, head_size});
+        });
 
-            for (std::uint32_t head = 0; head < value_heads; ++head) {
+    // The recurrence and the gating that follows it are independent per value
+    // head as well as per sequence, so they dispatch over both together. One
+    // task per sequence would leave five of eight cores idle at batch three;
+    // sequences times heads keeps every core fed down to batch one, which is
+    // the same 32 units the single-sequence path already dispatched.
+    const auto units = static_cast<std::uint32_t>(batch) * value_heads;
+    detail::parallel_ranges(
+        units,
+        1,
+        [&](std::uint32_t begin, std::uint32_t end) {
+            for (std::uint32_t unit = begin; unit < end; ++unit) {
+                const auto batch_index = unit / value_heads;
+                const auto head = unit % value_heads;
+                auto &scratch = *scratches[batch_index];
+                const auto sequence =
+                    sequence_view(*states[batch_index], scratch);
+                gated_delta_head(
+                    sequence,
+                    descriptor.alpha_bias,
+                    descriptor.a_log,
+                    GatedDeltaShape{key_heads, value_heads, head_size},
+                    head);
+
+                const auto offset =
+                    static_cast<std::size_t>(head) * head_size;
                 const auto source = std::span<const float>(
-                    scratch.recurrent_output.data() +
-                        static_cast<std::size_t>(head) * head_size,
-                    head_size);
+                    scratch.recurrent_output.data() + offset, head_size);
                 auto destination = std::span<float>(
-                    scratch.normalized.data() +
-                        static_cast<std::size_t>(head) * head_size,
+                    batch_scratch.projection_4.data() +
+                        static_cast<std::size_t>(batch_index) * value_size +
+                        offset,
                     head_size);
                 backend.normalize_rms(
-                    source,
-                    descriptor.norm,
-                    0.0F,
-                    epsilon,
-                    destination);
+                    source, descriptor.norm, 0.0F, epsilon, destination);
                 for (std::uint32_t index = 0; index < head_size; ++index) {
-                    destination[index] *= silu(
-                        scratch.gate[
-                            static_cast<std::size_t>(head) * head_size +
-                            index]);
+                    destination[index] *=
+                        silu(scratch.gate[offset + index]);
                 }
             }
-            std::copy(
-                scratch.normalized.begin(),
-                scratch.normalized.end(),
-                batch_scratch.projection_4.begin() +
-                    batch_index * value_size);
         });
     backend.ne_matmul(
         descriptor.output,
