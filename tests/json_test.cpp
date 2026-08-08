@@ -12,6 +12,9 @@ int main() {
     assert(*value.find("stream")->boolean() == false);
     assert(value.find("items")->array()->size() == 2);
     assert(adi::json_string("a\n\"b") == "\"a\\n\\\"b\"");
+    assert(adi::json_dump(value) ==
+           R"({"input":"hello\nworld","max":2,"stream":false,"items":[null,"☺"]})");
+    assert(adi::json_dump(adi::parse_json("-0.25")) == "-0.25");
 
     bool rejected = false;
     try {

@@ -25,6 +25,7 @@ import time
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -70,6 +71,40 @@ ANSWER_LABEL_STYLE = "bold white on #0f766e"
 STATUS_BAR_STYLE = "bold white on #334155"
 READLINE_PROMPT = "\x01\x1b[32m\x02user\x01\x1b[0m\x02 > "
 RATE_WINDOW_SECONDS = 5.0
+MAX_TOOL_ROUNDS = 8
+
+BASIC_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "name": "calculator",
+        "description": "Perform one basic arithmetic operation on two numbers.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": ["add", "subtract", "multiply", "divide"],
+                },
+                "a": {"type": "number"},
+                "b": {"type": "number"},
+            },
+            "required": ["operation", "a", "b"],
+            "additionalProperties": False,
+        },
+        "strict": False,
+    },
+    {
+        "type": "function",
+        "name": "get_current_time",
+        "description": "Get the current local date, time, and UTC offset.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+        "strict": False,
+    },
+]
 
 
 class ClientError(RuntimeError):
@@ -97,6 +132,14 @@ def configure_windows_console_signals() -> None:
 
 
 @dataclass(frozen=True)
+class ToolCall:
+    id: str
+    call_id: str
+    name: str
+    arguments: str
+
+
+@dataclass(frozen=True)
 class GenerationSettings:
     max_output_tokens: Optional[int]
     temperature: float
@@ -104,7 +147,12 @@ class GenerationSettings:
     seed: int
     model_id: Optional[str] = None
 
-    def payload(self, messages: list[dict[str, str]], stream: bool) -> dict[str, Any]:
+    def payload(
+        self,
+        messages: list[dict[str, Any]],
+        stream: bool,
+        tools: Optional[list[dict[str, Any]]] = None,
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "input": messages,
             "temperature": self.temperature,
@@ -116,6 +164,8 @@ class GenerationSettings:
             payload["max_output_tokens"] = self.max_output_tokens
         if self.model_id:
             payload["model"] = self.model_id
+        if tools:
+            payload["tools"] = tools
         return payload
 
 
@@ -130,6 +180,8 @@ class ResponseResult:
     decode_seconds: Optional[float] = None
     prefill_tokens_per_second: Optional[float] = None
     decode_tokens_per_second: Optional[float] = None
+    output_items: list[dict[str, Any]] = field(default_factory=list)
+    tool_calls: list[ToolCall] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -240,10 +292,10 @@ class UsageTotals:
 @dataclass
 class Conversation:
     system_prompt: Optional[str] = None
-    messages: list[dict[str, str]] = field(default_factory=list)
+    messages: list[dict[str, Any]] = field(default_factory=list)
 
-    def request_messages(self, user_text: str) -> list[dict[str, str]]:
-        request: list[dict[str, str]] = []
+    def request_messages(self, user_text: str) -> list[dict[str, Any]]:
+        request: list[dict[str, Any]] = []
         if self.system_prompt:
             request.append({"role": "system", "content": self.system_prompt})
         request.extend(self.messages)
@@ -258,13 +310,21 @@ class Conversation:
             ]
         )
 
+    def commit_items(
+        self,
+        user_text: str,
+        response_items: list[dict[str, Any]],
+    ) -> None:
+        self.messages.append({"role": "user", "content": user_text})
+        self.messages.extend(response_items)
+
     def reset(self) -> None:
         self.messages.clear()
 
     def save(self, path: Path) -> None:
         path = path.expanduser()
         document = {
-            "version": 1,
+            "version": 2,
             "system_prompt": self.system_prompt,
             "messages": self.messages,
         }
@@ -290,7 +350,7 @@ class Conversation:
             document = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise ClientError(f"cannot load session {path}: {error}") from error
-        if not isinstance(document, dict) or document.get("version") != 1:
+        if not isinstance(document, dict) or document.get("version") not in {1, 2}:
             raise ClientError(f"unsupported session format in {path}")
         system_prompt = document.get("system_prompt")
         if system_prompt is not None and not isinstance(system_prompt, str):
@@ -298,7 +358,33 @@ class Conversation:
         messages = document.get("messages")
         if not isinstance(messages, list):
             raise ClientError(f"invalid message list in {path}")
-        validated: list[dict[str, str]] = []
+        validated: list[dict[str, Any]] = []
+        if document["version"] == 2:
+            for index, message in enumerate(messages):
+                if not isinstance(message, dict):
+                    raise ClientError(f"invalid message {index} in {path}")
+                item_type = message.get("type")
+                if item_type in {None, "message"}:
+                    if message.get("role") not in {"user", "assistant"} or not isinstance(
+                        message.get("content"), (str, list)
+                    ):
+                        raise ClientError(f"invalid message {index} in {path}")
+                elif item_type == "function_call":
+                    if not all(
+                        isinstance(message.get(key), str)
+                        for key in ("call_id", "name", "arguments")
+                    ):
+                        raise ClientError(f"invalid function call {index} in {path}")
+                elif item_type == "function_call_output":
+                    if not isinstance(message.get("call_id"), str) or not isinstance(
+                        message.get("output"), str
+                    ):
+                        raise ClientError(f"invalid function output {index} in {path}")
+                else:
+                    raise ClientError(f"unsupported item {index} in {path}")
+                validated.append(message)
+            return cls(system_prompt=system_prompt, messages=validated)
+
         expected_role = "user"
         for index, message in enumerate(messages):
             if not isinstance(message, dict):
@@ -336,13 +422,14 @@ class AdiResponsesClient:
 
     def create(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         settings: GenerationSettings,
         *,
         stream: bool,
         on_delta: Optional[Callable[[str], None]] = None,
+        tools: Optional[list[dict[str, Any]]] = None,
     ) -> ResponseResult:
-        payload = settings.payload(messages, stream)
+        payload = settings.payload(messages, stream, tools)
         if stream:
             return self._create_stream(payload, on_delta or (lambda _: None))
         return self._create_nonstream(payload)
@@ -784,9 +871,24 @@ def responses_url(base_url: str) -> str:
 def parse_response_object(body: dict[str, Any]) -> ResponseResult:
     output = body.get("output")
     text_parts: list[str] = []
+    output_items: list[dict[str, Any]] = []
+    tool_calls: list[ToolCall] = []
     if isinstance(output, list):
         for item in output:
             if not isinstance(item, dict):
+                continue
+            output_items.append(item)
+            if item.get("type") == "function_call":
+                item_id = item.get("id")
+                call_id = item.get("call_id")
+                name = item.get("name")
+                arguments = item.get("arguments")
+                if not all(
+                    isinstance(value, str)
+                    for value in (item_id, call_id, name, arguments)
+                ):
+                    raise ApiError("ADI returned an invalid function call")
+                tool_calls.append(ToolCall(item_id, call_id, name, arguments))
                 continue
             content = item.get("content")
             if not isinstance(content, list):
@@ -844,8 +946,72 @@ def parse_response_object(body: dict[str, Any]) -> ResponseResult:
         decode_seconds=decode_seconds,
         prefill_tokens_per_second=prefill_rate,
         decode_tokens_per_second=decode_rate,
+        output_items=output_items,
+        tool_calls=tool_calls,
         raw=body,
     )
+
+
+def execute_basic_tool(call: ToolCall) -> str:
+    """Execute one of the deliberately small, side-effect-free demo tools."""
+    try:
+        arguments = json.loads(call.arguments)
+    except json.JSONDecodeError as error:
+        return json.dumps({"error": f"invalid arguments JSON: {error.msg}"})
+    if not isinstance(arguments, dict):
+        return json.dumps({"error": "tool arguments must be an object"})
+
+    try:
+        if call.name == "get_current_time":
+            if arguments:
+                raise ValueError("get_current_time takes no arguments")
+            now = datetime.now().astimezone()
+            return json.dumps(
+                {
+                    "local_time": now.isoformat(timespec="seconds"),
+                    "utc_offset": now.strftime("%z"),
+                    "timezone": now.tzname(),
+                },
+                ensure_ascii=False,
+            )
+
+        if call.name == "calculator":
+            if set(arguments) != {"operation", "a", "b"}:
+                raise ValueError("calculator requires only operation, a, and b")
+            operation = arguments["operation"]
+            a = arguments["a"]
+            b = arguments["b"]
+            if operation not in {"add", "subtract", "multiply", "divide"}:
+                raise ValueError("unsupported calculator operation")
+            if type(a) not in {int, float} or type(b) not in {int, float}:
+                raise ValueError("calculator operands must be numbers")
+            if not math.isfinite(float(a)) or not math.isfinite(float(b)):
+                raise ValueError("calculator operands must be finite")
+            if operation == "add":
+                result = a + b
+            elif operation == "subtract":
+                result = a - b
+            elif operation == "multiply":
+                result = a * b
+            else:
+                if b == 0:
+                    raise ValueError("division by zero")
+                result = a / b
+            if not math.isfinite(float(result)):
+                raise ValueError("calculator result is not finite")
+            return json.dumps({"result": result}, allow_nan=False)
+
+        raise ValueError(f"unknown tool {call.name!r}")
+    except (ArithmeticError, ValueError) as error:
+        return json.dumps({"error": str(error)}, ensure_ascii=False)
+
+
+def function_call_output(call: ToolCall, output: str) -> dict[str, str]:
+    return {
+        "type": "function_call_output",
+        "call_id": call.call_id,
+        "output": output,
+    }
 
 
 class ReasoningRenderer:
@@ -1255,7 +1421,25 @@ def print_history(conversation: Conversation) -> None:
     if conversation.system_prompt:
         table.add_row("0", "system", truncate(conversation.system_prompt))
     for index, message in enumerate(conversation.messages, start=1):
-        table.add_row(str(index), message["role"], truncate(message["content"]))
+        item_type = message.get("type")
+        if item_type == "function_call":
+            role = f"tool call: {message.get('name', '?')}"
+            content = str(message.get("arguments", ""))
+        elif item_type == "function_call_output":
+            role = "tool output"
+            content = str(message.get("output", ""))
+        else:
+            role = str(message.get("role", "message"))
+            raw_content = message.get("content", "")
+            if isinstance(raw_content, list):
+                content = "".join(
+                    str(part.get("text", ""))
+                    for part in raw_content
+                    if isinstance(part, dict)
+                )
+            else:
+                content = str(raw_content)
+        table.add_row(str(index), role, truncate(content))
     console.print(table)
 
 
@@ -1314,6 +1498,7 @@ def print_repl_help() -> None:
         "  /save PATH            Save the conversation as JSON\n"
         "  /load PATH            Load a saved conversation\n"
         "  /paste                Enter a multi-line message\n"
+        "  /tools [on|off]       Show, enable, or disable tools\n"
         "  /stats                Show cumulative usage and timing\n"
         "  /settings             Show endpoint and generation settings"
     )
@@ -1340,23 +1525,28 @@ def print_settings(
     client: AdiResponsesClient,
     settings: GenerationSettings,
     stream: bool,
+    tools_enabled: bool,
 ) -> None:
     console.print(client.responses_url, style="cyan", markup=False)
     console.print(settings_summary(settings, stream), style="dim", markup=False)
     if settings.model_id:
         console.print(f"model {settings.model_id}", style="dim", markup=False)
+    console.print(
+        f"basic tools {'enabled' if tools_enabled else 'disabled'}",
+        style="dim",
+        markup=False,
+    )
 
 
-def send_turn(
+def send_response_request(
     client: AdiResponsesClient,
-    conversation: Conversation,
+    input_items: list[dict[str, Any]],
     settings: GenerationSettings,
-    user_text: str,
     *,
     stream: bool,
     totals: UsageTotals,
+    tools: Optional[list[dict[str, Any]]] = None,
 ) -> ResponseResult:
-    console.print("[bold cyan]assistant[/bold cyan]")
     metrics = TurnMetrics()
     show_live_status = stream and bool(getattr(console, "is_terminal", False))
     streaming_display = StreamingDisplay(metrics) if show_live_status else None
@@ -1384,12 +1574,13 @@ def send_turn(
     )
     try:
         with live_context:
-            result = client.create(
-                conversation.request_messages(user_text),
-                settings,
-                stream=stream,
-                on_delta=on_delta,
-            )
+            create_arguments: dict[str, Any] = {
+                "stream": stream,
+                "on_delta": on_delta,
+            }
+            if tools:
+                create_arguments["tools"] = tools
+            result = client.create(input_items, settings, **create_arguments)
             metrics.finish()
             if streaming_display is not None:
                 if not printed_delta and result.text:
@@ -1423,14 +1614,85 @@ def send_turn(
     else:
         renderer.feed(result.text, final=True)
         console.print()
-    if not result.text:
+    if not result.text and not result.tool_calls:
         console.print("[yellow]ADI returned no output text.[/yellow]")
-    conversation.commit(user_text, result.text)
     reason = incomplete_reason(result)
     if reason is not None:
         console.print(reason, style="yellow", markup=False)
     print_usage(result, totals, metrics)
     return result
+
+
+def response_input_items(result: ResponseResult) -> list[dict[str, Any]]:
+    if result.output_items:
+        return list(result.output_items)
+    if result.text:
+        return [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": result.text}],
+            }
+        ]
+    return []
+
+
+def send_turn(
+    client: AdiResponsesClient,
+    conversation: Conversation,
+    settings: GenerationSettings,
+    user_text: str,
+    *,
+    stream: bool,
+    totals: UsageTotals,
+    tools: Optional[list[dict[str, Any]]] = None,
+) -> ResponseResult:
+    console.print("[bold cyan]assistant[/bold cyan]")
+    if not tools:
+        result = send_response_request(
+            client,
+            conversation.request_messages(user_text),
+            settings,
+            stream=stream,
+            totals=totals,
+        )
+        conversation.commit(user_text, result.text)
+        return result
+
+    request_items = conversation.request_messages(user_text)
+    committed_items: list[dict[str, Any]] = []
+    for round_index in range(MAX_TOOL_ROUNDS):
+        result = send_response_request(
+            client,
+            request_items,
+            settings,
+            stream=stream,
+            totals=totals,
+            tools=tools,
+        )
+        result_items = response_input_items(result)
+        committed_items.extend(result_items)
+        if not result.tool_calls:
+            conversation.commit_items(user_text, committed_items)
+            return result
+        if result.status != "completed":
+            raise ClientError("ADI returned tool calls in an incomplete response")
+
+        request_items.extend(result_items)
+        for call in result.tool_calls:
+            output = execute_basic_tool(call)
+            output_item = function_call_output(call, output)
+            request_items.append(output_item)
+            committed_items.append(output_item)
+            console.print(
+                f"[bold magenta]tool[/bold magenta] {call.name} "
+                f"[dim]{truncate(call.arguments)}[/dim]"
+            )
+            console.print(f"  {truncate(output)}", style="dim", markup=False)
+        if round_index + 1 < MAX_TOOL_ROUNDS:
+            console.print("[bold cyan]assistant[/bold cyan]")
+
+    raise ClientError(f"tool loop exceeded {MAX_TOOL_ROUNDS} model responses")
 
 
 def interactive_loop(
@@ -1440,17 +1702,22 @@ def interactive_loop(
     *,
     stream: bool,
     session_path: Optional[Path],
+    tools_enabled: bool = True,
 ) -> None:
     totals = UsageTotals()
     console.print("[bold green]ADI chat[/bold green]")
     console.print(
-        f"{client.responses_url}  •  {settings_summary(settings, stream)}",
+        f"{client.responses_url}  •  {settings_summary(settings, stream)}  •  "
+        f"tools {'on' if tools_enabled else 'off'}",
         style="dim",
         markup=False,
     )
     if conversation.messages:
+        prior_turns = sum(
+            1 for item in conversation.messages if item.get("role") == "user"
+        )
         console.print(
-            f"Loaded {plural(len(conversation.messages) // 2, 'prior turn')}.",
+            f"Loaded {plural(prior_turns, 'prior turn')}.",
             style="dim",
             markup=False,
         )
@@ -1503,8 +1770,29 @@ def interactive_loop(
             if command == "/stats":
                 print_session_stats(totals)
                 continue
+            if command == "/tools":
+                if not argument:
+                    console.print(
+                        f"Tools are {'enabled' if tools_enabled else 'disabled'}.",
+                        style="dim",
+                        markup=False,
+                    )
+                elif argument.lower() in {"on", "off"}:
+                    tools_enabled = argument.lower() == "on"
+                    console.print(
+                        f"Tools {'enabled' if tools_enabled else 'disabled'}.",
+                        style="dim",
+                        markup=False,
+                    )
+                else:
+                    console.print(
+                        "Usage: /tools [on|off]",
+                        style="yellow",
+                        markup=False,
+                    )
+                continue
             if command == "/settings":
-                print_settings(client, settings, stream)
+                print_settings(client, settings, stream, tools_enabled)
                 continue
             if command in {"/save", "/load"}:
                 if not argument:
@@ -1542,6 +1830,7 @@ def interactive_loop(
                 line,
                 stream=stream,
                 totals=totals,
+                tools=BASIC_TOOLS if tools_enabled else None,
             )
         except KeyboardInterrupt:
             continue
@@ -1642,6 +1931,11 @@ def chat(
         "--stream/--no-stream",
         help="Use Responses API server-sent-event streaming.",
     ),
+    tools: bool = typer.Option(
+        True,
+        "--tools/--no-tools",
+        help="Set the initial state of the calculator and local-time tools.",
+    ),
 ) -> None:
     """Run the ADI chat client."""
     if temperature != 0.0 and temperature < 0.0001:
@@ -1703,6 +1997,7 @@ def chat(
                         prompt,
                         stream=stream,
                         totals=totals,
+                        tools=BASIC_TOOLS if tools else None,
                     )
                 except KeyboardInterrupt as error:
                     raise typer.Exit(130) from error
@@ -1715,6 +2010,7 @@ def chat(
                     settings,
                     stream=stream,
                     session_path=session,
+                    tools_enabled=tools,
                 )
     except ClientError as error:
         console.print(f"error: {error}", style="red", markup=False)

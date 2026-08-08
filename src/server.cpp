@@ -4,6 +4,7 @@
 #include "adi/json.hpp"
 #include "chat.hpp"
 #include "server_internal.hpp"
+#include "tool_call.hpp"
 #include "utf8.hpp"
 
 #include <algorithm>
@@ -22,6 +23,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -442,34 +444,185 @@ std::string content_text(const Json &content) {
     return result;
 }
 
-std::string formatted_input(const Json &root) {
+struct PreparedRequest {
+    std::string prompt;
+    std::vector<FunctionTool> tools;
+    std::vector<Json> response_tools;
+    std::string tool_choice;
+    bool parallel_tool_calls = false;
+
+    [[nodiscard]] bool tools_enabled() const noexcept {
+        return tool_choice == "auto" && !tools.empty();
+    }
+};
+
+void append_system_message(
+    std::vector<ChatMessage> &messages,
+    std::string content) {
+    if (messages.size() == 1 && messages.front().role == "system") {
+        if (!messages.front().content.empty() && !content.empty()) {
+            messages.front().content += "\n\n";
+        }
+        messages.front().content += std::move(content);
+        return;
+    }
+    if (!messages.empty()) {
+        throw std::runtime_error("system message must be at the beginning");
+    }
+    messages.push_back({"system", std::move(content), {}});
+}
+
+void append_function_call(
+    const Json &item,
+    std::vector<ChatMessage> &messages,
+    std::unordered_set<std::string> &call_ids) {
+    const auto *call_id = item.find("call_id");
+    const auto *name = item.find("name");
+    const auto *arguments = item.find("arguments");
+    if (call_id == nullptr || call_id->string() == nullptr ||
+        call_id->string()->empty() || name == nullptr ||
+        name->string() == nullptr || name->string()->empty() ||
+        arguments == nullptr || arguments->string() == nullptr) {
+        throw std::runtime_error(
+            "function_call items require string call_id, name, and arguments");
+    }
+    if (!call_ids.emplace(*call_id->string()).second) {
+        throw std::runtime_error("duplicate function call_id in input");
+    }
+    auto parsed_arguments = parse_json(*arguments->string());
+    if (parsed_arguments.object() == nullptr) {
+        throw std::runtime_error("function_call arguments must encode an object");
+    }
+    if (messages.empty() || messages.back().role != "assistant") {
+        messages.push_back({"assistant", "", {}});
+    }
+    messages.back().tool_calls.push_back(
+        {*name->string(), std::move(parsed_arguments)});
+}
+
+void append_function_output(
+    const Json &item,
+    std::vector<ChatMessage> &messages,
+    const std::unordered_set<std::string> &call_ids) {
+    const auto *call_id = item.find("call_id");
+    const auto *output = item.find("output");
+    if (call_id == nullptr || call_id->string() == nullptr ||
+        output == nullptr) {
+        throw std::runtime_error(
+            "function_call_output items require string call_id and output");
+    }
+    if (!call_ids.contains(*call_id->string())) {
+        throw std::runtime_error(
+            "function_call_output refers to an unknown call_id");
+    }
+    messages.push_back({"tool", content_text(*output), {}});
+}
+
+std::vector<ChatMessage> response_messages(const Json &root) {
     const auto *input = root.find("input");
     if (input == nullptr) {
         throw std::runtime_error("'input' is required");
     }
-    if (const auto *text = input->string()) {
-        return qwen_user_prompt(*text);
+    std::vector<ChatMessage> rendered_messages;
+    if (const auto *instructions = root.find("instructions");
+        instructions != nullptr && !instructions->is_null()) {
+        if (instructions->string() == nullptr) {
+            throw std::runtime_error("'instructions' must be a string");
+        }
+        append_system_message(rendered_messages, *instructions->string());
     }
-    const auto *messages = input->array();
-    if (messages == nullptr || messages->empty()) {
+    if (const auto *text = input->string()) {
+        rendered_messages.push_back({"user", *text, {}});
+        return rendered_messages;
+    }
+    const auto *items = input->array();
+    if (items == nullptr || items->empty()) {
         throw std::runtime_error("'input' must be a string or non-empty message array");
     }
-    std::vector<ChatMessage> rendered_messages;
-    rendered_messages.reserve(messages->size());
-    for (const auto &message : *messages) {
-        const auto *role = message.find("role");
-        const auto *content = message.find("content");
+    rendered_messages.reserve(rendered_messages.size() + items->size());
+    std::unordered_set<std::string> call_ids;
+    for (const auto &item : *items) {
+        if (item.object() == nullptr) {
+            throw std::runtime_error("each input item must be an object");
+        }
+        const auto *type = item.find("type");
+        if (type != nullptr && type->string() == nullptr) {
+            throw std::runtime_error("input item 'type' must be a string");
+        }
+        if (type != nullptr && *type->string() == "function_call") {
+            append_function_call(item, rendered_messages, call_ids);
+            continue;
+        }
+        if (type != nullptr && *type->string() == "function_call_output") {
+            append_function_output(item, rendered_messages, call_ids);
+            continue;
+        }
+        if (type != nullptr && *type->string() != "message") {
+            throw std::runtime_error("unsupported Responses input item type");
+        }
+
+        const auto *role = item.find("role");
+        const auto *content = item.find("content");
         if (role == nullptr || role->string() == nullptr || content == nullptr) {
             throw std::runtime_error("each input message needs role and content");
         }
-        if (*role->string() != "user" && *role->string() != "assistant" &&
-            *role->string() != "system") {
+        if (*role->string() == "system" || *role->string() == "developer") {
+            append_system_message(rendered_messages, content_text(*content));
+        } else if (*role->string() == "user" ||
+                   *role->string() == "assistant") {
+            rendered_messages.push_back(
+                {*role->string(), content_text(*content), {}});
+        } else {
             throw std::runtime_error("unsupported input message role");
         }
-        rendered_messages.push_back(
-            {*role->string(), content_text(*content)});
     }
-    return qwen35_chat_prompt(rendered_messages);
+    return rendered_messages;
+}
+
+PreparedRequest prepare_request(const Json &root) {
+    if (const auto *previous = root.find("previous_response_id");
+        previous != nullptr && !previous->is_null()) {
+        throw std::runtime_error(
+            "previous_response_id is not supported; send the full input history");
+    }
+
+    PreparedRequest result;
+    if (const auto *tools = root.find("tools");
+        tools != nullptr && !tools->is_null()) {
+        result.tools = parse_function_tools(*tools);
+    }
+    result.response_tools.reserve(result.tools.size());
+    std::vector<Json> prompt_tools;
+    prompt_tools.reserve(result.tools.size());
+    for (const auto &tool : result.tools) {
+        result.response_tools.push_back(tool.response_definition);
+        prompt_tools.push_back(tool.prompt_definition);
+    }
+
+    result.tool_choice = result.tools.empty() ? "none" : "auto";
+    if (const auto *choice = root.find("tool_choice"); choice != nullptr) {
+        if (choice->string() == nullptr ||
+            (*choice->string() != "auto" && *choice->string() != "none")) {
+            throw std::runtime_error(
+                "'tool_choice' must be 'auto' or 'none'");
+        }
+        result.tool_choice = *choice->string();
+    }
+    result.parallel_tool_calls = !result.tools.empty();
+    if (const auto *parallel = root.find("parallel_tool_calls");
+        parallel != nullptr) {
+        if (parallel->boolean() == nullptr) {
+            throw std::runtime_error("'parallel_tool_calls' must be a boolean");
+        }
+        result.parallel_tool_calls = *parallel->boolean();
+    }
+
+    const auto messages = response_messages(root);
+    result.prompt = qwen35_chat_prompt(
+        messages,
+        result.tools_enabled() ? std::span<const Json>(prompt_tools)
+                               : std::span<const Json>{});
+    return result;
 }
 
 std::uint32_t integer_option(
@@ -543,6 +696,20 @@ std::string response_json(
     std::string_view model_name,
     const GenerationResult &result,
     const ResponseIdentity &identity) {
+    return response_json(
+        model_name,
+        result,
+        identity,
+        ParsedModelOutput{result.text, {}},
+        ResponseConfiguration{});
+}
+
+std::string response_json(
+    std::string_view model_name,
+    const GenerationResult &result,
+    const ResponseIdentity &identity,
+    const ParsedModelOutput &output,
+    const ResponseConfiguration &configuration) {
     const bool incomplete = result.finish_reason == FinishReason::length;
     const std::string_view response_status =
         incomplete ? "incomplete" : "completed";
@@ -564,6 +731,46 @@ std::string response_json(
         result.decode_seconds <= 0.0
             ? 0.0
             : result.output_tokens / result.decode_seconds;
+
+    std::string tools_json = "[";
+    for (std::size_t index = 0; index < configuration.tools.size(); ++index) {
+        if (index != 0) {
+            tools_json.push_back(',');
+        }
+        tools_json += json_dump(configuration.tools[index]);
+    }
+    tools_json.push_back(']');
+
+    std::string output_json = "[";
+    std::size_t output_index = 0;
+    if (!output.text.empty() || output.function_calls.empty()) {
+        output_json += "{\"id\":" + json_string(identity.message_id) +
+                       ",\"type\":\"message\",\"status\":" +
+                       json_string(item_status) +
+                       ",\"role\":\"assistant\",\"content\":[{\"type\":"
+                       "\"output_text\",\"text\":" + json_string(output.text) +
+                       ",\"annotations\":[]}]}";
+        ++output_index;
+    }
+    for (std::size_t call_index = 0;
+         call_index < output.function_calls.size();
+         ++call_index, ++output_index) {
+        if (output_index != 0) {
+            output_json.push_back(',');
+        }
+        const auto suffix = identity.id.substr(5) + "_" +
+                            std::to_string(call_index);
+        const auto &call = output.function_calls[call_index];
+        output_json +=
+            "{\"id\":" + json_string("fc_" + suffix) +
+            ",\"call_id\":" + json_string("call_" + suffix) +
+            ",\"type\":\"function_call\",\"name\":" +
+            json_string(call.name) + ",\"arguments\":" +
+            json_string(call.arguments_json) +
+            ",\"status\":\"completed\"}";
+    }
+    output_json.push_back(']');
+
     return "{\"id\":" + json_string(identity.id) +
            ",\"object\":\"response\",\"created_at\":" +
            std::to_string(identity.created_at) +
@@ -571,14 +778,11 @@ std::string response_json(
            ",\"error\":null,\"incomplete_details\":" +
            std::string(incomplete_details) +
            ",\"model\":" + json_string(model_name) +
-           ",\"parallel_tool_calls\":false,\"tool_choice\":\"none\""
-           ",\"tools\":[],\"output\":[{\"id\":" +
-           json_string(identity.message_id) +
-           ",\"type\":\"message\",\"status\":" + json_string(item_status) +
-           ",\"role\":\"assistant\""
-           ",\"content\":[{\"type\":\"output_text\",\"text\":" +
-           json_string(result.text) +
-           ",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":" +
+           ",\"parallel_tool_calls\":" +
+           (configuration.parallel_tool_calls ? "true" : "false") +
+           ",\"tool_choice\":" + json_string(configuration.tool_choice) +
+           ",\"tools\":" + tools_json + ",\"output\":" + output_json +
+           ",\"usage\":{\"input_tokens\":" +
            std::to_string(result.input_tokens) +
            ",\"input_tokens_details\":{\"cache_write_tokens\":0,"
            "\"cached_tokens\":0},\"output_tokens\":" +
@@ -701,12 +905,13 @@ std::string_view request_model(
     return model.name();
 }
 
-void validate_features(const Json &request) {
-    if (const auto *tools = request.find("tools");
-        tools != nullptr && (!tools->is_null() &&
-                             (tools->array() == nullptr || !tools->array()->empty()))) {
-        throw std::runtime_error("tools are not supported");
-    }
+server_detail::ResponseConfiguration response_configuration(
+    const PreparedRequest &request) {
+    return {
+        request.parallel_tool_calls,
+        request.tool_choice,
+        request.response_tools,
+    };
 }
 
 void send_event(
@@ -718,9 +923,146 @@ void send_event(
         "event: " + std::string(event) + "\ndata: " + data + "\n\n");
 }
 
+std::string function_suffix(
+    const ResponseIdentity &identity,
+    std::size_t call_index) {
+    return identity.id.substr(5) + "_" + std::to_string(call_index);
+}
+
+void emit_message_start(
+    Connection &connection,
+    const ResponseIdentity &identity,
+    std::size_t output_index,
+    std::uint32_t &sequence) {
+    send_event(
+        connection,
+        "response.output_item.added",
+        "{\"type\":\"response.output_item.added\",\"sequence_number\":" +
+            std::to_string(sequence++) + ",\"output_index\":" +
+            std::to_string(output_index) + ",\"item\":{\"id\":" +
+            json_string(identity.message_id) +
+            ",\"type\":\"message\",\"status\":\"in_progress\","
+            "\"role\":\"assistant\",\"content\":[]}}");
+    send_event(
+        connection,
+        "response.content_part.added",
+        "{\"type\":\"response.content_part.added\",\"sequence_number\":" +
+            std::to_string(sequence++) + ",\"item_id\":" +
+            json_string(identity.message_id) + ",\"output_index\":" +
+            std::to_string(output_index) +
+            ",\"content_index\":0,\"part\":{\"type\":\"output_text\","
+            "\"text\":\"\",\"annotations\":[]}}");
+}
+
+void emit_text_delta(
+    Connection &connection,
+    const ResponseIdentity &identity,
+    std::size_t output_index,
+    std::string_view delta,
+    std::uint32_t &sequence) {
+    if (delta.empty()) {
+        return;
+    }
+    send_event(
+        connection,
+        "response.output_text.delta",
+        "{\"type\":\"response.output_text.delta\",\"sequence_number\":" +
+            std::to_string(sequence++) + ",\"item_id\":" +
+            json_string(identity.message_id) + ",\"output_index\":" +
+            std::to_string(output_index) +
+            ",\"content_index\":0,\"delta\":" + json_string(delta) + "}");
+}
+
+void emit_message_done(
+    Connection &connection,
+    const ResponseIdentity &identity,
+    std::size_t output_index,
+    std::string_view text,
+    std::string_view status,
+    std::uint32_t &sequence) {
+    send_event(
+        connection,
+        "response.output_text.done",
+        "{\"type\":\"response.output_text.done\",\"sequence_number\":" +
+            std::to_string(sequence++) + ",\"item_id\":" +
+            json_string(identity.message_id) + ",\"output_index\":" +
+            std::to_string(output_index) +
+            ",\"content_index\":0,\"text\":" + json_string(text) + "}");
+    send_event(
+        connection,
+        "response.content_part.done",
+        "{\"type\":\"response.content_part.done\",\"sequence_number\":" +
+            std::to_string(sequence++) + ",\"item_id\":" +
+            json_string(identity.message_id) + ",\"output_index\":" +
+            std::to_string(output_index) +
+            ",\"content_index\":0,\"part\":{\"type\":\"output_text\","
+            "\"text\":" + json_string(text) + ",\"annotations\":[]}}");
+    send_event(
+        connection,
+        "response.output_item.done",
+        "{\"type\":\"response.output_item.done\",\"sequence_number\":" +
+            std::to_string(sequence++) + ",\"output_index\":" +
+            std::to_string(output_index) + ",\"item\":{\"id\":" +
+            json_string(identity.message_id) +
+            ",\"type\":\"message\",\"status\":" + json_string(status) +
+            ",\"role\":\"assistant\",\"content\":[{\"type\":"
+            "\"output_text\",\"text\":" + json_string(text) +
+            ",\"annotations\":[]}]}}");
+}
+
+void emit_function_call(
+    Connection &connection,
+    const ResponseIdentity &identity,
+    const FunctionCall &call,
+    std::size_t output_index,
+    std::size_t call_index,
+    std::uint32_t &sequence) {
+    const auto suffix = function_suffix(identity, call_index);
+    const auto item_id = "fc_" + suffix;
+    const auto call_id = "call_" + suffix;
+    send_event(
+        connection,
+        "response.output_item.added",
+        "{\"type\":\"response.output_item.added\",\"sequence_number\":" +
+            std::to_string(sequence++) + ",\"output_index\":" +
+            std::to_string(output_index) + ",\"item\":{\"id\":" +
+            json_string(item_id) + ",\"call_id\":" + json_string(call_id) +
+            ",\"type\":\"function_call\",\"name\":" +
+            json_string(call.name) +
+            ",\"arguments\":\"\",\"status\":\"in_progress\"}}");
+    send_event(
+        connection,
+        "response.function_call_arguments.delta",
+        "{\"type\":\"response.function_call_arguments.delta\","
+        "\"sequence_number\":" + std::to_string(sequence++) +
+            ",\"item_id\":" + json_string(item_id) +
+            ",\"output_index\":" + std::to_string(output_index) +
+            ",\"delta\":" + json_string(call.arguments_json) + "}");
+    send_event(
+        connection,
+        "response.function_call_arguments.done",
+        "{\"type\":\"response.function_call_arguments.done\","
+        "\"sequence_number\":" + std::to_string(sequence++) +
+            ",\"item_id\":" + json_string(item_id) +
+            ",\"output_index\":" + std::to_string(output_index) +
+            ",\"arguments\":" + json_string(call.arguments_json) + "}");
+    send_event(
+        connection,
+        "response.output_item.done",
+        "{\"type\":\"response.output_item.done\",\"sequence_number\":" +
+            std::to_string(sequence++) + ",\"output_index\":" +
+            std::to_string(output_index) + ",\"item\":{\"id\":" +
+            json_string(item_id) + ",\"call_id\":" + json_string(call_id) +
+            ",\"type\":\"function_call\",\"name\":" +
+            json_string(call.name) + ",\"arguments\":" +
+            json_string(call.arguments_json) +
+            ",\"status\":\"completed\"}}");
+}
+
 void stream_responses(
     Connection &connection,
     const Json &request,
+    const PreparedRequest &prepared,
     const MachModel &model,
     ContinuousBatcher &batcher) {
     const auto headers =
@@ -733,6 +1075,15 @@ void stream_responses(
     try {
         const auto identity = make_identity();
         const std::string model_name(request_model(request, model));
+        const auto configuration = response_configuration(prepared);
+        std::string tools_json = "[";
+        for (std::size_t index = 0; index < prepared.response_tools.size(); ++index) {
+            if (index != 0) {
+                tools_json.push_back(',');
+            }
+            tools_json += json_dump(prepared.response_tools[index]);
+        }
+        tools_json.push_back(']');
         const auto response_stub =
             "{\"id\":" + json_string(identity.id) +
             ",\"object\":\"response\",\"created_at\":" +
@@ -740,8 +1091,10 @@ void stream_responses(
             ",\"status\":\"in_progress\",\"error\":null,"
             "\"incomplete_details\":null,\"model\":" +
             json_string(model_name) +
-            ",\"parallel_tool_calls\":false,\"tool_choice\":\"none\","
-            "\"tools\":[],\"output\":[]}";
+            ",\"parallel_tool_calls\":" +
+            (prepared.parallel_tool_calls ? "true" : "false") +
+            ",\"tool_choice\":" + json_string(prepared.tool_choice) +
+            ",\"tools\":" + tools_json + ",\"output\":[]}";
         send_event(
             connection,
             "response.created",
@@ -752,37 +1105,16 @@ void stream_responses(
             "response.in_progress",
             "{\"type\":\"response.in_progress\",\"sequence_number\":" +
                 std::to_string(sequence++) + ",\"response\":" + response_stub + "}");
-        send_event(
-            connection,
-            "response.output_item.added",
-            "{\"type\":\"response.output_item.added\",\"sequence_number\":" +
-                std::to_string(sequence++) +
-                ",\"output_index\":0,\"item\":{\"id\":" +
-                json_string(identity.message_id) +
-                ",\"type\":\"message\",\"status\":\"in_progress\","
-                "\"role\":\"assistant\",\"content\":[]}}");
-        send_event(
-            connection,
-            "response.content_part.added",
-            "{\"type\":\"response.content_part.added\",\"sequence_number\":" +
-                std::to_string(sequence++) +
-                ",\"item_id\":" + json_string(identity.message_id) +
-                ",\"output_index\":0,\"content_index\":0,\"part\":"
-                "{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}}");
+        bool message_started = !prepared.tools_enabled();
+        bool tool_marker_seen = false;
+        std::string streamed_text;
+        if (message_started) {
+            emit_message_start(connection, identity, 0, sequence);
+        }
 
         std::string pending;
         const auto emit_delta = [&](std::string_view delta) {
-            if (delta.empty()) {
-                return;
-            }
-            send_event(
-                connection,
-                "response.output_text.delta",
-                "{\"type\":\"response.output_text.delta\",\"sequence_number\":" +
-                    std::to_string(sequence++) +
-                    ",\"item_id\":" + json_string(identity.message_id) +
-                    ",\"output_index\":0,\"content_index\":0,\"delta\":" +
-                    json_string(delta) + "}");
+            emit_text_delta(connection, identity, 0, delta, sequence);
         };
         const auto drain_pending = [&](bool final) {
             while (!pending.empty()) {
@@ -827,47 +1159,85 @@ void stream_responses(
             return false;
         };
         const auto result = batcher.generate_from_prompt(
-            formatted_input(request),
+            prepared.prompt,
             request_options(request),
-            [&](std::string_view piece) {
-                pending.append(piece);
-                drain_pending(false);
-            },
+            prepared.tools_enabled()
+                ? TokenCallback{[&](std::string_view piece) {
+                      if (tool_marker_seen) {
+                          return;
+                      }
+                      // The supported tokenizer represents <tool_call> as one
+                      // special token, so syntax never has to be exposed as a
+                      // partial text delta.
+                      const auto marker = piece.find("<tool_call>");
+                      const auto visible = piece.substr(0, marker);
+                      if (!visible.empty()) {
+                          if (!message_started) {
+                              emit_message_start(
+                                  connection, identity, 0, sequence);
+                              message_started = true;
+                          }
+                          streamed_text.append(visible);
+                          pending.append(visible);
+                          drain_pending(false);
+                      }
+                      tool_marker_seen = marker != std::string_view::npos;
+                  }}
+                : TokenCallback{[&](std::string_view piece) {
+                      pending.append(piece);
+                      drain_pending(false);
+                  }},
             cancellation_check);
-        drain_pending(true);
-        send_event(
-            connection,
-            "response.output_text.done",
-            "{\"type\":\"response.output_text.done\",\"sequence_number\":" +
-                std::to_string(sequence++) +
-                ",\"item_id\":" + json_string(identity.message_id) +
-                ",\"output_index\":0,\"content_index\":0,\"text\":" +
-                json_string(result.text) + "}");
-        send_event(
-            connection,
-            "response.content_part.done",
-            "{\"type\":\"response.content_part.done\",\"sequence_number\":" +
-                std::to_string(sequence++) +
-                ",\"item_id\":" + json_string(identity.message_id) +
-                ",\"output_index\":0,\"content_index\":0,\"part\":"
-                "{\"type\":\"output_text\",\"text\":" +
-                json_string(result.text) + ",\"annotations\":[]}}");
-        send_event(
-            connection,
-            "response.output_item.done",
-            "{\"type\":\"response.output_item.done\",\"sequence_number\":" +
-                std::to_string(sequence++) +
-                ",\"output_index\":0,\"item\":{\"id\":" +
-                json_string(identity.message_id) +
-                ",\"type\":\"message\",\"status\":" +
-                json_string(
-                    result.finish_reason == FinishReason::length
-                        ? "incomplete"
-                        : "completed") +
-                ","
-                "\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\","
-                "\"text\":" + json_string(result.text) +
-                ",\"annotations\":[]}]}}");
+        if (!pending.empty()) {
+            drain_pending(true);
+        }
+        const auto output = prepared.tools_enabled()
+                                ? parse_tool_calls(
+                                      result.text,
+                                      prepared.tools,
+                                      prepared.parallel_tool_calls)
+                                : ParsedModelOutput{result.text, {}};
+        const auto item_status = result.finish_reason == FinishReason::length
+                                     ? "incomplete"
+                                     : "completed";
+        std::size_t output_index = 0;
+        if (!output.text.empty() || output.function_calls.empty()) {
+            if (!message_started) {
+                emit_message_start(connection, identity, output_index, sequence);
+                message_started = true;
+            }
+            if (prepared.tools_enabled()) {
+                if (!output.text.starts_with(streamed_text)) {
+                    throw std::runtime_error(
+                        "streamed text does not match parsed model output");
+                }
+                emit_text_delta(
+                    connection,
+                    identity,
+                    output_index,
+                    std::string_view(output.text).substr(streamed_text.size()),
+                    sequence);
+            }
+            emit_message_done(
+                connection,
+                identity,
+                output_index,
+                output.text,
+                item_status,
+                sequence);
+            ++output_index;
+        }
+        for (std::size_t call_index = 0;
+             call_index < output.function_calls.size();
+             ++call_index, ++output_index) {
+            emit_function_call(
+                connection,
+                identity,
+                output.function_calls[call_index],
+                output_index,
+                call_index,
+                sequence);
+        }
         const std::string terminal_event =
             result.finish_reason == FinishReason::length
                 ? "response.incomplete"
@@ -879,7 +1249,8 @@ void stream_responses(
                 ",\"sequence_number\":" +
                 std::to_string(sequence++) +
                 ",\"response\":" +
-                response_json(model_name, result, identity) + "}");
+                response_json(
+                    model_name, result, identity, output, configuration) + "}");
     } catch (const SocketFailure &) {
         return;
     } catch (const std::exception &error) {
@@ -895,19 +1266,11 @@ void stream_responses(
 
 std::string handle_responses(
     const Json &request,
+    const PreparedRequest &prepared,
     const MachModel &model,
     ContinuousBatcher &batcher,
     Connection &connection) {
-    if (request.object() == nullptr) {
-        throw std::runtime_error("request body must be a JSON object");
-    }
-    if (const auto *stream = request.find("stream");
-        stream != nullptr && stream->boolean() == nullptr) {
-        throw std::runtime_error("'stream' must be a boolean");
-    }
-    validate_features(request);
     const auto model_name = request_model(request, model);
-    const auto prompt = formatted_input(request);
     const auto cancellation_check = [&]() {
         if (std::chrono::steady_clock::now() >= connection.deadline) {
             throw std::runtime_error("request deadline exceeded");
@@ -919,12 +1282,23 @@ std::string handle_responses(
         return false;
     };
     const auto result = batcher.generate_from_prompt(
-        prompt,
+        prepared.prompt,
         request_options(request),
         {},
         cancellation_check);
+    const auto output = prepared.tools_enabled()
+                            ? parse_tool_calls(
+                                  result.text,
+                                  prepared.tools,
+                                  prepared.parallel_tool_calls)
+                            : ParsedModelOutput{result.text, {}};
     const auto identity = make_identity();
-    return response_json(model_name, result, identity);
+    return response_json(
+        model_name,
+        result,
+        identity,
+        output,
+        response_configuration(prepared));
 }
 
 void handle_client(
@@ -963,17 +1337,19 @@ void handle_client(
             stream != nullptr && stream->boolean() == nullptr) {
             throw std::runtime_error("'stream' must be a boolean");
         }
-        validate_features(parsed);
         (void)request_model(parsed, model);
+        (void)request_options(parsed);
+        const auto prepared = prepare_request(parsed);
         if (const auto *stream = parsed.find("stream");
             stream != nullptr && stream->boolean() != nullptr && *stream->boolean()) {
-            stream_responses(connection, parsed, model, batcher);
+            stream_responses(connection, parsed, prepared, model, batcher);
         } else {
             send_response(
                 connection,
                 200,
                 "OK",
-                handle_responses(parsed, model, batcher, connection));
+                handle_responses(
+                    parsed, prepared, model, batcher, connection));
         }
     } catch (const SocketFailure &) {
         return;

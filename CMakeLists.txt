@@ -57,6 +57,7 @@ add_library(adi_runtime STATIC
     src/simd_x86_avx512.cpp
     src/simd_x86_vbmi.cpp
     src/tokenizer.cpp
+    src/tool_call.cpp
     src/unicode.cpp
     src/utf8.cpp
     src/version.cpp
@@ -245,6 +246,11 @@ if(ADI_BUILD_TESTS)
     target_include_directories(adi_server_test PRIVATE src)
     add_test(NAME server COMMAND adi_server_test)
 
+    add_executable(adi_tool_call_test tests/tool_call_test.cpp)
+    target_link_libraries(adi_tool_call_test PRIVATE adi_runtime)
+    target_include_directories(adi_tool_call_test PRIVATE src)
+    add_test(NAME tool_call COMMAND adi_tool_call_test)
+
     add_executable(adi_tokenizer_test tests/tokenizer_test.cpp)
     target_link_libraries(adi_tokenizer_test PRIVATE adi_runtime)
     target_include_directories(adi_tokenizer_test PRIVATE src)
@@ -298,6 +304,7 @@ if(ADI_BUILD_TESTS)
             adi_bpe_test
             adi_chat_test
             adi_server_test
+            adi_tool_call_test
             adi_tokenizer_test
             adi_model_e2e_test
             adi_model_batch_test

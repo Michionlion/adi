@@ -63,6 +63,23 @@ void strip_assistant_reasoning(
     }
 }
 
+void append_tool_call(std::string &prompt, const ChatToolCall &call) {
+    if (call.arguments.object() == nullptr) {
+        throw std::runtime_error("function call arguments must be an object");
+    }
+    prompt += "<tool_call>\n<function=" + call.name + ">\n";
+    for (const auto &[name, value] : *call.arguments.object()) {
+        prompt += "<parameter=" + name + ">\n";
+        if (const auto *string = value.string()) {
+            prompt += *string;
+        } else {
+            prompt += json_dump(value);
+        }
+        prompt += "\n</parameter>\n";
+    }
+    prompt += "</function>\n</tool_call>";
+}
+
 } // namespace
 
 bool supported_qwen35_chat_template(
@@ -79,7 +96,8 @@ bool supported_qwen35_chat_template(
 }
 
 std::string qwen35_chat_prompt(
-    std::span<const ChatMessage> messages) {
+    std::span<const ChatMessage> messages,
+    std::span<const Json> tools) {
     if (messages.empty()) {
         throw std::runtime_error("no messages provided");
     }
@@ -113,7 +131,31 @@ std::string qwen35_chat_prompt(
     }
 
     std::string prompt;
-    if (messages.front().role == "system") {
+    if (!tools.empty()) {
+        prompt +=
+            "<|im_start|>system\n"
+            "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+        for (const auto &tool : tools) {
+            prompt += "\n" + json_dump(tool);
+        }
+        prompt +=
+            "\n</tools>"
+            "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+            "<tool_call>\n<function=example_function_name>\n"
+            "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+            "<parameter=example_parameter_2>\nThis is the value for the second parameter\n"
+            "that can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n"
+            "<IMPORTANT>\nReminder:\n"
+            "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n"
+            "- Required parameters MUST be specified\n"
+            "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n"
+            "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n"
+            "</IMPORTANT>";
+        if (messages.front().role == "system" && !contents.front().empty()) {
+            prompt += "\n\n" + contents.front();
+        }
+        prompt += "<|im_end|>\n";
+    } else if (messages.front().role == "system") {
         prompt += "<|im_start|>system\n" + contents.front() +
                   "<|im_end|>\n";
     }
@@ -131,6 +173,18 @@ std::string qwen35_chat_prompt(
                       "<|im_end|>\n";
             continue;
         }
+        if (role == "tool") {
+            if (index == 0 || messages[index - 1].role != "tool") {
+                prompt += "<|im_start|>user";
+            }
+            prompt += "\n<tool_response>\n" + contents[index] +
+                      "\n</tool_response>";
+            if (index + 1 == messages.size() ||
+                messages[index + 1].role != "tool") {
+                prompt += "<|im_end|>\n";
+            }
+            continue;
+        }
         if (role != "assistant") {
             throw std::runtime_error("unsupported input message role");
         }
@@ -141,7 +195,20 @@ std::string qwen35_chat_prompt(
         if (index > last_query) {
             prompt += "<think>\n" + reasoning + "\n</think>\n\n";
         }
-        prompt += contents[index] + "<|im_end|>\n";
+        prompt += contents[index];
+        for (std::size_t call_index = 0;
+             call_index < messages[index].tool_calls.size();
+             ++call_index) {
+            if (call_index == 0) {
+                if (!contents[index].empty()) {
+                    prompt += "\n\n";
+                }
+            } else {
+                prompt += "\n";
+            }
+            append_tool_call(prompt, messages[index].tool_calls[call_index]);
+        }
+        prompt += "<|im_end|>\n";
     }
     prompt += "<|im_start|>assistant\n<think>\n";
     return prompt;

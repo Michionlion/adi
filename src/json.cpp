@@ -4,6 +4,7 @@
 #include <charconv>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -281,6 +282,61 @@ class Parser {
     std::size_t position_ = 0;
 };
 
+void dump_value(std::string &output, const Json &value) {
+    if (value.is_null()) {
+        output += "null";
+        return;
+    }
+    if (const auto *boolean = value.boolean()) {
+        output += *boolean ? "true" : "false";
+        return;
+    }
+    if (const auto *number = value.number()) {
+        if (!std::isfinite(*number)) {
+            throw std::runtime_error("cannot serialize non-finite JSON number");
+        }
+        char buffer[64];
+        const auto [end, error] = std::to_chars(
+            buffer,
+            buffer + sizeof(buffer),
+            *number,
+            std::chars_format::general,
+            std::numeric_limits<double>::max_digits10);
+        if (error != std::errc{}) {
+            throw std::runtime_error("cannot serialize JSON number");
+        }
+        output.append(buffer, end);
+        return;
+    }
+    if (const auto *string = value.string()) {
+        output += json_string(*string);
+        return;
+    }
+    if (const auto *array = value.array()) {
+        output.push_back('[');
+        for (std::size_t index = 0; index < array->size(); ++index) {
+            if (index != 0) {
+                output.push_back(',');
+            }
+            dump_value(output, (*array)[index]);
+        }
+        output.push_back(']');
+        return;
+    }
+
+    output.push_back('{');
+    const auto &object = *value.object();
+    for (std::size_t index = 0; index < object.size(); ++index) {
+        if (index != 0) {
+            output.push_back(',');
+        }
+        output += json_string(object[index].first);
+        output.push_back(':');
+        dump_value(output, object[index].second);
+    }
+    output.push_back('}');
+}
+
 } // namespace
 
 bool Json::is_null() const noexcept {
@@ -363,6 +419,12 @@ std::string json_string(std::string_view input) {
         }
     }
     result.push_back('"');
+    return result;
+}
+
+std::string json_dump(const Json &value) {
+    std::string result;
+    dump_value(result, value);
     return result;
 }
 

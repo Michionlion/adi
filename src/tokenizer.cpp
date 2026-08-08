@@ -234,7 +234,7 @@ void Tokenizer::mask_unused_logits(std::span<float> logits) const {
 }
 
 std::string qwen_user_prompt(std::string_view input) {
-    const ChatMessage message{"user", std::string(input)};
+    const ChatMessage message{"user", std::string(input), {}};
     return qwen35_chat_prompt(std::span<const ChatMessage>(&message, 1));
 }
 
