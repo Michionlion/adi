@@ -20,6 +20,23 @@ namespace {
 
 thread_local bool worker_thread = false;
 
+class WorkerContext {
+  public:
+    WorkerContext() noexcept : previous_(worker_thread) {
+        worker_thread = true;
+    }
+
+    ~WorkerContext() {
+        worker_thread = previous_;
+    }
+
+    WorkerContext(const WorkerContext &) = delete;
+    WorkerContext &operator=(const WorkerContext &) = delete;
+
+  private:
+    bool previous_;
+};
+
 std::uint32_t configured_threads() noexcept {
     const auto available = std::max(1U, std::thread::hardware_concurrency());
     const char *value = std::getenv("ADI_THREADS");
@@ -124,6 +141,7 @@ class WorkerPool {
         }
 
         std::exception_ptr failure;
+        const WorkerContext context;
         try {
             function(
                 count * (task_count - 1) / task_count,
@@ -176,6 +194,7 @@ class WorkerPool {
         }
 
         std::exception_ptr failure;
+        const WorkerContext context;
         try {
             drain();
         } catch (...) {

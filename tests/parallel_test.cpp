@@ -4,10 +4,13 @@
 #include "parallel.hpp"
 
 #include <atomic>
+#include <barrier>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <numeric>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -44,15 +47,21 @@ void check_uneven_work() {
 
 void check_nested() {
     // A dispatch inside a dispatch must still run every index exactly once,
-    // even though the inner one runs in place on the calling worker.
-    constexpr std::uint32_t outer = 8;
+    // and the inner dispatch must run in place on the calling thread. The
+    // barrier makes every pool thread, including the caller, claim one outer
+    // index before any can enter the inner dispatch.
+    const auto outer = adi::detail::worker_thread_count();
     constexpr std::uint32_t inner = 5;
     std::vector<std::atomic<std::uint32_t>> visits(outer * inner);
     for (auto &visit : visits) {
         visit.store(0, std::memory_order_relaxed);
     }
+    std::barrier ready(static_cast<std::ptrdiff_t>(outer));
     adi::detail::parallel_dynamic(outer, [&](std::uint32_t outer_index) {
+        const auto outer_thread = std::this_thread::get_id();
+        ready.arrive_and_wait();
         adi::detail::parallel_dynamic(inner, [&](std::uint32_t inner_index) {
+            assert(std::this_thread::get_id() == outer_thread);
             visits[outer_index * inner + inner_index].fetch_add(
                 1, std::memory_order_relaxed);
         });
