@@ -3,7 +3,9 @@
 #include "utf8.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <bit>
 #include <condition_variable>
 #include <cmath>
 #include <deque>
@@ -43,6 +45,55 @@ std::uint32_t resolved_output_limit(
 } // namespace adi::generation_detail
 namespace adi {
 namespace {
+
+struct SamplingScratch {
+    std::vector<std::uint32_t> indexes;
+    std::vector<std::uint32_t> radix_buffer;
+    std::vector<double> probabilities;
+};
+
+std::uint32_t descending_float_key(float value) noexcept {
+    // The sampling validator rejects non-finite values. Canonicalizing zero is
+    // the one special case needed to match the comparator's +0 == -0 tie.
+    if (value == 0.0F) {
+        value = 0.0F;
+    }
+    constexpr std::uint32_t sign_bit = 0x80000000U;
+    const auto bits = std::bit_cast<std::uint32_t>(value);
+    const auto ascending =
+        (bits & sign_bit) != 0 ? ~bits : bits ^ sign_bit;
+    return ~ascending;
+}
+
+void sort_sampling_indexes(
+    std::span<const float> logits,
+    SamplingScratch &scratch) {
+    scratch.indexes.resize(logits.size());
+    scratch.radix_buffer.resize(logits.size());
+    std::iota(scratch.indexes.begin(), scratch.indexes.end(), 0);
+
+    // Four stable byte passes sort the transformed IEEE-754 key ascending,
+    // which is numeric logit order descending. Starting with ascending token
+    // IDs preserves the old comparator's deterministic tie-break exactly.
+    for (std::uint32_t shift = 0; shift < 32; shift += 8) {
+        std::array<std::size_t, 256> counts{};
+        for (const auto index : scratch.indexes) {
+            const auto bucket =
+                (descending_float_key(logits[index]) >> shift) & 0xFFU;
+            ++counts[bucket];
+        }
+        std::array<std::size_t, 256> offsets{};
+        for (std::size_t bucket = 1; bucket < offsets.size(); ++bucket) {
+            offsets[bucket] = offsets[bucket - 1] + counts[bucket - 1];
+        }
+        for (const auto index : scratch.indexes) {
+            const auto bucket =
+                (descending_float_key(logits[index]) >> shift) & 0xFFU;
+            scratch.radix_buffer[offsets[bucket]++] = index;
+        }
+        scratch.indexes.swap(scratch.radix_buffer);
+    }
+}
 
 void validate_generation_options(
     const MachModel &model,
@@ -125,24 +176,19 @@ std::uint32_t sample_token(
             std::max_element(logits.begin(), logits.end()) - logits.begin());
     }
 
-    std::vector<std::uint32_t> indexes(logits.size());
-    std::iota(indexes.begin(), indexes.end(), 0);
-    std::sort(indexes.begin(), indexes.end(), [&](std::uint32_t left, std::uint32_t right) {
-        if (logits[left] == logits[right]) {
-            return left < right;
-        }
-        return logits[left] > logits[right];
-    });
+    thread_local SamplingScratch scratch;
+    sort_sampling_indexes(logits, scratch);
+    const auto &indexes = scratch.indexes;
     const double maximum = static_cast<double>(logits[indexes[0]]);
-    std::vector<double> probabilities;
-    probabilities.reserve(logits.size());
+    scratch.probabilities.resize(logits.size());
     double denominator = 0.0;
-    for (const auto index : indexes) {
+    for (std::size_t position = 0; position < indexes.size(); ++position) {
+        const auto index = indexes[position];
         const double scaled =
             (static_cast<double>(logits[index]) - maximum) /
             static_cast<double>(temperature);
         const double probability = std::exp(scaled);
-        probabilities.push_back(probability);
+        scratch.probabilities[position] = probability;
         denominator += probability;
     }
     if (!std::isfinite(denominator) || denominator <= 0.0) {
@@ -150,8 +196,8 @@ std::uint32_t sample_token(
     }
     double cumulative = 0.0;
     std::size_t retained = 0;
-    for (; retained < probabilities.size(); ++retained) {
-        cumulative += probabilities[retained] / denominator;
+    for (; retained < scratch.probabilities.size(); ++retained) {
+        cumulative += scratch.probabilities[retained] / denominator;
         if (cumulative >= top_p) {
             ++retained;
             break;
@@ -159,12 +205,15 @@ std::uint32_t sample_token(
     }
     retained = std::max<std::size_t>(1, retained);
     double retained_sum =
-        std::accumulate(probabilities.begin(), probabilities.begin() + retained, 0.0);
+        std::accumulate(
+            scratch.probabilities.begin(),
+            scratch.probabilities.begin() + retained,
+            0.0);
     std::uniform_real_distribution<double> distribution(0.0, retained_sum);
     const double target = distribution(random);
     double running = 0.0;
     for (std::size_t index = 0; index < retained; ++index) {
-        running += probabilities[index];
+        running += scratch.probabilities[index];
         if (target <= running) {
             return indexes[index];
         }

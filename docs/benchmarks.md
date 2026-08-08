@@ -893,3 +893,40 @@ Two adjacent experiments did not pay and are not retained:
 - the nested-dispatch test synchronizes every pool thread, including the
   caller, then verifies each inner dispatch stays on its outer thread and
   executes every index exactly once.
+
+## Exact sampling radix order
+
+Measured on 2026-08-08 on the same eight-core EPYC 9645 VM and Release build.
+The sampled generation path used to comparison-sort every one of the 248,320
+logits on every token, then allocate a second array for probabilities. The
+replacement uses four stable byte-radix passes over an IEEE-754 numeric-order
+key and retains its index and probability buffers per sampling thread.
+
+On a fixed 248,320-logit input at temperature 0.7 and top-p 0.9, medians of
+five 40-sample runs:
+
+| | before | after | change |
+| --- | ---: | ---: | ---: |
+| milliseconds/sample | 20.85 | 4.45 | -78.7% |
+| samples/second | 47.96 | 224.7 | 4.69x |
+
+Both paths produce checksum `5018038` over the 40 chosen token IDs. A direct
+differential test also compares the chosen token and following RNG state with
+the old comparison-sort implementation across temperatures {0.1, 0.7, 2.0},
+top-p values {0.1, 0.9, 1.0}, and 64 seeds. The inputs deliberately contain
+duplicate logits. An additional all-zero test covers the comparator's
+ascending-token-ID tie-break and alternating positive and negative zero. The
+radix key canonicalizes signed zero specifically to preserve that behavior.
+
+A nearby bit-exact non-expert experiment is not retained. Interleaving either
+two or four independent tile rows while preserving each output row's complete
+accumulation order increased the 8192x2048 projection from the 1.21 ms
+baseline to medians of 3.41 ms and 1.64 ms respectively. The extra live
+accumulators and trellis streams cost more than sharing the transformed input
+loads saves.
+
+Pairing the two query heads already assigned to each long-context attention
+worker is not retained either. It reused each key/value span while preserving
+each head's token-order arithmetic, but attention work excluding projections
+rose from a 703 ms median to 888 ms over the 2,048-token benchmark. The
+existing one-head-at-a-time loop has the better compiler schedule.
