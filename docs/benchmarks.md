@@ -368,12 +368,47 @@ the smaller differences as ties.
 | Batch | 1 | 4 | 8 | 16 | 32 |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Before | 1.97 | 4.83 | 6.16 | 6.29 | 7.45 |
-| After | 2.96 | 8.82 | 12.83 | 17.13 | 18.82 |
+| Expert lanes | 2.96 | 8.82 | 12.83 | 17.13 | 18.82 |
+| Linear-attention dispatch | 2.94 | 10.29 | 17.03 | 27.20 | 31.69 |
 
-Batch 1 gains 50% without touching a batch kernel at all: single-sequence
-decode routes through `moe_forward` and `mach_expert_matvec`, so what it picks
-up is the shared trellis walk. Everything above batch 1 gains from the lanes
-as well, and the curve no longer flattens after batch 16.
+Batch 1 gains 50% from the expert work without touching a batch kernel at all:
+single-sequence decode routes through `moe_forward` and `mach_expert_matvec`,
+so what it picks up is the shared trellis walk. Everything above batch 1 gains
+from the lanes as well, and the curve no longer flattens after batch 16.
+
+The second row is `linear_attention_forward_batch`, which batched only its
+projections and ran the convolution, the normalizations, the recurrence and
+the gating in a serial loop over sequences, dispatching the worker pool once
+per sequence per layer. Dispatching once over sequences instead takes linear
+attention from 1261 ms to 488 ms of the batch-32 decode step. Batch 1 is
+unchanged because a single task runs in place on the calling thread, which is
+not a worker, so the recurrence still spreads across its 32 value heads.
+
+### Where decode time goes now
+
+Wall time per decode step, from the stage timers:
+
+| | batch 1 | batch 8 | batch 32 |
+| --- | ---: | ---: | ---: |
+| linear attention | 170 ms | 176 ms | 488 ms |
+| MoE | 143 ms | 159 ms | 317 ms |
+| full attention | 42 ms | 44 ms | 73 ms |
+| step total | 367 ms | 441 ms | 1044 ms |
+
+Two things follow. Decode is latency-bound rather than throughput-bound below
+batch 8: a step costs 367 ms for one sequence and 441 ms for eight, so the
+batch is nearly free. And linear attention is still the largest single stage
+at every batch, so it is where the next decode work belongs.
+
+The dispatch over sequences also leaves cores idle between batch 2 and 7,
+where `parallel_tasks` creates only one task per sequence: linear attention
+costs about the same 170 to 190 ms at batches 1, 4, and 8. Splitting the
+recurrence over sequences and value heads together, the way
+`linear_attention_prefill_chunk` splits over heads, would fill them.
+
+MoE dispatch in decode reaches 0.58 to 0.64 parallel efficiency against the
+0.933 the same dispatch reaches in prefill, because decode spreads few rows
+over many experts and most fall below the batch kernel's threshold.
 
 ### Exactness
 
