@@ -1028,3 +1028,25 @@ and all 65,536 possible trellis states. Results are bit-exact. A former
 large-table arithmetic-gather experiment lost to cached state lookup; the
 winning combination amortizes the arithmetic across rows and keeps its much
 smaller signed table hot.
+
+## Channel-blocked prefill convolution
+
+Measured on 2026-08-08 on the same eight-core EPYC 9645 VM and Release build.
+The causal width-four convolution has independent state per channel. Prefill
+now gives each worker whole 128-channel head blocks and advances the tokens
+sequentially inside those blocks. Each worker also normalizes the complete
+query/key heads it owns, avoiding another dispatch while preserving the
+scalar arithmetic order.
+
+| 128-token prompt, microbatch 128 | before | after | change |
+| --- | ---: | ---: | ---: |
+| seconds/prefill | 3.420 | 3.174 | -7.2% |
+| prompt tokens/second | 37.43 | 40.33 | +7.7% |
+| linear-attention stage | 1337.7 ms | 1075.6 ms | -19.6% |
+
+The table reports medians of three interleaved pairs. Five interleaved
+64-token pairs independently moved from 1.973 to 1.831 seconds per prefill,
+also a 7.2% reduction. Final-logit and complete-state checksums match at both
+widths. The direct equivalence test starts with nonzero convolution and
+recurrent state and compares token-at-a-time execution bit-for-bit for chunks
+of 1, 2, 7, 16, 64, and 65 tokens.

@@ -953,12 +953,11 @@ void linear_attention_forward_batch(
 
 } // namespace
 
-// Prefill evaluates one sequence, so every token shares one recurrent state
-// and the batch function has to walk tokens one at a time, dispatching the
-// worker pool once per token per layer. The recurrence is independent across
-// value heads while tokens must stay ordered within a head, so this flips the
-// loops: one dispatch over heads for the whole chunk, tokens sequential
-// inside. Every value, and the order every value is computed in, is unchanged.
+// Prefill evaluates one sequence, so every token shares recurrent state. The
+// convolution is independent across channels and the Gated Delta recurrence
+// is independent across value heads, while tokens stay ordered within each.
+// The chunk path assigns those independent streams to workers and walks their
+// tokens sequentially. Every value and its arithmetic order remain unchanged.
 void linear_attention_prefill_chunk(
     const MachModel &model,
     std::uint32_t layer,
@@ -1031,36 +1030,61 @@ void linear_attention_prefill_chunk(
     backend.dense_bf16_matmul(descriptor.alpha, inputs, tokens, scratch.alpha);
     backend.dense_bf16_matmul(descriptor.beta, inputs, tokens, scratch.beta);
 
-    // Phase B: the short convolution carries history across tokens, so it
-    // stays strictly sequential, with the history shifted in the same order.
-    for (std::size_t token = 0; token < count; ++token) {
-        const auto *qkv = scratch.qkv.data() + token * channels;
-        auto *convolved = scratch.convolved.data() + token * channels;
-        for (std::uint32_t channel = 0; channel < channels; ++channel) {
-            const auto history = static_cast<std::size_t>(channel) * 3;
-            const auto weights =
-                static_cast<std::size_t>(channel) * convolution_width;
-            float value = 0.0F;
-            for (std::uint32_t index = 0; index < 3; ++index) {
-                value += state.convolution[history + index] *
-                         bf16_to_f32(descriptor.convolution[weights + index]);
+    // Phase B: channels have independent convolution histories. Assign whole
+    // head-sized channel blocks to workers and keep tokens ordered within
+    // each block. Whole heads also let their owner normalize Q/K without a
+    // second dispatch or a cross-worker dependency.
+    constexpr std::uint32_t channel_heads = channels / head_size;
+    detail::parallel_ranges(
+        channel_heads,
+        4,
+        [&](std::uint32_t head_begin, std::uint32_t head_end) {
+            const auto channel_begin = head_begin * head_size;
+            const auto channel_end = head_end * head_size;
+            for (std::size_t token = 0; token < count; ++token) {
+                const auto *qkv =
+                    scratch.qkv.data() + token * channels;
+                auto *convolved =
+                    scratch.convolved.data() + token * channels;
+                for (std::uint32_t channel = channel_begin;
+                     channel < channel_end;
+                     ++channel) {
+                    const auto history =
+                        static_cast<std::size_t>(channel) * 3;
+                    const auto weights =
+                        static_cast<std::size_t>(channel) *
+                        convolution_width;
+                    float value = 0.0F;
+                    for (std::uint32_t index = 0; index < 3; ++index) {
+                        value += state.convolution[history + index] *
+                                 bf16_to_f32(
+                                     descriptor.convolution[weights + index]);
+                    }
+                    value += qkv[channel] *
+                             bf16_to_f32(
+                                 descriptor.convolution[weights + 3]);
+                    convolved[channel] = silu(value);
+                    state.convolution[history] =
+                        state.convolution[history + 1];
+                    state.convolution[history + 1] =
+                        state.convolution[history + 2];
+                    state.convolution[history + 2] = qkv[channel];
+                }
             }
-            value += qkv[channel] *
-                     bf16_to_f32(descriptor.convolution[weights + 3]);
-            convolved[channel] = silu(value);
-            state.convolution[history] = state.convolution[history + 1];
-            state.convolution[history + 1] = state.convolution[history + 2];
-            state.convolution[history + 2] = qkv[channel];
-        }
-        for (std::uint32_t head = 0; head < key_heads; ++head) {
-            const auto offset = static_cast<std::size_t>(head) * head_size;
-            l2_normalize(
-                std::span<float>(convolved + offset, head_size), epsilon);
-            l2_normalize(
-                std::span<float>(convolved + qk_size + offset, head_size),
-                epsilon);
-        }
-    }
+            for (std::uint32_t head = head_begin;
+                 head < std::min(head_end, 2 * key_heads);
+                 ++head) {
+                for (std::size_t token = 0; token < count; ++token) {
+                    auto *convolved =
+                        scratch.convolved.data() + token * channels;
+                    const auto offset =
+                        static_cast<std::size_t>(head) * head_size;
+                    l2_normalize(
+                        std::span<float>(convolved + offset, head_size),
+                        epsilon);
+                }
+            }
+        });
 
     // Phase C: one worker dispatch for the whole chunk instead of one per
     // token. Each value head owns its own slice of the recurrent state.
