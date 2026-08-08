@@ -5,6 +5,7 @@
 #include "adi/executor.hpp"
 #include "adi/generation.hpp"
 #include "adi/model.hpp"
+#include "model_test_main.hpp"
 #include "adi/options.hpp"
 
 #include <cassert>
@@ -154,14 +155,42 @@ void check_rejected_ubatch(const adi::MachModel &model) {
     }
 }
 
+void check_cancelled_prefill(const adi::MachModel &model) {
+    const auto tokens = prompt_tokens(model, 9);
+    adi::DecoderState state;
+    adi::PrefillScratch scratch;
+    std::vector<float> logits(model.config().vocabulary);
+    std::uint32_t checks = 0;
+    bool cancelled = false;
+    try {
+        adi::prefill(
+            model,
+            tokens,
+            state,
+            logits,
+            scratch,
+            adi::cpu_backend(),
+            [&] { return ++checks == 2; });
+    } catch (const std::runtime_error &) {
+        cancelled = true;
+    }
+    assert(cancelled);
+    assert(checks == 2);
+    assert(state.position == 0);
+}
+
 } // namespace
 
-int main(int argc, char **argv) {
+int ADI_MODEL_TEST_MAIN(
+    int argc,
+    adi::test_detail::CommandCharacter **argv) {
     assert(argc == 2 || argc == 3);
-    const adi::MachModel model(argv[1]);
-    const bool full = argc == 3 && std::string_view(argv[2]) == "--full";
+    const adi::MachModel model(adi::test_detail::model_path(argv[1]));
+    const bool full =
+        argc == 3 && adi::test_detail::full_argument(argv[2]);
 
     check_rejected_ubatch(model);
+    check_cancelled_prefill(model);
     check_decode_anchor(model, 3);
 
     if (full) {

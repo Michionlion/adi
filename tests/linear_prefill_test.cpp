@@ -4,6 +4,7 @@
 // convolution history, and the same Gated DeltaNet recurrent state.
 #include "adi/executor.hpp"
 #include "adi/model.hpp"
+#include "model_test_main.hpp"
 
 #include <cassert>
 #include <cstdint>
@@ -101,9 +102,11 @@ void check_tokens(
 
 } // namespace
 
-int main(int argc, char **argv) {
+int ADI_MODEL_TEST_MAIN(
+    int argc,
+    adi::test_detail::CommandCharacter **argv) {
     assert(argc == 2);
-    const adi::MachModel model(argv[1]);
+    const adi::MachModel model(adi::test_detail::model_path(argv[1]));
     const auto layer = first_linear_layer(model);
 
     // 64 is the default microbatch and 65 crosses it; 7 is a chunk that

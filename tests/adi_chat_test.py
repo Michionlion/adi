@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import subprocess
 import sys
 import types
 import unittest
@@ -122,6 +124,17 @@ SPEC.loader.exec_module(adi_chat)
 
 
 class AdiChatTests(unittest.TestCase):
+    def test_windows_ctrl_break_uses_keyboard_interrupt_handler(self) -> None:
+        with mock.patch.object(adi_chat.signal, "signal") as register:
+            adi_chat.configure_windows_console_signals()
+        if os.name == "nt":
+            register.assert_called_once_with(
+                adi_chat.signal.SIGBREAK,
+                adi_chat.signal.default_int_handler,
+            )
+        else:
+            register.assert_not_called()
+
     def test_optional_max_tokens_is_omitted_from_payload(self) -> None:
         settings = adi_chat.GenerationSettings(
             max_output_tokens=None,
@@ -373,11 +386,51 @@ class AdiChatTests(unittest.TestCase):
         )
         self.assertIsNone(adi_chat.parse_listening_port("unrelated output"))
 
+    def test_ctrl_c_at_prompt_exits_interactive_loop(self) -> None:
+        class FakeClient:
+            responses_url = "http://127.0.0.1:1234/v1/responses"
+
+        console = StubConsole()
+        adi_chat.console = console
+        with mock.patch.object(
+            adi_chat,
+            "read_user_input_line",
+            side_effect=KeyboardInterrupt,
+        ):
+            adi_chat.interactive_loop(
+                FakeClient(),
+                adi_chat.Conversation(),
+                adi_chat.GenerationSettings(None, 0.0, 1.0, 0),
+                stream=True,
+                session_path=None,
+            )
+        self.assertNotIn("Use /exit", "".join(text for text, _ in console.output))
+
+    @unittest.skipUnless(os.name == "nt", "Windows job object test")
+    def test_windows_job_kills_child_when_closed(self) -> None:
+        job = adi_chat.WindowsKillOnCloseJob.create()
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+        try:
+            job.assign(process.pid)
+            job.close()
+            process.wait(timeout=3.0)
+            self.assertIsNotNone(process.returncode)
+        finally:
+            job.close()
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=3.0)
+
     def test_managed_server_passes_port_zero_through(self) -> None:
         captured_command: list[str] = []
+        fake_job = mock.Mock()
 
         class FakeProcess:
             def __init__(self) -> None:
+                self.pid = 123
                 self.stdout = iter(
                     ["adi: listening on http://127.0.0.1:43210/v1/responses\n"]
                 )
@@ -402,7 +455,14 @@ class AdiChatTests(unittest.TestCase):
             captured_command[:] = command
             return FakeProcess()
 
-        with mock.patch.object(adi_chat.subprocess, "Popen", fake_popen):
+        with (
+            mock.patch.object(adi_chat.subprocess, "Popen", fake_popen),
+            mock.patch.object(
+                adi_chat.WindowsKillOnCloseJob,
+                "create",
+                return_value=fake_job,
+            ),
+        ):
             server = adi_chat.ManagedAdiServer.start(
                 Path("/fake/adi"),
                 Path("/fake/model.gguf"),
@@ -417,8 +477,12 @@ class AdiChatTests(unittest.TestCase):
                 self.assertEqual(captured_command[-2:], ["--port", "0"])
                 self.assertEqual(server.port, 43210)
                 self.assertEqual(server.base_url, "http://127.0.0.1:43210")
+                if os.name == "nt":
+                    fake_job.assign.assert_called_once_with(123)
             finally:
                 server.stop()
+        if os.name == "nt":
+            fake_job.close.assert_called_once_with()
 
 
 if __name__ == "__main__":

@@ -30,10 +30,19 @@ constexpr std::uint32_t max_dimensions = 4;
     throw std::runtime_error("GGUF: " + std::string(message));
 }
 
+std::string display_path(const std::filesystem::path &path) {
+    const auto utf8 = path.u8string();
+    return {
+        reinterpret_cast<const char *>(utf8.data()),
+        utf8.size(),
+    };
+}
+
 #ifndef _WIN32
 [[noreturn]] void fail_errno(std::string_view action, const std::filesystem::path &path) {
     throw std::runtime_error(
-        std::string(action) + " '" + path.string() + "': " + std::strerror(errno));
+        std::string(action) + " '" + display_path(path) + "': " +
+        std::strerror(errno));
 }
 #endif
 
@@ -43,8 +52,30 @@ constexpr std::uint32_t max_dimensions = 4;
     const std::filesystem::path &path,
     unsigned long error) {
     throw std::runtime_error(
-        std::string(action) + " '" + path.string() + "' (Windows error " +
+        std::string(action) + " '" + display_path(path) + "' (Windows error " +
         std::to_string(error) + ")");
+}
+
+std::wstring windows_file_path(const std::filesystem::path &path) {
+    const auto required = ::GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+    if (required == 0) {
+        return path.native();
+    }
+    std::wstring absolute(required, L'\0');
+    const auto written = ::GetFullPathNameW(
+        path.c_str(), required, absolute.data(), nullptr);
+    if (written == 0 || written >= required) {
+        return path.native();
+    }
+    absolute.resize(written);
+    if (absolute.size() < MAX_PATH || absolute.starts_with(L"\\\\?\\") ||
+        absolute.starts_with(L"\\\\.\\")) {
+        return absolute;
+    }
+    if (absolute.starts_with(L"\\\\")) {
+        return L"\\\\?\\UNC\\" + absolute.substr(2);
+    }
+    return L"\\\\?\\" + absolute;
 }
 #endif
 
@@ -203,8 +234,9 @@ T load_scalar(const std::byte *data) {
 
 GgufFile::GgufFile(const std::filesystem::path &path) {
 #ifdef _WIN32
+    const auto native_path = windows_file_path(path);
     file_handle_ = ::CreateFileW(
-        path.c_str(),
+        native_path.c_str(),
         GENERIC_READ,
         FILE_SHARE_READ,
         nullptr,

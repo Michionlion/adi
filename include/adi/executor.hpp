@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <span>
 #include <vector>
@@ -252,6 +253,7 @@ void prefill(
     // An empty span advances the model state without computing unused logits.
     std::span<float> logits,
     PrefillScratch &scratch,
-    const Backend &backend = cpu_backend());
+    const Backend &backend = cpu_backend(),
+    const std::function<bool()> &cancelled = {});
 
 } // namespace adi

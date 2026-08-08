@@ -1,6 +1,7 @@
 #include "adi/model.hpp"
 #include "adi/tokenizer.hpp"
 #include "chat.hpp"
+#include "model_test_main.hpp"
 
 #include <cassert>
 #include <cstdint>
@@ -10,9 +11,11 @@
 #include <utility>
 #include <vector>
 
-int main(int argc, char **argv) {
+int ADI_MODEL_TEST_MAIN(
+    int argc,
+    adi::test_detail::CommandCharacter **argv) {
     assert(argc == 2);
-    adi::MachModel model(argv[1]);
+    adi::MachModel model(adi::test_detail::model_path(argv[1]));
     adi::Tokenizer tokenizer(model);
     const auto chat_template =
         model.gguf().string("tokenizer.chat_template");

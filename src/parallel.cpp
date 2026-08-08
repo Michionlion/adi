@@ -1,5 +1,7 @@
 #include "parallel.hpp"
 
+#include "environment.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <charconv>
@@ -39,7 +41,8 @@ class WorkerContext {
 
 std::uint32_t configured_threads() noexcept {
     const auto available = std::max(1U, std::thread::hardware_concurrency());
-    const char *value = std::getenv("ADI_THREADS");
+    std::array<char, 32> value_buffer{};
+    const char *value = environment_variable("ADI_THREADS", value_buffer);
     if (value == nullptr) {
         return available;
     }

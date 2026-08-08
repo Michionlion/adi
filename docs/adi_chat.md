@@ -90,3 +90,6 @@ output omits the changing footer but keeps the final summary.
 A turn is committed to history only after a complete response. Interrupting a
 stream with Ctrl+C closes the HTTP request, leaves the local history unchanged,
 and allows ADI to observe the disconnect through its normal cancellation path.
+Ctrl+C at the input prompt exits the client. On Windows, a managed ADI server is
+also placed in a kill-on-close job so it cannot survive an interrupted client or
+its `uv run` wrapper.

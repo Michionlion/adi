@@ -4,6 +4,7 @@
 // unbatched path exactly at every batch size and every routing pattern.
 #include "adi/executor.hpp"
 #include "adi/model.hpp"
+#include "model_test_main.hpp"
 
 #include <algorithm>
 #include <array>
@@ -198,9 +199,11 @@ void operator delete(void *memory, std::size_t) noexcept {
     std::free(memory);
 }
 
-int main(int argc, char **argv) {
+int ADI_MODEL_TEST_MAIN(
+    int argc,
+    adi::test_detail::CommandCharacter **argv) {
     assert(argc == 2);
-    const adi::MachModel model(argv[1]);
+    const adi::MachModel model(adi::test_detail::model_path(argv[1]));
     constexpr std::uint32_t layer = 0;
     for (const auto pattern :
          {Pattern::identical, Pattern::varied, Pattern::duplicated}) {

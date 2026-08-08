@@ -1,15 +1,18 @@
 #include "adi/generation.hpp"
 #include "adi/model.hpp"
 #include "adi/tokenizer.hpp"
+#include "model_test_main.hpp"
 
 #include <cassert>
 #include <string>
 #include <string_view>
 #include <thread>
 
-int main(int argc, char **argv) {
+int ADI_MODEL_TEST_MAIN(
+    int argc,
+    adi::test_detail::CommandCharacter **argv) {
     assert(argc == 2);
-    adi::MachModel model(argv[1]);
+    adi::MachModel model(adi::test_detail::model_path(argv[1]));
     adi::Tokenizer tokenizer(model);
     adi::GenerationOptions options;
     options.max_output_tokens = 1;

@@ -14,7 +14,9 @@ from __future__ import annotations
 import json
 import math
 import os
+import queue
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -76,6 +78,22 @@ class ClientError(RuntimeError):
 
 class ApiError(ClientError):
     """An error returned by ADI's Responses API."""
+
+
+def configure_windows_utf8_stdio() -> None:
+    """Keep redirected Windows output compatible with UTF-8 PowerShell pipes."""
+    if os.name != "nt":
+        return
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
+def configure_windows_console_signals() -> None:
+    """Treat Windows Ctrl+Break like Ctrl+C inside the client."""
+    if os.name == "nt" and hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, signal.default_int_handler)
 
 
 @dataclass(frozen=True)
@@ -404,16 +422,51 @@ class AdiResponsesClient:
                             )
                         raise ApiError(str(message))
 
-                for line in response.iter_lines():
-                    if line == "":
-                        dispatch()
-                    elif line.startswith(":"):
-                        continue
-                    elif line.startswith("event:"):
-                        event_name = line[6:].lstrip()
-                    elif line.startswith("data:"):
-                        data_lines.append(line[5:].lstrip())
-                dispatch()
+                lines: queue.Queue[object] = queue.Queue()
+                stream_finished = object()
+
+                def read_stream() -> None:
+                    try:
+                        for line in response.iter_lines():
+                            lines.put(line)
+                    except BaseException as error:
+                        lines.put(error)
+                    finally:
+                        lines.put(stream_finished)
+
+                reader = threading.Thread(
+                    target=read_stream,
+                    name="adi-response-reader",
+                    daemon=True,
+                )
+                reader.start()
+                try:
+                    while True:
+                        try:
+                            item = lines.get(timeout=0.1)
+                        except queue.Empty:
+                            continue
+                        if item is stream_finished:
+                            break
+                        if isinstance(item, BaseException):
+                            raise item
+                        line = str(item)
+                        if line == "":
+                            dispatch()
+                        elif line.startswith(":"):
+                            continue
+                        elif line.startswith("event:"):
+                            event_name = line[6:].lstrip()
+                        elif line.startswith("data:"):
+                            data_lines.append(line[5:].lstrip())
+                    dispatch()
+                except BaseException:
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+                    reader.join(timeout=5.0)
+                    raise
         except ApiError:
             raise
         except httpx.HTTPError as error:
@@ -449,6 +502,120 @@ class AdiResponsesClient:
         raise ApiError(message)
 
 
+class WindowsKillOnCloseJob:
+    """Own a Windows job that kills its processes when this client disappears."""
+
+    KILL_ON_JOB_CLOSE = 0x00002000
+    EXTENDED_LIMIT_INFORMATION = 9
+    PROCESS_TERMINATE = 0x0001
+    PROCESS_SET_QUOTA = 0x0100
+
+    def __init__(self, handle: int, kernel32: Any) -> None:
+        self.handle = handle
+        self.kernel32 = kernel32
+
+    @classmethod
+    def create(cls) -> "WindowsKillOnCloseJob":
+        import ctypes
+        from ctypes import wintypes
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_uint64),
+                ("WriteOperationCount", ctypes.c_uint64),
+                ("OtherOperationCount", ctypes.c_uint64),
+                ("ReadTransferCount", ctypes.c_uint64),
+                ("WriteTransferCount", ctypes.c_uint64),
+                ("OtherTransferCount", ctypes.c_uint64),
+            ]
+
+        class BasicLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class ExtendedLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", BasicLimitInformation),
+                ("IoInfo", IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        handle = kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        information = ExtendedLimitInformation()
+        information.BasicLimitInformation.LimitFlags = cls.KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(
+            handle,
+            cls.EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            error = ctypes.WinError(ctypes.get_last_error())
+            kernel32.CloseHandle(handle)
+            raise error
+        return cls(handle, kernel32)
+
+    def assign(self, process_id: int) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        self.kernel32.OpenProcess.argtypes = [
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        ]
+        self.kernel32.OpenProcess.restype = wintypes.HANDLE
+        self.kernel32.AssignProcessToJobObject.argtypes = [
+            wintypes.HANDLE,
+            wintypes.HANDLE,
+        ]
+        self.kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+
+        process = self.kernel32.OpenProcess(
+            self.PROCESS_TERMINATE | self.PROCESS_SET_QUOTA,
+            False,
+            process_id,
+        )
+        if not process:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            if not self.kernel32.AssignProcessToJobObject(self.handle, process):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            self.kernel32.CloseHandle(process)
+
+    def close(self) -> None:
+        if self.handle:
+            self.kernel32.CloseHandle(self.handle)
+            self.handle = 0
+
+
 class ManagedAdiServer:
     def __init__(
         self,
@@ -456,11 +623,13 @@ class ManagedAdiServer:
         log_tail: deque[str],
         host: str,
         port: int,
+        kill_job: Optional[WindowsKillOnCloseJob] = None,
     ) -> None:
         self.process = process
         self.log_tail = log_tail
         self.host = host
         self.port = port
+        self.kill_job = kill_job
         self.listening = False
         self.log_thread: Optional[threading.Thread] = None
 
@@ -507,7 +676,11 @@ class ManagedAdiServer:
             creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         else:
             start_new_session = True
+        kill_job: Optional[WindowsKillOnCloseJob] = None
+        process: Optional[subprocess.Popen[str]] = None
         try:
+            if os.name == "nt":
+                kill_job = WindowsKillOnCloseJob.create()
             process = subprocess.Popen(
                 command,
                 stdin=subprocess.DEVNULL,
@@ -521,11 +694,18 @@ class ManagedAdiServer:
                 creationflags=creation_flags,
                 start_new_session=start_new_session,
             )
+            if kill_job is not None:
+                kill_job.assign(process.pid)
         except OSError as error:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait(timeout=5.0)
+            if kill_job is not None:
+                kill_job.close()
             raise ClientError(f"cannot start ADI: {error}") from error
 
         log_tail: deque[str] = deque(maxlen=40)
-        server = cls(process, log_tail, host, port)
+        server = cls(process, log_tail, host, port, kill_job)
 
         def drain_output() -> None:
             assert process.stdout is not None
@@ -568,13 +748,18 @@ class ManagedAdiServer:
         raise ClientError(f"ADI did not listen within {timeout:g} seconds{detail}")
 
     def stop(self) -> None:
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5.0)
+        try:
+            if self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=5.0)
+        finally:
+            if self.kill_job is not None:
+                self.kill_job.close()
+                self.kill_job = None
         if self.log_thread is not None:
             self.log_thread.join(timeout=1.0)
 
@@ -1269,7 +1454,10 @@ def interactive_loop(
             style="dim",
             markup=False,
         )
-    console.print("Type /help for commands; Ctrl+D or /exit quits.", style="dim")
+    console.print(
+        "Type /help for commands; Ctrl+C, Ctrl+D, or /exit quits.",
+        style="dim",
+    )
     while True:
         try:
             line = read_user_input_line()
@@ -1277,8 +1465,8 @@ def interactive_loop(
             console.print()
             return
         except KeyboardInterrupt:
-            console.print("\n[dim]Use /exit to quit.[/dim]")
-            continue
+            console.print()
+            return
         if not line:
             continue
         if line.startswith("/"):
@@ -1538,6 +1726,9 @@ def chat(
 
 
 if __name__ == "__main__":
+    configure_windows_utf8_stdio()
+    configure_windows_console_signals()
+    console = Console()
     if len(sys.argv) == 1:
         sys.argv.append("--help")
     app()
