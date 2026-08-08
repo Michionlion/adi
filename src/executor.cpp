@@ -740,145 +740,153 @@ void linear_attention_forward_batch(
         static_cast<std::uint32_t>(batch),
         batch_scratch.projection_3);
 
-    for (std::size_t batch_index = 0;
-         batch_index < batch;
-         ++batch_index) {
-        auto &state = *states[batch_index];
-        auto &scratch = *scratches[batch_index];
-        scratch.qkv.assign(
-            batch_scratch.projection_0.begin() + batch_index * channels,
-            batch_scratch.projection_0.begin() + (batch_index + 1) * channels);
-        scratch.gate.assign(
-            batch_scratch.projection_1.begin() + batch_index * value_size,
-            batch_scratch.projection_1.begin() + (batch_index + 1) * value_size);
-        scratch.alpha.assign(
-            batch_scratch.projection_2.begin() + batch_index * value_heads,
-            batch_scratch.projection_2.begin() + (batch_index + 1) * value_heads);
-        scratch.beta.assign(
-            batch_scratch.projection_3.begin() + batch_index * value_heads,
-            batch_scratch.projection_3.begin() + (batch_index + 1) * value_heads);
-        scratch.convolved.resize(channels);
-        scratch.recurrent_output.resize(value_size);
-        scratch.normalized.resize(value_size);
+    // Decode batches are independent sequences: each one owns its convolution
+    // and recurrent state and writes only its own slice of the staged output.
+    // Walking them serially meant the convolution, the normalizations and the
+    // gating ran on one thread, and gated_delta_recurrent dispatched the
+    // worker pool once per sequence per layer. One dispatch over sequences
+    // instead leaves that recurrence nested, so it runs in place, and every
+    // value is computed exactly as before.
+    detail::parallel_tasks(
+        static_cast<std::uint32_t>(batch),
+        [&](std::uint32_t batch_index) {
+            auto &state = *states[batch_index];
+            auto &scratch = *scratches[batch_index];
+            const auto item = static_cast<std::size_t>(batch_index);
+            const auto qkv = batch_scratch.projection_0.begin() +
+                             item * channels;
+            scratch.qkv.assign(qkv, qkv + channels);
+            const auto gate = batch_scratch.projection_1.begin() +
+                              item * value_size;
+            scratch.gate.assign(gate, gate + value_size);
+            const auto alpha = batch_scratch.projection_2.begin() +
+                               item * value_heads;
+            scratch.alpha.assign(alpha, alpha + value_heads);
+            const auto beta = batch_scratch.projection_3.begin() +
+                              item * value_heads;
+            scratch.beta.assign(beta, beta + value_heads);
+            scratch.convolved.resize(channels);
+            scratch.recurrent_output.resize(value_size);
+            scratch.normalized.resize(value_size);
 
-        if (descriptor.convolution.size() !=
-            static_cast<std::size_t>(channels) * convolution_width) {
-            throw std::runtime_error(
-                "linear attention convolution shape mismatch");
-        }
-        if (state.convolution.empty()) {
-            state.convolution.assign(
+            if (descriptor.convolution.size() !=
+                static_cast<std::size_t>(channels) * convolution_width) {
+                throw std::runtime_error(
+                    "linear attention convolution shape mismatch");
+            }
+            if (state.convolution.empty()) {
+                state.convolution.assign(
+                    static_cast<std::size_t>(channels) *
+                        (convolution_width - 1),
+                    0.0F);
+            }
+            if (state.convolution.size() !=
                 static_cast<std::size_t>(channels) *
-                    (convolution_width - 1),
-                0.0F);
-        }
-        if (state.convolution.size() !=
-            static_cast<std::size_t>(channels) *
-                (convolution_width - 1)) {
-            throw std::invalid_argument(
-                "linear attention convolution state mismatch");
-        }
-        for (std::uint32_t channel = 0;
-             channel < channels;
-             ++channel) {
-            const auto history = static_cast<std::size_t>(channel) * 3;
-            const auto weights =
-                static_cast<std::size_t>(channel) * convolution_width;
-            float value = 0.0F;
-            for (std::uint32_t index = 0; index < 3; ++index) {
+                    (convolution_width - 1)) {
+                throw std::invalid_argument(
+                    "linear attention convolution state mismatch");
+            }
+            for (std::uint32_t channel = 0;
+                 channel < channels;
+                 ++channel) {
+                const auto history = static_cast<std::size_t>(channel) * 3;
+                const auto weights =
+                    static_cast<std::size_t>(channel) * convolution_width;
+                float value = 0.0F;
+                for (std::uint32_t index = 0; index < 3; ++index) {
+                    value +=
+                        state.convolution[history + index] *
+                        bf16_to_f32(descriptor.convolution[weights + index]);
+                }
                 value +=
-                    state.convolution[history + index] *
-                    bf16_to_f32(descriptor.convolution[weights + index]);
+                    scratch.qkv[channel] *
+                    bf16_to_f32(descriptor.convolution[weights + 3]);
+                scratch.convolved[channel] = silu(value);
+                state.convolution[history] =
+                    state.convolution[history + 1];
+                state.convolution[history + 1] =
+                    state.convolution[history + 2];
+                state.convolution[history + 2] = scratch.qkv[channel];
             }
-            value +=
-                scratch.qkv[channel] *
-                bf16_to_f32(descriptor.convolution[weights + 3]);
-            scratch.convolved[channel] = silu(value);
-            state.convolution[history] =
-                state.convolution[history + 1];
-            state.convolution[history + 1] =
-                state.convolution[history + 2];
-            state.convolution[history + 2] = scratch.qkv[channel];
-        }
 
-        auto query = std::span<float>(scratch.convolved.data(), qk_size);
-        auto key = std::span<float>(
-            scratch.convolved.data() + qk_size,
-            qk_size);
-        auto value = std::span<float>(
-            scratch.convolved.data() + 2 * qk_size,
-            value_size);
-        for (std::uint32_t head = 0; head < key_heads; ++head) {
-            for (auto vector : {
-                     query.subspan(
-                         static_cast<std::size_t>(head) * head_size,
-                         head_size),
-                     key.subspan(
-                         static_cast<std::size_t>(head) * head_size,
-                         head_size),
-                }) {
-                l2_normalize(vector, epsilon);
+            auto query = std::span<float>(scratch.convolved.data(), qk_size);
+            auto key = std::span<float>(
+                scratch.convolved.data() + qk_size,
+                qk_size);
+            auto value = std::span<float>(
+                scratch.convolved.data() + 2 * qk_size,
+                value_size);
+            for (std::uint32_t head = 0; head < key_heads; ++head) {
+                for (auto vector : {
+                         query.subspan(
+                             static_cast<std::size_t>(head) * head_size,
+                             head_size),
+                         key.subspan(
+                             static_cast<std::size_t>(head) * head_size,
+                             head_size),
+                    }) {
+                    l2_normalize(vector, epsilon);
+                }
             }
-        }
-        if (descriptor.alpha_bias.size() != value_heads ||
-            descriptor.a_log.size() != value_heads) {
-            throw std::runtime_error(
-                "linear attention decay shape mismatch");
-        }
-        if (state.recurrent.empty()) {
-            state.recurrent.assign(
+            if (descriptor.alpha_bias.size() != value_heads ||
+                descriptor.a_log.size() != value_heads) {
+                throw std::runtime_error(
+                    "linear attention decay shape mismatch");
+            }
+            if (state.recurrent.empty()) {
+                state.recurrent.assign(
+                    static_cast<std::size_t>(value_heads) * head_size *
+                        head_size,
+                    0.0F);
+            }
+            if (state.recurrent.size() !=
                 static_cast<std::size_t>(value_heads) * head_size *
-                    head_size,
-                0.0F);
-        }
-        if (state.recurrent.size() !=
-            static_cast<std::size_t>(value_heads) * head_size *
-                head_size) {
-            throw std::invalid_argument(
-                "linear attention recurrent state mismatch");
-        }
-        gated_delta_recurrent(
-            state.recurrent,
-            query,
-            key,
-            value,
-            scratch.alpha,
-            scratch.beta,
-            descriptor.alpha_bias,
-            descriptor.a_log,
-            key_heads,
-            value_heads,
-            head_size,
-            scratch.recurrent_output);
-
-        for (std::uint32_t head = 0; head < value_heads; ++head) {
-            const auto source = std::span<const float>(
-                scratch.recurrent_output.data() +
-                    static_cast<std::size_t>(head) * head_size,
-                head_size);
-            auto destination = std::span<float>(
-                scratch.normalized.data() +
-                    static_cast<std::size_t>(head) * head_size,
-                head_size);
-            backend.normalize_rms(
-                source,
-                descriptor.norm,
-                0.0F,
-                epsilon,
-                destination);
-            for (std::uint32_t index = 0; index < head_size; ++index) {
-                destination[index] *= silu(
-                    scratch.gate[
-                        static_cast<std::size_t>(head) * head_size +
-                        index]);
+                    head_size) {
+                throw std::invalid_argument(
+                    "linear attention recurrent state mismatch");
             }
-        }
-        std::copy(
-            scratch.normalized.begin(),
-            scratch.normalized.end(),
-            batch_scratch.projection_4.begin() +
-                batch_index * value_size);
-    }
+            gated_delta_recurrent(
+                state.recurrent,
+                query,
+                key,
+                value,
+                scratch.alpha,
+                scratch.beta,
+                descriptor.alpha_bias,
+                descriptor.a_log,
+                key_heads,
+                value_heads,
+                head_size,
+                scratch.recurrent_output);
+
+            for (std::uint32_t head = 0; head < value_heads; ++head) {
+                const auto source = std::span<const float>(
+                    scratch.recurrent_output.data() +
+                        static_cast<std::size_t>(head) * head_size,
+                    head_size);
+                auto destination = std::span<float>(
+                    scratch.normalized.data() +
+                        static_cast<std::size_t>(head) * head_size,
+                    head_size);
+                backend.normalize_rms(
+                    source,
+                    descriptor.norm,
+                    0.0F,
+                    epsilon,
+                    destination);
+                for (std::uint32_t index = 0; index < head_size; ++index) {
+                    destination[index] *= silu(
+                        scratch.gate[
+                            static_cast<std::size_t>(head) * head_size +
+                            index]);
+                }
+            }
+            std::copy(
+                scratch.normalized.begin(),
+                scratch.normalized.end(),
+                batch_scratch.projection_4.begin() +
+                    batch_index * value_size);
+        });
     backend.ne_matmul(
         descriptor.output,
         batch_scratch.projection_4,
