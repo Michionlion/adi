@@ -12,9 +12,18 @@ namespace adi::detail {
 // selected ISA, or zero when that ISA has no batch kernel.
 [[nodiscard]] std::uint32_t ne_batch_lanes() noexcept;
 
-// Smallest batch at which the SIMD kernel is used. Below it the packing and
-// per-tile setup cost more than they save, and the scalar loop wins.
-constexpr std::uint32_t ne_batch_minimum = 4;
+// Smallest batch at which the SIMD kernel is used. Batch 1 never reaches it:
+// mach_ne_matmul sends a single vector to mach_ne_matvec before this is
+// consulted.
+//
+// This was four, on the assumption that the packing and per-tile setup had to
+// be earned back before the kernel could win. They do not: a batch of two or
+// three occupies one SIMD block just as a batch of sixteen does, so it costs
+// what one pass over the tiles costs and nothing more. Measured serially on
+// the 1408x2048 shared-expert gate, one pass is 0.93 ms against the scalar
+// loop's 1.60 ms at batch two and 1.77 ms at batch three; with eight workers
+// it is 0.22 ms against 0.39 and 0.48.
+constexpr std::uint32_t ne_batch_minimum = 2;
 
 // Accumulates every packed trellis tile across the batch dimension.
 //
