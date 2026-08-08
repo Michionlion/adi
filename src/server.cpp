@@ -544,6 +544,20 @@ std::string response_json(
         incomplete ? "incomplete" : "completed";
     const std::string_view incomplete_details =
         incomplete ? "{\"reason\":\"max_output_tokens\"}" : "null";
+    const double prompt_ms = result.prefill_seconds * 1000.0;
+    const double predicted_ms = result.decode_seconds * 1000.0;
+    const double prompt_per_token_ms =
+        result.input_tokens == 0 ? 0.0 : prompt_ms / result.input_tokens;
+    const double predicted_per_token_ms =
+        result.output_tokens == 0 ? 0.0 : predicted_ms / result.output_tokens;
+    const double prompt_per_second =
+        result.prefill_seconds <= 0.0
+            ? 0.0
+            : result.input_tokens / result.prefill_seconds;
+    const double predicted_per_second =
+        result.decode_seconds <= 0.0
+            ? 0.0
+            : result.output_tokens / result.decode_seconds;
     return "{\"id\":" + json_string(identity.id) +
            ",\"object\":\"response\",\"created_at\":" +
            std::to_string(identity.created_at) +
@@ -565,7 +579,20 @@ std::string response_json(
            std::to_string(result.output_tokens) +
            ",\"output_tokens_details\":{\"reasoning_tokens\":0},"
            "\"total_tokens\":" +
-           std::to_string(result.input_tokens + result.output_tokens) + "}}";
+           std::to_string(result.input_tokens + result.output_tokens) + "},"
+           "\"timings\":{\"prompt_n\":" +
+           std::to_string(result.input_tokens) +
+           ",\"prompt_ms\":" + std::to_string(prompt_ms) +
+           ",\"prompt_per_token_ms\":" +
+           std::to_string(prompt_per_token_ms) +
+           ",\"prompt_per_second\":" +
+           std::to_string(prompt_per_second) +
+           ",\"predicted_n\":" + std::to_string(result.output_tokens) +
+           ",\"predicted_ms\":" + std::to_string(predicted_ms) +
+           ",\"predicted_per_token_ms\":" +
+           std::to_string(predicted_per_token_ms) +
+           ",\"predicted_per_second\":" +
+           std::to_string(predicted_per_second) + "}}";
 }
 
 std::uint16_t bound_port(SocketHandle socket) {
@@ -952,7 +979,7 @@ void handle_client(
 #endif
     const MachModel model(options.model);
     Tokenizer tokenizer(model);
-    ContinuousBatcher batcher(model, tokenizer);
+    ContinuousBatcher batcher(model, tokenizer, options.execution);
     std::atomic<std::uint32_t> active_connections = 0;
     const auto raw_listener = ::socket(
         AF_INET,

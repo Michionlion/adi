@@ -32,4 +32,6 @@ int main(int argc, char **argv) {
     assert(result.input_tokens == 11);
     assert(result.output_tokens == 1);
     assert(result.finish_reason == adi::FinishReason::length);
+    assert(result.prefill_seconds > 0.0);
+    assert(result.decode_seconds > 0.0);
 }

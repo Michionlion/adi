@@ -93,6 +93,8 @@ int main() {
         4,
         2,
         adi::FinishReason::length,
+        0.5,
+        0.25,
     };
     const auto limited_json =
         adi::server_detail::response_json("model", limited, identity);
@@ -120,6 +122,15 @@ int main() {
         *usage->find("output_tokens_details")
              ->find("reasoning_tokens")
              ->number() == 0.0);
+    const auto *timings = limited_response.find("timings");
+    assert(*timings->find("prompt_n")->number() == 4.0);
+    assert(*timings->find("prompt_ms")->number() == 500.0);
+    assert(*timings->find("prompt_per_token_ms")->number() == 125.0);
+    assert(*timings->find("prompt_per_second")->number() == 8.0);
+    assert(*timings->find("predicted_n")->number() == 2.0);
+    assert(*timings->find("predicted_ms")->number() == 250.0);
+    assert(*timings->find("predicted_per_token_ms")->number() == 125.0);
+    assert(*timings->find("predicted_per_second")->number() == 8.0);
 
     const auto error_event = adi::parse_json(
         adi::server_detail::error_event_json("bad request", 7));

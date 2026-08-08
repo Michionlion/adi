@@ -3,7 +3,10 @@
 #include "utf8.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <bit>
+#include <chrono>
 #include <condition_variable>
 #include <cmath>
 #include <deque>
@@ -44,6 +47,55 @@ std::uint32_t resolved_output_limit(
 namespace adi {
 namespace {
 
+struct SamplingScratch {
+    std::vector<std::uint32_t> indexes;
+    std::vector<std::uint32_t> radix_buffer;
+    std::vector<double> probabilities;
+};
+
+std::uint32_t descending_float_key(float value) noexcept {
+    // The sampling validator rejects non-finite values. Canonicalizing zero is
+    // the one special case needed to match the comparator's +0 == -0 tie.
+    if (value == 0.0F) {
+        value = 0.0F;
+    }
+    constexpr std::uint32_t sign_bit = 0x80000000U;
+    const auto bits = std::bit_cast<std::uint32_t>(value);
+    const auto ascending =
+        (bits & sign_bit) != 0 ? ~bits : bits ^ sign_bit;
+    return ~ascending;
+}
+
+void sort_sampling_indexes(
+    std::span<const float> logits,
+    SamplingScratch &scratch) {
+    scratch.indexes.resize(logits.size());
+    scratch.radix_buffer.resize(logits.size());
+    std::iota(scratch.indexes.begin(), scratch.indexes.end(), 0);
+
+    // Four stable byte passes sort the transformed IEEE-754 key ascending,
+    // which is numeric logit order descending. Starting with ascending token
+    // IDs preserves the old comparator's deterministic tie-break exactly.
+    for (std::uint32_t shift = 0; shift < 32; shift += 8) {
+        std::array<std::size_t, 256> counts{};
+        for (const auto index : scratch.indexes) {
+            const auto bucket =
+                (descending_float_key(logits[index]) >> shift) & 0xFFU;
+            ++counts[bucket];
+        }
+        std::array<std::size_t, 256> offsets{};
+        for (std::size_t bucket = 1; bucket < offsets.size(); ++bucket) {
+            offsets[bucket] = offsets[bucket - 1] + counts[bucket - 1];
+        }
+        for (const auto index : scratch.indexes) {
+            const auto bucket =
+                (descending_float_key(logits[index]) >> shift) & 0xFFU;
+            scratch.radix_buffer[offsets[bucket]++] = index;
+        }
+        scratch.indexes.swap(scratch.radix_buffer);
+    }
+}
+
 void validate_generation_options(
     const MachModel &model,
     const GenerationOptions &options) {
@@ -63,7 +115,10 @@ void validate_generation_options(
     }
 }
 
-constexpr std::size_t prefill_chunk_tokens = 64;
+const ExecutionOptions &validated(const ExecutionOptions &options) {
+    validate_execution_options(options);
+    return options;
+}
 
 void throw_if_cancelled(const CancelCallback &cancelled) {
     if (cancelled && cancelled()) {
@@ -71,30 +126,35 @@ void throw_if_cancelled(const CancelCallback &cancelled) {
     }
 }
 
+} // namespace
+
 void prefill_prompt(
     const MachModel &model,
     std::span<const std::uint32_t> tokens,
     DecoderState &state,
     std::span<float> logits,
     PrefillScratch &scratch,
+    const ExecutionOptions &execution,
     const CancelCallback &cancelled) {
+    validate_execution_options(execution);
+    const auto chunk_tokens =
+        static_cast<std::size_t>(execution.prefill_ubatch);
     for (std::size_t offset = 0; offset < tokens.size();
-         offset += prefill_chunk_tokens) {
+         offset += chunk_tokens) {
         throw_if_cancelled(cancelled);
-        const auto count = std::min(
-            prefill_chunk_tokens,
-            tokens.size() - offset);
+        const auto count = std::min(chunk_tokens, tokens.size() - offset);
+        // Only the last chunk's logits are ever read, and the vocabulary head
+        // is expensive, so earlier chunks advance state without computing it.
+        const bool final_chunk = offset + count == tokens.size();
         prefill(
             model,
             tokens.subspan(offset, count),
             state,
-            logits,
+            final_chunk ? logits : std::span<float>{},
             scratch);
     }
     throw_if_cancelled(cancelled);
 }
-
-} // namespace
 
 std::uint32_t sample_token(
     std::span<const float> logits,
@@ -117,24 +177,19 @@ std::uint32_t sample_token(
             std::max_element(logits.begin(), logits.end()) - logits.begin());
     }
 
-    std::vector<std::uint32_t> indexes(logits.size());
-    std::iota(indexes.begin(), indexes.end(), 0);
-    std::sort(indexes.begin(), indexes.end(), [&](std::uint32_t left, std::uint32_t right) {
-        if (logits[left] == logits[right]) {
-            return left < right;
-        }
-        return logits[left] > logits[right];
-    });
+    thread_local SamplingScratch scratch;
+    sort_sampling_indexes(logits, scratch);
+    const auto &indexes = scratch.indexes;
     const double maximum = static_cast<double>(logits[indexes[0]]);
-    std::vector<double> probabilities;
-    probabilities.reserve(logits.size());
+    scratch.probabilities.resize(logits.size());
     double denominator = 0.0;
-    for (const auto index : indexes) {
+    for (std::size_t position = 0; position < indexes.size(); ++position) {
+        const auto index = indexes[position];
         const double scaled =
             (static_cast<double>(logits[index]) - maximum) /
             static_cast<double>(temperature);
         const double probability = std::exp(scaled);
-        probabilities.push_back(probability);
+        scratch.probabilities[position] = probability;
         denominator += probability;
     }
     if (!std::isfinite(denominator) || denominator <= 0.0) {
@@ -142,8 +197,8 @@ std::uint32_t sample_token(
     }
     double cumulative = 0.0;
     std::size_t retained = 0;
-    for (; retained < probabilities.size(); ++retained) {
-        cumulative += probabilities[retained] / denominator;
+    for (; retained < scratch.probabilities.size(); ++retained) {
+        cumulative += scratch.probabilities[retained] / denominator;
         if (cumulative >= top_p) {
             ++retained;
             break;
@@ -151,12 +206,15 @@ std::uint32_t sample_token(
     }
     retained = std::max<std::size_t>(1, retained);
     double retained_sum =
-        std::accumulate(probabilities.begin(), probabilities.begin() + retained, 0.0);
+        std::accumulate(
+            scratch.probabilities.begin(),
+            scratch.probabilities.begin() + retained,
+            0.0);
     std::uniform_real_distribution<double> distribution(0.0, retained_sum);
     const double target = distribution(random);
     double running = 0.0;
     for (std::size_t index = 0; index < retained; ++index) {
-        running += probabilities[index];
+        running += scratch.probabilities[index];
         if (target <= running) {
             return indexes[index];
         }
@@ -168,9 +226,10 @@ GenerationResult generate(
     const MachModel &model,
     Tokenizer &tokenizer,
     std::string_view input,
-    const GenerationOptions &options) {
+    const GenerationOptions &options,
+    const ExecutionOptions &execution) {
     return generate_from_prompt(
-        model, tokenizer, qwen_user_prompt(input), options);
+        model, tokenizer, qwen_user_prompt(input), options, {}, {}, execution);
 }
 
 GenerationResult generate_from_prompt(
@@ -179,8 +238,10 @@ GenerationResult generate_from_prompt(
     std::string_view formatted_prompt,
     const GenerationOptions &options,
     const TokenCallback &token_callback,
-    const CancelCallback &cancelled) {
+    const CancelCallback &cancelled,
+    const ExecutionOptions &execution) {
     validate_generation_options(model, options);
+    validate_execution_options(execution);
     const auto prompt_tokens = tokenizer.encode(formatted_prompt, cancelled);
     if (prompt_tokens.empty()) {
         throw std::invalid_argument("prompt exceeds model context");
@@ -199,14 +260,17 @@ GenerationResult generate_from_prompt(
     DecoderScratch scratch;
     PrefillScratch prefill_scratch;
     std::vector<float> logits(model.config().vocabulary);
+    const auto prefill_started = std::chrono::steady_clock::now();
     prefill_prompt(
         model,
         prompt_tokens,
         state,
         logits,
         prefill_scratch,
+        execution,
         cancelled);
     tokenizer.mask_unused_logits(logits);
+    const auto prefill_finished = std::chrono::steady_clock::now();
     std::mt19937_64 random(options.seed);
     std::vector<std::uint32_t> output_tokens;
     output_tokens.reserve(max_output_tokens);
@@ -231,11 +295,18 @@ GenerationResult generate_from_prompt(
             tokenizer.mask_unused_logits(logits);
         }
     }
+    const auto decode_finished = std::chrono::steady_clock::now();
+    const double prefill_seconds = std::chrono::duration<double>(
+        prefill_finished - prefill_started).count();
+    const double decode_seconds = std::chrono::duration<double>(
+        decode_finished - prefill_finished).count();
     return {
         sanitize_utf8(tokenizer.decode(output_tokens)),
         static_cast<std::uint32_t>(prompt_tokens.size()),
         static_cast<std::uint32_t>(output_tokens.size()),
         finish_reason,
+        prefill_seconds,
+        decode_seconds,
     };
 }
 
@@ -286,11 +357,17 @@ struct ContinuousBatcher::Impl {
         std::uint32_t max_output_tokens = 0;
         std::vector<std::uint32_t> output_tokens;
         std::mt19937_64 random;
+        double prefill_seconds = 0.0;
+        std::chrono::steady_clock::time_point decode_started;
     };
 
-    Impl(const MachModel &model, Tokenizer &tokenizer)
+    Impl(
+        const MachModel &model,
+        Tokenizer &tokenizer,
+        const ExecutionOptions &execution)
         : model(model),
           tokenizer(tokenizer),
+          execution(execution),
           worker([this](std::stop_token stop) { run(stop); }) {}
 
     ~Impl() {
@@ -359,11 +436,15 @@ struct ContinuousBatcher::Impl {
 
     void finish(Active &active, FinishReason reason) {
         try {
+            const auto decode_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - active.decode_started).count();
             active.request->promise.set_value({
                 sanitize_utf8(tokenizer.decode(active.output_tokens)),
                 active.input_tokens,
                 static_cast<std::uint32_t>(active.output_tokens.size()),
                 reason,
+                active.prefill_seconds,
+                decode_seconds,
             });
         } catch (...) {
             active.request->complete_stream();
@@ -394,20 +475,27 @@ struct ContinuousBatcher::Impl {
         DecoderState state;
         PrefillScratch prefill_scratch;
         std::vector<float> prompt_logits(model.config().vocabulary);
+        const auto prefill_started = std::chrono::steady_clock::now();
         prefill_prompt(
             model,
             prompt_tokens,
             state,
             prompt_logits,
             prefill_scratch,
+            execution,
             request_cancelled);
         tokenizer.mask_unused_logits(prompt_logits);
+        const auto prefill_finished = std::chrono::steady_clock::now();
+        const double prefill_seconds = std::chrono::duration<double>(
+            prefill_finished - prefill_started).count();
         Active admitted{
             request,
             static_cast<std::uint32_t>(prompt_tokens.size()),
             max_output_tokens,
             {},
             std::mt19937_64(request->options.seed),
+            prefill_seconds,
+            prefill_finished,
         };
         admitted.output_tokens.reserve(max_output_tokens);
 
@@ -590,6 +678,7 @@ struct ContinuousBatcher::Impl {
 
     const MachModel &model;
     Tokenizer &tokenizer;
+    ExecutionOptions execution;
     std::mutex mutex;
     std::condition_variable_any condition;
     std::deque<std::shared_ptr<Request>> pending;
@@ -598,8 +687,9 @@ struct ContinuousBatcher::Impl {
 
 ContinuousBatcher::ContinuousBatcher(
     const MachModel &model,
-    Tokenizer &tokenizer)
-    : impl_(std::make_unique<Impl>(model, tokenizer)) {}
+    Tokenizer &tokenizer,
+    const ExecutionOptions &execution)
+    : impl_(std::make_unique<Impl>(model, tokenizer, validated(execution))) {}
 
 ContinuousBatcher::~ContinuousBatcher() = default;
 

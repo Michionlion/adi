@@ -113,6 +113,7 @@ class MachModel {
     std::array<float, 32> rope_theta_divisors_;
     std::vector<float> expert_state_values_;
     std::vector<float> ne_state_values_;
+    std::vector<float> ne_signed_tlut_;
     std::vector<std::uint16_t> expert_wave_indexes_forward_;
     std::vector<std::uint16_t> expert_wave_indexes_reverse_;
     std::vector<float> expert_wave_gamma_;

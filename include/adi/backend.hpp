@@ -2,6 +2,7 @@
 
 #include "adi/kernels.hpp"
 
+#include <cstdint>
 #include <string_view>
 
 namespace adi {
@@ -22,5 +23,9 @@ struct Backend {
 };
 
 [[nodiscard]] const Backend &cpu_backend() noexcept;
+
+// Workers the runtime parallelizes across, honouring ADI_THREADS. Exposed so
+// benchmarks can report parallel efficiency against a measured CPU total.
+[[nodiscard]] std::uint32_t worker_threads() noexcept;
 
 } // namespace adi

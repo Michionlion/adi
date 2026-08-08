@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import socket
@@ -20,6 +21,7 @@ import sys
 import threading
 import time
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -27,8 +29,10 @@ from typing import Any, Callable, Optional
 try:
     import httpx
     import typer
-    from rich.console import Console
+    from rich.console import Console, Group
+    from rich.live import Live
     from rich.table import Table
+    from rich.text import Text
 except ImportError as error:  # pragma: no cover - exercised only before install
     missing = getattr(error, "name", "a required package")
     print(
@@ -57,8 +61,13 @@ console = Console()
 THINK_OPEN_TAG = "<think>"
 THINK_CLOSE_TAG = "</think>"
 THINK_SUFFIX_GUARD = max(len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG)) - 1
-DIM_REASONING_STYLE = "dim"
+DIM_REASONING_STYLE = "dim italic"
+REASONING_GUTTER_STYLE = "bold cyan"
+REASONING_LABEL_STYLE = "bold white on #374151"
+ANSWER_LABEL_STYLE = "bold white on #0f766e"
+STATUS_BAR_STYLE = "bold white on #334155"
 READLINE_PROMPT = "\x01\x1b[32m\x02user\x01\x1b[0m\x02 > "
+RATE_WINDOW_SECONDS = 5.0
 
 
 class ClientError(RuntimeError):
@@ -99,7 +108,73 @@ class ResponseResult:
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
+    prefill_seconds: Optional[float] = None
+    decode_seconds: Optional[float] = None
+    prefill_tokens_per_second: Optional[float] = None
+    decode_tokens_per_second: Optional[float] = None
     raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class TurnMetrics:
+    """Client-observed timings for one Responses API request."""
+
+    started_at: float = field(default_factory=time.monotonic)
+    first_token_at: Optional[float] = None
+    finished_at: Optional[float] = None
+    streamed_tokens: int = 0
+    recent_token_times: deque[float] = field(default_factory=deque)
+
+    def observe_token(self, observed_at: Optional[float] = None) -> None:
+        observed_at = time.monotonic() if observed_at is None else observed_at
+        if self.first_token_at is None:
+            self.first_token_at = observed_at
+        self.streamed_tokens += 1
+        self.recent_token_times.append(observed_at)
+        cutoff = observed_at - RATE_WINDOW_SECONDS
+        while self.recent_token_times[0] < cutoff:
+            self.recent_token_times.popleft()
+
+    def finish(self, finished_at: Optional[float] = None) -> None:
+        self.finished_at = time.monotonic() if finished_at is None else finished_at
+
+    def elapsed(self, now: Optional[float] = None) -> float:
+        end = self.finished_at
+        if end is None:
+            end = time.monotonic() if now is None else now
+        return max(0.0, end - self.started_at)
+
+    def time_to_first_token(self) -> Optional[float]:
+        if self.first_token_at is None:
+            return None
+        return max(0.0, self.first_token_at - self.started_at)
+
+    def current_tokens_per_second(self) -> Optional[float]:
+        if len(self.recent_token_times) < 2:
+            return None
+        duration = self.recent_token_times[-1] - self.recent_token_times[0]
+        if duration <= 0.0:
+            return None
+        return (len(self.recent_token_times) - 1) / duration
+
+    def average_tokens_per_second(self) -> Optional[float]:
+        if self.streamed_tokens < 2 or self.first_token_at is None:
+            return None
+        last_token_at = self.recent_token_times[-1]
+        duration = last_token_at - self.first_token_at
+        if duration <= 0.0:
+            return None
+        return (self.streamed_tokens - 1) / duration
+
+    def decode_tokens_per_second(self, output_tokens: int) -> Optional[float]:
+        if output_tokens < 2:
+            return None
+        if self.first_token_at is None or self.finished_at is None:
+            return None
+        duration = self.finished_at - self.first_token_at
+        if duration <= 0.0:
+            return None
+        return (output_tokens - 1) / duration
 
 
 @dataclass
@@ -108,12 +183,40 @@ class UsageTotals:
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
+    request_seconds: float = 0.0
+    timed_input_tokens: int = 0
+    timed_output_tokens: int = 0
+    prefill_seconds: float = 0.0
+    decode_seconds: float = 0.0
 
-    def add(self, result: ResponseResult) -> None:
+    def add(self, result: ResponseResult, elapsed: float) -> None:
         self.requests += 1
         self.input_tokens += result.input_tokens
         self.output_tokens += result.output_tokens
         self.total_tokens += result.total_tokens
+        self.request_seconds += elapsed
+
+        if result.prefill_seconds is not None:
+            self.timed_input_tokens += result.input_tokens
+            self.prefill_seconds += result.prefill_seconds
+        if result.decode_seconds is not None:
+            self.timed_output_tokens += result.output_tokens
+            self.decode_seconds += result.decode_seconds
+
+    def output_tokens_per_second(self) -> Optional[float]:
+        if self.request_seconds <= 0.0:
+            return None
+        return self.output_tokens / self.request_seconds
+
+    def prefill_tokens_per_second(self) -> Optional[float]:
+        if self.prefill_seconds <= 0.0:
+            return None
+        return self.timed_input_tokens / self.prefill_seconds
+
+    def decode_tokens_per_second(self) -> Optional[float]:
+        if self.decode_seconds <= 0.0:
+            return None
+        return self.timed_output_tokens / self.decode_seconds
 
 
 @dataclass
@@ -518,22 +621,58 @@ def parse_response_object(body: dict[str, Any]) -> ResponseResult:
         input_tokens = integer_or_zero(usage.get("input_tokens"))
         output_tokens = integer_or_zero(usage.get("output_tokens"))
         total_tokens = integer_or_zero(usage.get("total_tokens"))
+    timings = body.get("timings")
+    prefill_seconds = decode_seconds = None
+    prefill_rate = decode_rate = None
+    if isinstance(timings, dict):
+        prompt_ms = nonnegative_number_or_none(timings.get("prompt_ms"))
+        predicted_ms = nonnegative_number_or_none(timings.get("predicted_ms"))
+        if prompt_ms is not None:
+            prefill_seconds = prompt_ms / 1000.0
+        if predicted_ms is not None:
+            decode_seconds = predicted_ms / 1000.0
+        prefill_rate = nonnegative_number_or_none(
+            timings.get("prompt_per_second")
+        )
+        decode_rate = nonnegative_number_or_none(
+            timings.get("predicted_per_second")
+        )
+        if (
+            prefill_rate is None
+            and prefill_seconds is not None
+            and prefill_seconds > 0
+        ):
+            prefill_rate = input_tokens / prefill_seconds
+        if (
+            decode_rate is None
+            and decode_seconds is not None
+            and decode_seconds > 0
+        ):
+            decode_rate = output_tokens / decode_seconds
     return ResponseResult(
         text="".join(text_parts),
         status=str(body.get("status", "completed")),
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         total_tokens=total_tokens or input_tokens + output_tokens,
+        prefill_seconds=prefill_seconds,
+        decode_seconds=decode_seconds,
+        prefill_tokens_per_second=prefill_rate,
+        decode_tokens_per_second=decode_rate,
         raw=body,
     )
 
 
 class ReasoningRenderer:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        emit: Optional[Callable[[str, bool], None]] = None,
+    ) -> None:
         # ADI prompts assistant responses from "<think>\\n", so the first streamed
         # characters are reasoning content unless a prior close token is received.
         self.in_reasoning = True
         self.pending = ""
+        self.emit = emit
 
     def feed(self, text: str, *, final: bool = False) -> None:
         buffered = self.pending + text
@@ -578,6 +717,9 @@ class ReasoningRenderer:
 
     def _print(self, text: str) -> None:
         if text:
+            if self.emit is not None:
+                self.emit(text, False)
+                return
             console.print(
                 text,
                 end="",
@@ -588,6 +730,9 @@ class ReasoningRenderer:
 
     def _print_dim(self, text: str) -> None:
         if text:
+            if self.emit is not None:
+                self.emit(text, True)
+                return
             console.print(
                 text,
                 end="",
@@ -600,6 +745,13 @@ class ReasoningRenderer:
 
 def integer_or_zero(value: object) -> int:
     return value if type(value) is int and value >= 0 else 0
+
+
+def nonnegative_number_or_none(value: object) -> Optional[float]:
+    if type(value) not in {int, float}:
+        return None
+    converted = float(value)
+    return converted if math.isfinite(converted) and converted >= 0.0 else None
 
 
 def host_for_connect(host: str) -> str:
@@ -677,14 +829,237 @@ def resolve_adi_executable(requested: Optional[str]) -> Path:
     )
 
 
-def print_usage(result: ResponseResult, totals: UsageTotals) -> None:
-    totals.add(result)
-    console.print(
-        "[dim]"
-        f"request: {result.input_tokens} input + {result.output_tokens} output "
-        f"= {result.total_tokens} tokens; session: {totals.total_tokens} tokens"
-        "[/dim]"
+class StreamingStatus:
+    """A live footer rendered beneath streamed response text."""
+
+    def __init__(self, metrics: TurnMetrics) -> None:
+        self.metrics = metrics
+
+    def __rich__(self) -> Text:
+        if self.metrics.first_token_at is None:
+            message = f"PREFILLING  •  {self.metrics.elapsed():.1f}s elapsed"
+        else:
+            tokens = self.metrics.streamed_tokens
+            parts = ["GENERATING", plural(tokens, "token")]
+            current_rate = self.metrics.current_tokens_per_second()
+            if current_rate is None:
+                parts.append("measuring rate…")
+            else:
+                parts.append(f"{current_rate:.2f} tok/s current")
+            average_rate = self.metrics.average_tokens_per_second()
+            if average_rate is not None and tokens > len(
+                self.metrics.recent_token_times
+            ):
+                parts.append(f"{average_rate:.2f} tok/s avg")
+            parts.append(f"{self.metrics.elapsed():.1f}s elapsed")
+            message = "  •  ".join(parts)
+        return Text(
+            f"  {message}  ",
+            style=STATUS_BAR_STYLE,
+            justify="left",
+            overflow="ellipsis",
+            no_wrap=True,
+        )
+
+
+class StreamingDisplay:
+    """Own the incomplete response line and status as one Rich live region."""
+
+    def __init__(self, metrics: TurnMetrics) -> None:
+        self.metrics = metrics
+        self.partial_line = Text()
+        self.partial_reasoning: Optional[bool] = None
+        self.reasoning_started = False
+        self.answer_started = False
+
+    def __rich__(self) -> Group:
+        return Group(
+            self.partial_line,
+            Text(""),
+            StreamingStatus(self.metrics).__rich__(),
+        )
+
+    def _start_phase(self, reasoning: bool) -> None:
+        if reasoning:
+            if not self.reasoning_started:
+                console.print(Text("  REASONING  ", style=REASONING_LABEL_STYLE))
+                self.reasoning_started = True
+            return
+        if self.answer_started:
+            return
+        if self.reasoning_started:
+            console.print()
+        console.print(Text("  ANSWER  ", style=ANSWER_LABEL_STYLE))
+        self.answer_started = True
+
+    def _start_line(self, reasoning: bool) -> None:
+        self._start_phase(reasoning)
+        self.partial_reasoning = reasoning
+        if reasoning:
+            self.partial_line.append("  │ ", style=REASONING_GUTTER_STYLE)
+
+    def _commit_line(self) -> None:
+        console.print(self.partial_line, highlight=False, soft_wrap=True)
+        self.partial_line = Text()
+        self.partial_reasoning = None
+
+    def write(self, text: str, reasoning: bool) -> None:
+        style = DIM_REASONING_STYLE if reasoning else None
+        while text:
+            newline = text.find("\n")
+            segment = text if newline == -1 else text[:newline]
+            if segment:
+                if self.partial_reasoning is None:
+                    self._start_line(reasoning)
+                elif self.partial_reasoning != reasoning:
+                    self._commit_line()
+                    self._start_line(reasoning)
+                self.partial_line.append(segment, style=style)
+            if newline == -1:
+                return
+            if self.partial_reasoning is None and reasoning:
+                self._start_line(True)
+            self._commit_line()
+            text = text[newline + 1 :]
+
+    def finish(self) -> None:
+        if self.partial_line:
+            console.print(
+                self.partial_line,
+                end="",
+                highlight=False,
+                soft_wrap=True,
+            )
+            self.partial_line = Text()
+            self.partial_reasoning = None
+
+
+def plural(count: int, noun: str) -> str:
+    return f"{count:,} {noun if count == 1 else noun + 's'}"
+
+
+def print_usage(
+    result: ResponseResult,
+    totals: UsageTotals,
+    metrics: TurnMetrics,
+) -> None:
+    elapsed = metrics.elapsed()
+    totals.add(result, elapsed)
+    has_server_timings = any(
+        value is not None
+        for value in (
+            result.prefill_seconds,
+            result.decode_seconds,
+            result.prefill_tokens_per_second,
+            result.decode_tokens_per_second,
+        )
     )
+    if has_server_timings:
+        prefill_parts = [f"{result.input_tokens:,} input tokens"]
+        if result.prefill_seconds is not None:
+            prefill_parts.append(f"{result.prefill_seconds:.2f}s")
+        if result.prefill_tokens_per_second is not None:
+            prefill_parts.append(
+                f"{result.prefill_tokens_per_second:.2f} tok/s"
+            )
+        decode_parts = [f"{result.output_tokens:,} output tokens"]
+        if result.decode_seconds is not None:
+            decode_parts.append(f"{result.decode_seconds:.2f}s")
+        if result.decode_tokens_per_second is not None:
+            decode_parts.append(f"{result.decode_tokens_per_second:.2f} tok/s")
+        console.print(
+            "  prefill  " + "  •  ".join(prefill_parts),
+            style="dim",
+            markup=False,
+        )
+        console.print(
+            "  decode   " + "  •  ".join(decode_parts),
+            style="dim",
+            markup=False,
+        )
+        request_parts = [f"{elapsed:.2f}s total"]
+        first_token = metrics.time_to_first_token()
+        if first_token is not None:
+            request_parts.append(f"{first_token:.2f}s TTFT")
+        request_parts.append(f"{totals.total_tokens:,} session tokens")
+        console.print(
+            "  request  " + "  •  ".join(request_parts),
+            style="dim",
+            markup=False,
+        )
+        return
+
+    # Older servers do not return authoritative phase timings. Retain useful
+    # client-observed metrics when connecting to one of them.
+    parts = [
+        f"{result.output_tokens:,} output",
+        f"{result.input_tokens:,} input",
+    ]
+    decode_rate = metrics.decode_tokens_per_second(result.output_tokens)
+    if decode_rate is not None:
+        parts.append(f"{decode_rate:.2f} tok/s decode")
+    elif elapsed > 0.0 and result.output_tokens:
+        parts.append(f"{result.output_tokens / elapsed:.2f} tok/s end-to-end")
+    first_token = metrics.time_to_first_token()
+    if first_token is not None:
+        parts.append(f"{first_token:.1f}s TTFT")
+    parts.extend(
+        [
+            f"{elapsed:.1f}s total",
+            f"{totals.total_tokens:,} session tokens",
+        ]
+    )
+    console.print("  " + "  •  ".join(parts), style="dim", markup=False)
+
+
+def print_session_stats(totals: UsageTotals) -> None:
+    if totals.requests == 0:
+        console.print("No completed requests in this session.", style="dim")
+        return
+    summary = [
+        plural(totals.requests, "request"),
+        f"{totals.input_tokens:,} input",
+        f"{totals.output_tokens:,} output",
+        f"{totals.total_tokens:,} total tokens",
+        f"{totals.request_seconds:.1f}s request time",
+    ]
+    console.print("  •  ".join(summary), style="dim", markup=False)
+    prefill_rate = totals.prefill_tokens_per_second()
+    if prefill_rate is not None:
+        console.print(
+            f"  prefill  {totals.timed_input_tokens:,} input tokens  •  "
+            f"{totals.prefill_seconds:.2f}s  •  {prefill_rate:.2f} tok/s",
+            style="dim",
+            markup=False,
+        )
+    decode_rate = totals.decode_tokens_per_second()
+    if decode_rate is not None:
+        console.print(
+            f"  decode   {totals.timed_output_tokens:,} output tokens  •  "
+            f"{totals.decode_seconds:.2f}s  •  {decode_rate:.2f} tok/s",
+            style="dim",
+            markup=False,
+        )
+    if prefill_rate is None and decode_rate is None:
+        rate = totals.output_tokens_per_second()
+        if rate is not None:
+            console.print(
+                f"  {rate:.2f} output tok/s end-to-end",
+                style="dim",
+                markup=False,
+            )
+
+
+def incomplete_reason(result: ResponseResult) -> Optional[str]:
+    if result.status == "completed":
+        return None
+    details = result.raw.get("incomplete_details")
+    reason = details.get("reason") if isinstance(details, dict) else None
+    if reason == "max_output_tokens":
+        return "Output limit reached; the response may be unfinished."
+    if isinstance(reason, str) and reason:
+        return f"Response ended early: {reason.replace('_', ' ')}."
+    return f"Response ended with status {result.status}."
 
 
 def print_history(conversation: Conversation) -> None:
@@ -754,8 +1129,37 @@ def print_repl_help() -> None:
         "  /save PATH            Save the conversation as JSON\n"
         "  /load PATH            Load a saved conversation\n"
         "  /paste                Enter a multi-line message\n"
-        "  /stats                Show cumulative token usage"
+        "  /stats                Show cumulative usage and timing\n"
+        "  /settings             Show endpoint and generation settings"
     )
+
+
+def settings_summary(settings: GenerationSettings, stream: bool) -> str:
+    limit = (
+        f"{settings.max_output_tokens:,} max output"
+        if settings.max_output_tokens is not None
+        else "context-limited output"
+    )
+    sampling = (
+        "greedy"
+        if settings.temperature == 0.0
+        else f"temperature {settings.temperature:g}  •  top-p {settings.top_p:g}"
+    )
+    return (
+        f"{'streaming' if stream else 'non-streaming'}  •  {sampling}  •  "
+        f"seed {settings.seed:,}  •  {limit}"
+    )
+
+
+def print_settings(
+    client: AdiResponsesClient,
+    settings: GenerationSettings,
+    stream: bool,
+) -> None:
+    console.print(client.responses_url, style="cyan", markup=False)
+    console.print(settings_summary(settings, stream), style="dim", markup=False)
+    if settings.model_id:
+        console.print(f"model {settings.model_id}", style="dim", markup=False)
 
 
 def send_turn(
@@ -768,31 +1172,68 @@ def send_turn(
     totals: UsageTotals,
 ) -> ResponseResult:
     console.print("[bold cyan]assistant[/bold cyan]")
-    renderer = ReasoningRenderer()
+    metrics = TurnMetrics()
+    show_live_status = stream and bool(getattr(console, "is_terminal", False))
+    streaming_display = StreamingDisplay(metrics) if show_live_status else None
+    renderer = ReasoningRenderer(
+        streaming_display.write if streaming_display is not None else None
+    )
     printed_delta = False
 
     def on_delta(delta: str) -> None:
         nonlocal printed_delta
+        if delta:
+            metrics.observe_token()
         printed_delta = printed_delta or bool(delta)
         renderer.feed(delta)
 
-    try:
-        result = client.create(
-            conversation.request_messages(user_text),
-            settings,
-            stream=stream,
-            on_delta=on_delta,
+    live_context = (
+        Live(
+            streaming_display,
+            console=console,
+            refresh_per_second=4,
+            transient=True,
         )
+        if show_live_status
+        else nullcontext()
+    )
+    try:
+        with live_context:
+            result = client.create(
+                conversation.request_messages(user_text),
+                settings,
+                stream=stream,
+                on_delta=on_delta,
+            )
+            metrics.finish()
+            if streaming_display is not None:
+                if not printed_delta and result.text:
+                    renderer.feed(result.text, final=True)
+                else:
+                    renderer.feed("", final=True)
     except KeyboardInterrupt:
+        if streaming_display is not None:
+            renderer.feed("", final=True)
+            streaming_display.finish()
         if printed_delta:
             console.print()
         console.print("[yellow]Generation interrupted; the turn was not saved.[/yellow]")
         raise
-    if stream:
-        if not printed_delta and result.text:
-            renderer.feed(result.text, final=True)
-        else:
+    except ClientError:
+        if streaming_display is not None:
             renderer.feed("", final=True)
+            streaming_display.finish()
+        if printed_delta:
+            console.print()
+        raise
+    if stream:
+        if streaming_display is not None:
+            streaming_display.finish()
+        else:
+            if not printed_delta and result.text:
+                renderer.feed(result.text, final=True)
+            else:
+                renderer.feed("", final=True)
         console.print()
     else:
         renderer.feed(result.text, final=True)
@@ -800,7 +1241,10 @@ def send_turn(
     if not result.text:
         console.print("[yellow]ADI returned no output text.[/yellow]")
     conversation.commit(user_text, result.text)
-    print_usage(result, totals)
+    reason = incomplete_reason(result)
+    if reason is not None:
+        console.print(reason, style="yellow", markup=False)
+    print_usage(result, totals, metrics)
     return result
 
 
@@ -813,10 +1257,19 @@ def interactive_loop(
     session_path: Optional[Path],
 ) -> None:
     totals = UsageTotals()
+    console.print("[bold green]ADI chat[/bold green]")
     console.print(
-        "[bold green]ADI chat ready.[/bold green] "
-        "Type /help for commands; Ctrl+D or /exit quits."
+        f"{client.responses_url}  •  {settings_summary(settings, stream)}",
+        style="dim",
+        markup=False,
     )
+    if conversation.messages:
+        console.print(
+            f"Loaded {plural(len(conversation.messages) // 2, 'prior turn')}.",
+            style="dim",
+            markup=False,
+        )
+    console.print("Type /help for commands; Ctrl+D or /exit quits.", style="dim")
     while True:
         try:
             line = read_user_input_line()
@@ -860,10 +1313,10 @@ def interactive_loop(
                 print_history(conversation)
                 continue
             if command == "/stats":
-                console.print(
-                    f"[dim]{totals.requests} requests, {totals.input_tokens} input, "
-                    f"{totals.output_tokens} output, {totals.total_tokens} total tokens[/dim]"
-                )
+                print_session_stats(totals)
+                continue
+            if command == "/settings":
+                print_settings(client, settings, stream)
                 continue
             if command in {"/save", "/load"}:
                 if not argument:

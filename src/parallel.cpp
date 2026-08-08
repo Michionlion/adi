@@ -1,6 +1,7 @@
 #include "parallel.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <condition_variable>
 #include <cstdlib>
@@ -18,6 +19,23 @@ namespace adi::detail {
 namespace {
 
 thread_local bool worker_thread = false;
+
+class WorkerContext {
+  public:
+    WorkerContext() noexcept : previous_(worker_thread) {
+        worker_thread = true;
+    }
+
+    ~WorkerContext() {
+        worker_thread = previous_;
+    }
+
+    WorkerContext(const WorkerContext &) = delete;
+    WorkerContext &operator=(const WorkerContext &) = delete;
+
+  private:
+    bool previous_;
+};
 
 std::uint32_t configured_threads() noexcept {
     const auto available = std::max(1U, std::thread::hardware_concurrency());
@@ -123,10 +141,62 @@ class WorkerPool {
         }
 
         std::exception_ptr failure;
+        const WorkerContext context;
         try {
             function(
                 count * (task_count - 1) / task_count,
                 count);
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        group->finish(failure);
+        group->wait();
+    }
+
+    // Same lifetime contract as run(): the caller blocks until every index has
+    // been executed, so capturing function by reference is safe.
+    void run_dynamic(
+        std::uint32_t count,
+        const std::function<void(std::uint32_t)> &function) {
+        if (count == 0) {
+            return;
+        }
+        const auto task_count = std::min(threads_, count);
+        if (task_count == 1 || worker_thread) {
+            for (std::uint32_t index = 0; index < count; ++index) {
+                function(index);
+            }
+            return;
+        }
+
+        const auto next = std::make_shared<std::atomic<std::uint32_t>>(0);
+        const auto group = std::make_shared<TaskGroup>(task_count);
+        const auto drain = [&function, next, count] {
+            for (;;) {
+                const auto index =
+                    next->fetch_add(1, std::memory_order_relaxed);
+                if (index >= count) {
+                    return;
+                }
+                function(index);
+            }
+        };
+        for (std::uint32_t task = 0; task + 1 < task_count; ++task) {
+            enqueue([group, drain] {
+                std::exception_ptr failure;
+                try {
+                    drain();
+                } catch (...) {
+                    failure = std::current_exception();
+                }
+                group->finish(failure);
+            });
+        }
+
+        std::exception_ptr failure;
+        const WorkerContext context;
+        try {
+            drain();
         } catch (...) {
             failure = std::current_exception();
         }
@@ -186,6 +256,12 @@ void parallel_ranges_impl(
     std::uint32_t minimum_per_worker,
     const std::function<void(std::uint32_t, std::uint32_t)> &function) {
     worker_pool().run(count, minimum_per_worker, function);
+}
+
+void parallel_dynamic_impl(
+    std::uint32_t count,
+    const std::function<void(std::uint32_t)> &function) {
+    worker_pool().run_dynamic(count, function);
 }
 
 std::uint32_t worker_thread_count() noexcept {

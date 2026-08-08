@@ -14,6 +14,7 @@ from unittest import mock
 class StubConsole:
     def __init__(self) -> None:
         self.output: list[tuple[str, dict[str, object]]] = []
+        self.is_terminal = False
 
     def print(self, *objects: object, **kwargs: object) -> None:
         self.output.append(("".join(str(value) for value in objects), kwargs))
@@ -56,6 +57,25 @@ def install_dependency_stubs() -> None:
     rich.__path__ = []  # type: ignore[attr-defined]
     rich_console = types.ModuleType("rich.console")
     rich_console.Console = StubConsole  # type: ignore[attr-defined]
+
+    class Group:
+        def __init__(self, *renderables: object) -> None:
+            self.renderables = renderables
+
+    rich_console.Group = Group  # type: ignore[attr-defined]
+    rich_live = types.ModuleType("rich.live")
+
+    class Live:
+        def __init__(self, *_: object, **__: object) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            pass
+
+    rich_live.Live = Live  # type: ignore[attr-defined]
     rich_table = types.ModuleType("rich.table")
 
     class Table:
@@ -69,9 +89,27 @@ def install_dependency_stubs() -> None:
             pass
 
     rich_table.Table = Table  # type: ignore[attr-defined]
+    rich_text = types.ModuleType("rich.text")
+
+    class Text:
+        def __init__(self, value: str = "", *_: object, **__: object) -> None:
+            self.value = value
+
+        def append(self, value: str, *_: object, **__: object) -> None:
+            self.value += value
+
+        def __bool__(self) -> bool:
+            return bool(self.value)
+
+        def __str__(self) -> str:
+            return self.value
+
+    rich_text.Text = Text  # type: ignore[attr-defined]
     sys.modules["rich"] = rich
     sys.modules["rich.console"] = rich_console
+    sys.modules["rich.live"] = rich_live
     sys.modules["rich.table"] = rich_table
+    sys.modules["rich.text"] = rich_text
 
 
 install_dependency_stubs()
@@ -107,6 +145,48 @@ class AdiChatTests(unittest.TestCase):
             23,
         )
 
+    def test_response_parser_reads_server_timings(self) -> None:
+        result = adi_chat.parse_response_object(
+            {
+                "status": "completed",
+                "output_text": "answer",
+                "usage": {
+                    "input_tokens": 40,
+                    "output_tokens": 10,
+                    "total_tokens": 50,
+                },
+                "timings": {
+                    "prompt_n": 40,
+                    "prompt_ms": 2000.0,
+                    "prompt_per_second": 20.0,
+                    "predicted_n": 10,
+                    "predicted_ms": 2500.0,
+                    "predicted_per_second": 4.0,
+                },
+            }
+        )
+
+        self.assertEqual(result.prefill_seconds, 2.0)
+        self.assertEqual(result.decode_seconds, 2.5)
+        self.assertEqual(result.prefill_tokens_per_second, 20.0)
+        self.assertEqual(result.decode_tokens_per_second, 4.0)
+
+        console = StubConsole()
+        adi_chat.console = console
+        totals = adi_chat.UsageTotals()
+        metrics = adi_chat.TurnMetrics(
+            started_at=10.0,
+            first_token_at=12.1,
+            finished_at=14.6,
+        )
+        adi_chat.print_usage(result, totals, metrics)
+        terminal_output = "".join(text for text, _ in console.output)
+        self.assertIn("prefill  40 input tokens  •  2.00s  •  20.00 tok/s", terminal_output)
+        self.assertIn("decode   10 output tokens  •  2.50s  •  4.00 tok/s", terminal_output)
+        self.assertIn("4.60s total", terminal_output)
+        self.assertEqual(totals.prefill_seconds, 2.0)
+        self.assertEqual(totals.decode_seconds, 2.5)
+
     def test_reasoning_renderer_handles_split_tags(self) -> None:
         source = "think one</think>\nanswer<think>think two</think>tail"
         expected_dim = "think onethink two"
@@ -138,6 +218,146 @@ class AdiChatTests(unittest.TestCase):
                 self.assertEqual(normal, expected_normal)
                 self.assertNotIn("<think>", dim + normal)
                 self.assertNotIn("</think>", dim + normal)
+
+    def test_turn_metrics_tracks_ttft_and_rolling_rate(self) -> None:
+        metrics = adi_chat.TurnMetrics(started_at=10.0)
+        metrics.observe_token(12.0)
+        metrics.observe_token(12.5)
+        metrics.observe_token(13.0)
+
+        self.assertEqual(metrics.streamed_tokens, 3)
+        self.assertEqual(metrics.time_to_first_token(), 2.0)
+        self.assertEqual(metrics.current_tokens_per_second(), 2.0)
+        self.assertEqual(metrics.average_tokens_per_second(), 2.0)
+
+        metrics.observe_token(20.0)
+        self.assertIsNone(metrics.current_tokens_per_second())
+        metrics.observe_token(21.0)
+        self.assertEqual(metrics.current_tokens_per_second(), 1.0)
+        self.assertAlmostEqual(metrics.average_tokens_per_second(), 4.0 / 9.0)
+
+        metrics.finish(22.0)
+        self.assertEqual(metrics.elapsed(), 12.0)
+        self.assertEqual(metrics.decode_tokens_per_second(5), 0.4)
+
+    def test_streaming_display_commits_only_complete_lines(self) -> None:
+        console = StubConsole()
+        adi_chat.console = console
+        display = adi_chat.StreamingDisplay(adi_chat.TurnMetrics(started_at=0.0))
+
+        display.write("one", True)
+        display.write(" two", True)
+        self.assertEqual(
+            [text for text, _ in console.output],
+            ["  REASONING  "],
+        )
+
+        display.write("\nthree", False)
+        self.assertEqual(
+            [text for text, _ in console.output],
+            ["  REASONING  ", "  │ one two", "", "  ANSWER  "],
+        )
+        display.write(" four", False)
+        self.assertEqual(len(console.output), 4)
+
+        display.finish()
+        self.assertEqual(
+            [text for text, _ in console.output],
+            [
+                "  REASONING  ",
+                "  │ one two",
+                "",
+                "  ANSWER  ",
+                "three four",
+            ],
+        )
+
+    def test_tty_stream_does_not_print_token_fragments_as_lines(self) -> None:
+        class FakeClient:
+            def create(self, messages, settings, *, stream, on_delta):
+                del messages, settings, stream
+                for delta in ("thin", "king</think>", "an", "swer"):
+                    on_delta(delta)
+                return adi_chat.ResponseResult(
+                    text="thinking</think>answer",
+                    input_tokens=7,
+                    output_tokens=4,
+                    total_tokens=11,
+                )
+
+        console = StubConsole()
+        console.is_terminal = True
+        adi_chat.console = console
+        adi_chat.send_turn(
+            FakeClient(),
+            adi_chat.Conversation(),
+            adi_chat.GenerationSettings(None, 0.7, 0.9, 0),
+            "hello",
+            stream=True,
+            totals=adi_chat.UsageTotals(),
+        )
+
+        printed = [text for text, _ in console.output]
+        self.assertIn("  REASONING  ", printed)
+        self.assertIn("  │ thinking", printed)
+        self.assertIn("  ANSWER  ", printed)
+        self.assertIn("answer", printed)
+        self.assertNotIn("thin", printed)
+        self.assertNotIn("king", printed)
+        self.assertNotIn("an", printed)
+        self.assertNotIn("swer", printed)
+
+    def test_incomplete_reason_describes_output_limit(self) -> None:
+        result = adi_chat.ResponseResult(
+            text="partial",
+            status="incomplete",
+            raw={"incomplete_details": {"reason": "max_output_tokens"}},
+        )
+        self.assertEqual(
+            adi_chat.incomplete_reason(result),
+            "Output limit reached; the response may be unfinished.",
+        )
+
+    def test_send_turn_prints_terminal_metrics_and_commits_history(self) -> None:
+        class FakeClient:
+            def create(self, messages, settings, *, stream, on_delta):
+                del messages, settings, stream
+                on_delta("reasoning</think>answer")
+                return adi_chat.ResponseResult(
+                    text="reasoning</think>answer",
+                    input_tokens=7,
+                    output_tokens=2,
+                    total_tokens=9,
+                )
+
+        console = StubConsole()
+        conversation = adi_chat.Conversation()
+        settings = adi_chat.GenerationSettings(None, 0.7, 0.9, 0)
+        totals = adi_chat.UsageTotals()
+        adi_chat.console = console
+
+        adi_chat.send_turn(
+            FakeClient(),
+            conversation,
+            settings,
+            "hello",
+            stream=True,
+            totals=totals,
+        )
+
+        self.assertEqual(
+            conversation.messages,
+            [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "reasoning</think>answer"},
+            ],
+        )
+        self.assertEqual(totals.total_tokens, 9)
+        terminal_output = "".join(text for text, _ in console.output)
+        self.assertIn("2 output", terminal_output)
+        self.assertIn("7 input", terminal_output)
+        self.assertIn("TTFT", terminal_output)
+        self.assertIn("9 session tokens", terminal_output)
 
     def test_listening_port_parser(self) -> None:
         self.assertEqual(

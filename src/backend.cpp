@@ -1,7 +1,12 @@
 #include "adi/backend.hpp"
+#include "parallel.hpp"
 #include "simd.hpp"
 
 namespace adi {
+
+std::uint32_t worker_threads() noexcept {
+    return detail::worker_thread_count();
+}
 
 const Backend &cpu_backend() noexcept {
     static const Backend backend{

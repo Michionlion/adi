@@ -127,7 +127,18 @@ int main() {
                 511.0F;
     }
     const auto ne_states = adi::detail::build_ne_state_values(ne_tlut);
+    const auto ne_signed_tlut =
+        adi::detail::build_ne_signed_tlut(ne_tlut);
     assert(ne_states.size() == 65536 * 2);
+    assert(ne_signed_tlut.size() == 1024 * 2);
+    for (std::uint32_t state = 0; state < 65536; ++state) {
+        const std::uint64_t product =
+            static_cast<std::uint64_t>(state) * (state + 1);
+        const auto signed_row = (product >> 6) & 0x3FFU;
+        assert(ne_signed_tlut[signed_row * 2] == ne_states[state * 2]);
+        assert(ne_signed_tlut[signed_row * 2 + 1] ==
+               ne_states[state * 2 + 1]);
+    }
     std::vector<std::uint16_t> ne_trellis(64);
     for (auto &value : ne_trellis) {
         value = static_cast<std::uint16_t>(next_random(random));
@@ -154,6 +165,7 @@ int main() {
         0.03125F,
         ne_tlut,
         ne_states,
+        ne_signed_tlut,
     };
     adi::mach_ne_matvec(
         uncached_ne,

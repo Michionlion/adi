@@ -15,11 +15,18 @@ add_library(adi_runtime STATIC
     src/chat.cpp
     src/codec_cache.cpp
     src/executor.cpp
+    src/expert_batch.cpp
+    src/expert_batch_x86_avx2.cpp
+    src/expert_batch_x86_avx512.cpp
     src/generation.cpp
     src/gguf.cpp
     src/json.cpp
     src/kernels.cpp
     src/model.cpp
+    src/ne_batch.cpp
+    src/ne_batch_x86_avx2.cpp
+    src/ne_batch_x86_avx512.cpp
+    src/options.cpp
     src/parallel.cpp
     src/profiling.cpp
     src/server.cpp
@@ -59,6 +66,16 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|amd64|x64|i[3-6]86)")
                 src/simd_x86_vbmi.cpp
                 PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
         endif()
+        # /fp:precise already forbids contraction across a statement, so the
+        # separate multiply and add in the batch kernels stay separate.
+        set_source_files_properties(
+            src/expert_batch_x86_avx2.cpp
+            src/ne_batch_x86_avx2.cpp
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:precise")
+        set_source_files_properties(
+            src/expert_batch_x86_avx512.cpp
+            src/ne_batch_x86_avx512.cpp
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX512;/fp:precise")
     elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         set_source_files_properties(
             src/simd_x86_avx2.cpp
@@ -70,6 +87,19 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|amd64|x64|i[3-6]86)")
             src/simd_x86_vbmi.cpp
             PROPERTIES COMPILE_OPTIONS
                 "-mavx512f;-mavx512bw;-mavx512vbmi")
+        # The batch kernels must not fuse their multiply and add into an FMA:
+        # that would round differently from the scalar reference and break
+        # bit-exactness. AVX2 and AVX-512 both make FMA available, so the
+        # contraction has to be disabled explicitly.
+        set_source_files_properties(
+            src/expert_batch_x86_avx2.cpp
+            src/ne_batch_x86_avx2.cpp
+            PROPERTIES COMPILE_OPTIONS "-mavx2;-ffp-contract=off")
+        set_source_files_properties(
+            src/expert_batch_x86_avx512.cpp
+            src/ne_batch_x86_avx512.cpp
+            PROPERTIES COMPILE_OPTIONS
+                "-mavx512f;-mavx512bw;-ffp-contract=off")
     endif()
 endif()
 
@@ -99,6 +129,31 @@ if(ADI_BUILD_TESTS)
     target_link_libraries(adi_int5_batch_test PRIVATE adi_runtime)
     target_include_directories(adi_int5_batch_test PRIVATE src)
     add_test(NAME int5_batch COMMAND adi_int5_batch_test)
+
+    add_executable(adi_parallel_test tests/parallel_test.cpp)
+    target_link_libraries(adi_parallel_test PRIVATE adi_runtime)
+    target_include_directories(adi_parallel_test PRIVATE src)
+    add_test(NAME parallel COMMAND adi_parallel_test)
+
+    add_executable(adi_ne_trellis_test tests/ne_trellis_test.cpp)
+    target_link_libraries(adi_ne_trellis_test PRIVATE adi_runtime)
+    target_include_directories(adi_ne_trellis_test PRIVATE src)
+    add_test(NAME ne_trellis COMMAND adi_ne_trellis_test)
+
+    add_executable(adi_expert_trellis_test tests/expert_trellis_test.cpp)
+    target_link_libraries(adi_expert_trellis_test PRIVATE adi_runtime)
+    target_include_directories(adi_expert_trellis_test PRIVATE src)
+    add_test(NAME expert_trellis COMMAND adi_expert_trellis_test)
+
+    add_executable(adi_ne_batch_test tests/ne_batch_test.cpp)
+    target_link_libraries(adi_ne_batch_test PRIVATE adi_runtime)
+    target_include_directories(adi_ne_batch_test PRIVATE src)
+    add_test(NAME ne_batch COMMAND adi_ne_batch_test)
+
+    add_executable(adi_expert_batch_test tests/expert_batch_test.cpp)
+    target_link_libraries(adi_expert_batch_test PRIVATE adi_runtime)
+    target_include_directories(adi_expert_batch_test PRIVATE src)
+    add_test(NAME expert_batch COMMAND adi_expert_batch_test)
 
     add_executable(adi_codec_cache_test tests/codec_cache_test.cpp)
     target_link_libraries(adi_codec_cache_test PRIVATE adi_runtime)
@@ -166,10 +221,28 @@ if(ADI_BUILD_TESTS)
     target_link_libraries(adi_model_e2e_test PRIVATE adi_runtime)
     add_executable(adi_model_batch_test tests/model_batch_test.cpp)
     target_link_libraries(adi_model_batch_test PRIVATE adi_runtime)
+    add_executable(adi_prefill_ubatch_test tests/prefill_ubatch_test.cpp)
+    target_link_libraries(adi_prefill_ubatch_test PRIVATE adi_runtime)
+    add_executable(adi_linear_prefill_test tests/linear_prefill_test.cpp)
+    target_link_libraries(adi_linear_prefill_test PRIVATE adi_runtime)
+    add_executable(adi_moe_batch_test tests/moe_batch_test.cpp)
+    target_link_libraries(adi_moe_batch_test PRIVATE adi_runtime)
     if(ADI_TEST_MODEL)
+        add_test(
+            NAME linear_prefill
+            COMMAND adi_linear_prefill_test ${ADI_TEST_MODEL})
+        add_test(
+            NAME moe_batch
+            COMMAND adi_moe_batch_test ${ADI_TEST_MODEL})
         add_test(NAME tokenizer COMMAND adi_tokenizer_test ${ADI_TEST_MODEL})
         add_test(NAME model_e2e COMMAND adi_model_e2e_test ${ADI_TEST_MODEL})
         add_test(NAME model_batch COMMAND adi_model_batch_test ${ADI_TEST_MODEL})
+        # The wide matrix from the plan runs as "adi_prefill_ubatch_test MODEL
+        # --full"; chunk handling does not depend on prompt size, so the
+        # per-commit test keeps prompts short.
+        add_test(
+            NAME prefill_ubatch
+            COMMAND adi_prefill_ubatch_test ${ADI_TEST_MODEL})
     endif()
 
     foreach(test_target
@@ -177,6 +250,11 @@ if(ADI_BUILD_TESTS)
             adi_gguf_test
             adi_kernels_test
             adi_int5_batch_test
+            adi_parallel_test
+            adi_ne_trellis_test
+            adi_expert_trellis_test
+            adi_ne_batch_test
+            adi_expert_batch_test
             adi_codec_cache_test
             adi_gated_delta_test
             adi_simd_dispatch_test
@@ -191,7 +269,10 @@ if(ADI_BUILD_TESTS)
             adi_server_test
             adi_tokenizer_test
             adi_model_e2e_test
-            adi_model_batch_test)
+            adi_model_batch_test
+            adi_prefill_ubatch_test
+            adi_linear_prefill_test
+            adi_moe_batch_test)
         if(MSVC)
             target_compile_options(${test_target} PRIVATE /UNDEBUG)
         else()
