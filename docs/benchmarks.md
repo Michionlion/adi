@@ -955,3 +955,19 @@ was also tested and is not retained. The 2,048-token linear-attention
 benchmark moved from a 2.553 milliseconds/token baseline to a 2.595 ms median,
 which is noise in the wrong direction and does not justify another model-data
 representation.
+
+## Direct AVX2 int5 unpacking
+
+Measured on 2026-08-08 on the same eight-core EPYC 9645 VM and Release build.
+The AVX2 int5 dot kernel used to decode 64 weights into a temporary float
+array, then load that array back into vectors. It now constructs each eight-
+weight vector directly from the mmap-backed packed bytes. Five alternating
+A/B pairs of 50 output-head iterations measured these medians:
+
+| AVX2 output head, 31,040 x 2,048 | before | after | change |
+| --- | ---: | ---: | ---: |
+| milliseconds/token | 4.273 | 3.556 | -16.8% |
+
+Both paths produce checksum `1988.55`. A direct test reproduces the AVX2
+kernel's eight accumulation lanes from packed codes and half-precision scales
+and compares the final result bit-for-bit.

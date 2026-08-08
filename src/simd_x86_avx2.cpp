@@ -66,22 +66,23 @@ void hadamard_avx2(std::span<float> values) {
     }
 }
 
-void unpack_int5_group(
+__m256 unpack_int5_block(
     const std::uint8_t *packed,
-    float scale,
-    float *weights) {
-    for (std::uint32_t block = 0; block < 8; ++block) {
-        std::uint64_t word = 0;
-        for (std::uint32_t byte = 0; byte < 5; ++byte) {
-            word |= static_cast<std::uint64_t>(packed[block * 5 + byte])
-                    << (byte * 8);
-        }
-        for (std::uint32_t index = 0; index < 8; ++index) {
-            const auto code = static_cast<std::int32_t>(
-                (word >> (index * 5)) & 0x1FU) - 16;
-            weights[block * 8 + index] = static_cast<float>(code) * scale;
-        }
+    __m256 scale) {
+    std::uint64_t word = 0;
+    for (std::uint32_t byte = 0; byte < 5; ++byte) {
+        word |= static_cast<std::uint64_t>(packed[byte]) << (byte * 8);
     }
+    const auto codes = _mm256_setr_epi32(
+        static_cast<std::int32_t>((word >> 0) & 0x1FU) - 16,
+        static_cast<std::int32_t>((word >> 5) & 0x1FU) - 16,
+        static_cast<std::int32_t>((word >> 10) & 0x1FU) - 16,
+        static_cast<std::int32_t>((word >> 15) & 0x1FU) - 16,
+        static_cast<std::int32_t>((word >> 20) & 0x1FU) - 16,
+        static_cast<std::int32_t>((word >> 25) & 0x1FU) - 16,
+        static_cast<std::int32_t>((word >> 30) & 0x1FU) - 16,
+        static_cast<std::int32_t>((word >> 35) & 0x1FU) - 16);
+    return _mm256_mul_ps(_mm256_cvtepi32_ps(codes), scale);
 }
 
 float int5_dot_avx2(
@@ -89,18 +90,17 @@ float int5_dot_avx2(
     std::span<const std::uint16_t> scales,
     std::span<const float> input) {
     __m256 sum = _mm256_setzero_ps();
-    alignas(32) float weights[64];
     for (std::size_t group = 0; group < scales.size(); ++group) {
-        unpack_int5_group(
-            packed.data() + group * 40,
-            f16_to_f32(scales[group]),
-            weights);
-        for (std::size_t index = 0; index < 64; index += 8) {
+        const auto scale = _mm256_set1_ps(f16_to_f32(scales[group]));
+        for (std::size_t block = 0; block < 8; ++block) {
+            const auto index = group * 64 + block * 8;
             sum = _mm256_add_ps(
                 sum,
                 _mm256_mul_ps(
-                    _mm256_load_ps(weights + index),
-                    _mm256_loadu_ps(input.data() + group * 64 + index)));
+                    unpack_int5_block(
+                        packed.data() + group * 40 + block * 5,
+                        scale),
+                    _mm256_loadu_ps(input.data() + index)));
         }
     }
     return reduce_avx2(sum);
