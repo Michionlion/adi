@@ -971,3 +971,35 @@ A/B pairs of 50 output-head iterations measured these medians:
 Both paths produce checksum `1988.55`. A direct test reproduces the AVX2
 kernel's eight accumulation lanes from packed codes and half-precision scales
 and compares the final result bit-for-bit.
+
+## Further decode candidates
+
+Measured on 2026-08-08 on the same eight-core EPYC 9645 VM and Release build.
+These adjacent experiments are not retained:
+
+- Prefetching an expert codebook entry eight independent states ahead moves
+  the 512x2048 gate from a 0.4430 ms median to 0.5121 ms and the 2048x512 down
+  projection from 0.4490 to 0.5122 ms. The address-generation work costs
+  14-16% more than the hidden lookup latency saves.
+- Pairing two expert local-row accumulators is bit-exact and cuts the gate
+  projection by 3.7%, but the down projection is unchanged. Since a routed
+  expert performs two gates and one down projection, this is well below 1%
+  at the token boundary and does not justify duplicating the trellis walk.
+- Recomputing Gated DeltaNet's decay product in its second state pass removes
+  an intermediate store and reload. The isolated 32-head recurrence is only
+  3.3% faster, about 0.0033 ms per layer before head parallelism, so its
+  token-level ceiling is negligible.
+- Running the eight output-head chunks as one outer worker dispatch is exact
+  and 4-6% faster for the head, approximately 0.4-0.8 ms per token. That is
+  below 0.4% end to end and not enough to add nested scheduling to this path.
+- Inlining the `silu` and `sigmoid` wrappers leaves checksums unchanged but
+  moves `bench-linear` from a 2.428 to 2.458 ms/token median and 128-row
+  `bench-moe-batch` from 61.86 to 62.46 ms/forward. The additional caller code
+  is about 1% slower than the wrapper calls.
+
+There is also no transformed-input reuse available between adjacent
+projections. Exact comparisons find matching input-scale vectors in 0 of 30
+linear QKV/gate pairs, 0 of 30 full-attention Q/K/V pairs, 0 of 40 shared
+gate/up pairs, and 0 of 10,240 routed-expert gate/up pairs. Fusing those
+Hadamard preparations would therefore change the weights rather than remove
+duplicate work.
