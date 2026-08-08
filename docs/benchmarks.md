@@ -693,6 +693,68 @@ rows of a tile and could be held in registers, but not in the sixteen the
 baseline SSE2 target has, so that one needs an ISA-specific translation unit
 like the batch kernel already has.
 
+## The expert codec has the same two problems
+
+Both fixes carry over, and the state register is a window here too. Shifting
+in twelve fresh bits and dropping the top twelve leaves a 16-bit window that
+has advanced twelve bits, so state i is the window at bit 12*i of the 384-bit
+stream. Only the last state's window crosses the end: 12*31 = 372 and 372 + 16
+exceeds 384. The stride is not a whole byte, so a state costs an unaligned
+extract rather than a word load, but it buys the same independence.
+
+The accumulator was in memory for the same reason. State i fills half of local
+row i >> 1, so a row's two states deliver sixteen adds to one `partial` slot.
+That row is built from zero and used once, in `row_sums += partial * gamma`,
+so it never has to reach memory at all: it stays in a register and folds
+straight into `row_sums`, which also removes the `partial` array and the
+separate gamma loop.
+
+| interleaved A/B (medians) | before | after | |
+| --- | ---: | ---: | ---: |
+| `bench-expert` 512x2048, 200 iterations, 9 pairs | 0.6760 ms | 0.4466 ms | 1.51x |
+| `decode-token`, `expert` over eight workers, 11 pairs | 731.7 ms | 500.4 ms | 1.46x |
+| `decode-token`, MoE stage, 11 pairs | 133.6 ms | 98.2 ms | 1.36x |
+| `decode-token`, step, 11 pairs | 0.2661 s | 0.2232 s | 1.19x |
+
+Across all three changes a batch-1 step went 0.3682 s to about 0.2100 s,
+**1.75x**, and 2.72 to 4.8 tokens/second. MoE was the largest stage after the
+non-expert work and is second again behind it.
+
+### Re-measuring the thresholds against the faster kernels
+
+Every tuned constant on this path was set against single-vector kernels that
+are now 1.5x to 2x faster while the batch kernels are unchanged, so the
+crossovers were re-measured. None of them moved.
+
+`ne_batch_minimum` stays at two. On the 8192x2048 qkv the batch kernel costs
+1.92 ms at batch two against 3.24 ms for two passes of the matvec, so it still
+wins by 1.69x and the margin is nowhere near closing.
+
+`expert_batch_minimum` stays at two, and this one is worth recording because
+the microbenchmark says otherwise. On `bench-expert` the batch kernel runs a
+single vector in 0.2055 ms against the matvec's 0.4627 ms, 2.25x, and it is
+bit-exact. End to end it is worth nothing: routing batch one through it moved
+the MoE stage from 88.7 to 92.3 ms and the step from 0.2074 to 0.2116 s, both
+slightly the wrong way. `bench-expert` hits one matrix 200 times with warm
+scratch, so the batch kernel's packing and per-call setup amortize away; decode
+touches 960 different expert matrices once each and is bound by streaming each
+one's packed weights, which is the same conclusion the routing measurements
+reached earlier by a different route. The gap between those two numbers is the
+useful part: a 2.25x kernel microbenchmark on this path can be worth zero.
+
+The non-expert matvec's `parallel_ranges` grain stays at four. Sweeping it over
+{1, 2, 4, 8} moves a decode step between 0.2176 and 0.2365 s with no ordering,
+which is inside the noise floor; on the shapes that matter the grain does not
+change the worker count at all, since 512 tile rows divide across eight workers
+whatever it is.
+
+The prefill microbatch default stays at 128. Prefill runs on the batch kernels,
+not the matvec, so none of these changes touch it, and a 256-token sweep
+confirms the curve has the same shape it had when 128 was chosen: 19.76, 25.90,
+30.73, 34.69 and 38.15 tokens/second at microbatches 16 through 256, still
+rising, with scratch doubling every step. Going to 256 is the same 2x scratch
+for 10% trade the current default already declined.
+
 ### Exactness
 
 Bit-exact, not tolerance-bounded:
