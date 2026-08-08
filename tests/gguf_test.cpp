@@ -12,6 +12,11 @@
 #include <string_view>
 #include <vector>
 
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 namespace {
 
 template <typename T>
@@ -26,7 +31,9 @@ void append_string(std::vector<std::byte> &bytes, std::string_view value) {
     bytes.insert(bytes.end(), begin, begin + value.size());
 }
 
-std::filesystem::path write_fixture(bool truncate = false) {
+std::filesystem::path write_fixture(
+    bool truncate = false,
+    bool unicode_path = false) {
     static std::atomic<std::uint64_t> fixture_counter = 0;
     std::vector<std::byte> bytes;
     append(bytes, std::uint32_t{0x46554747});
@@ -78,16 +85,62 @@ std::filesystem::path write_fixture(bool truncate = false) {
     const auto process_nonce =
         reinterpret_cast<std::uintptr_t>(&fixture_counter);
     const auto instance_nonce = fixture_counter.fetch_add(1);
-    const auto path =
-        std::filesystem::temp_directory_path() /
-        ("adi-gguf-test-" + std::to_string(clock_nonce) + "-" +
-         std::to_string(process_nonce) + "-" + std::to_string(instance_nonce) +
-         (truncate ? "-bad.gguf" : ".gguf"));
+    auto file_name = unicode_path
+                         ? std::filesystem::path(
+                               u8"adi-gguf-\u6a21\u578b-test-")
+                         : std::filesystem::path("adi-gguf-test-");
+    file_name += std::to_string(clock_nonce) + "-" +
+                 std::to_string(process_nonce) + "-" +
+                 std::to_string(instance_nonce) +
+                 (truncate ? "-bad.gguf" : ".gguf");
+    const auto path = std::filesystem::temp_directory_path() / file_name;
     std::ofstream output(path, std::ios::binary);
     output.write(reinterpret_cast<const char *>(bytes.data()),
                  static_cast<std::streamsize>(bytes.size()));
     return path;
 }
+
+#ifdef _WIN32
+std::wstring extended_path(const std::filesystem::path &path) {
+    const auto native = std::filesystem::absolute(path).native();
+    if (native.starts_with(L"\\\\")) {
+        return L"\\\\?\\UNC\\" + native.substr(2);
+    }
+    return L"\\\\?\\" + native;
+}
+
+void check_long_path() {
+    const auto source = write_fixture();
+    auto root = source;
+    root += ".long";
+    const auto native_root = extended_path(root);
+    assert(::CreateDirectoryW(native_root.c_str(), nullptr) != 0);
+    auto directory = root;
+    while ((directory / "fixture.gguf").native().size() < 300) {
+        directory /= "segment-0123456789-abcdefghijklmnopqrstuvwxyz";
+        const auto native = extended_path(directory);
+        assert(::CreateDirectoryW(native.c_str(), nullptr) != 0);
+    }
+    const auto path = directory / "fixture.gguf";
+    const auto native_path = extended_path(path);
+    assert(::CreateHardLinkW(native_path.c_str(), source.c_str(), nullptr) != 0);
+    {
+        const adi::GgufFile file(path);
+        assert(file.find_tensor("test.weight") != nullptr);
+    }
+    assert(::DeleteFileW(native_path.c_str()) != 0);
+    for (;;) {
+        const auto parent = directory.parent_path();
+        const auto native_directory = extended_path(directory);
+        assert(::RemoveDirectoryW(native_directory.c_str()) != 0);
+        if (directory == root) {
+            break;
+        }
+        directory = parent;
+    }
+    std::filesystem::remove(source);
+}
+#endif
 
 } // namespace
 
@@ -122,6 +175,17 @@ int main() {
         assert(last == 4.0F);
     }
     std::filesystem::remove(path);
+
+    const auto unicode_path = write_fixture(false, true);
+    {
+        const adi::GgufFile file(unicode_path);
+        assert(file.find_tensor("test.weight") != nullptr);
+    }
+    std::filesystem::remove(unicode_path);
+
+#ifdef _WIN32
+    check_long_path();
+#endif
 
     const auto truncated_path = write_fixture(true);
     bool rejected = false;

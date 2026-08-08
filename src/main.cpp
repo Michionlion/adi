@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cmath>
 #include <exception>
+#include <filesystem>
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
@@ -20,7 +21,58 @@
 #include <string_view>
 #include <vector>
 
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 namespace {
+
+#ifdef _WIN32
+std::string wide_to_utf8(std::wstring_view value) {
+    if (value.empty()) {
+        return {};
+    }
+    const auto size = ::WideCharToMultiByte(
+        CP_UTF8,
+        WC_ERR_INVALID_CHARS,
+        value.data(),
+        static_cast<int>(value.size()),
+        nullptr,
+        0,
+        nullptr,
+        nullptr);
+    if (size <= 0) {
+        throw std::runtime_error("cannot decode Windows command line");
+    }
+    std::string result(static_cast<std::size_t>(size), '\0');
+    if (::WideCharToMultiByte(
+            CP_UTF8,
+            WC_ERR_INVALID_CHARS,
+            value.data(),
+            static_cast<int>(value.size()),
+            result.data(),
+            size,
+            nullptr,
+            nullptr) != size) {
+        throw std::runtime_error("cannot decode Windows command line");
+    }
+    return result;
+}
+#endif
+
+std::filesystem::path path_argument(std::string_view value) {
+#ifdef _WIN32
+    std::u8string utf8;
+    utf8.reserve(value.size());
+    for (const unsigned char byte : value) {
+        utf8.push_back(static_cast<char8_t>(byte));
+    }
+    return std::filesystem::path(utf8);
+#else
+    return std::filesystem::path(value);
+#endif
+}
 
 float stable_benchmark_input(
     std::uint64_t index,
@@ -174,7 +226,7 @@ int profiled_benchmark(Function &&function) {
     }
 }
 
-int inspect(const char *path) {
+int inspect(const std::filesystem::path &path) {
     const adi::GgufFile file(path);
     std::cout << "GGUF v" << file.version() << '\n'
               << "alignment: " << file.alignment() << '\n'
@@ -233,7 +285,7 @@ adi::ExpertProjection parse_projection(std::string_view value) {
     throw std::invalid_argument("projection must be gate, up, or down");
 }
 
-int validate(const char *path) {
+int validate(const std::filesystem::path &path) {
     const adi::MachModel model(path);
     const auto &config = model.config();
     std::cout << "valid Mach additive model\n"
@@ -249,7 +301,7 @@ int validate(const char *path) {
 }
 
 int bench_expert(int argc, char **argv) {
-    const adi::MachModel model(argv[2]);
+    const adi::MachModel model(path_argument(argv[2]));
     const auto layer = parse_u32(argv[3], "layer");
     const auto expert = parse_u32(argv[4], "expert");
     const auto projection = parse_projection(argv[5]);
@@ -322,7 +374,7 @@ void print_benchmark(
 }
 
 int bench_ne(int argc, char **argv) {
-    const adi::MachModel model(argv[2]);
+    const adi::MachModel model(path_argument(argv[2]));
     const auto layer = parse_u32(argv[3], "layer");
     const auto matrix = model.non_expert(layer, argv[4]);
     const auto iterations = argc >= 6 ? parse_u32(argv[5], "iterations") : 3;
@@ -366,7 +418,7 @@ int bench_ne(int argc, char **argv) {
 }
 
 int bench_head(int argc, char **argv) {
-    const adi::MachModel model(argv[2]);
+    const adi::MachModel model(path_argument(argv[2]));
     const auto chunk_index = parse_u32(argv[3], "chunk");
     const auto head = model.head_chunk(chunk_index);
     const auto iterations = argc >= 5 ? parse_u32(argv[4], "iterations") : 1;
@@ -408,7 +460,9 @@ int bench_head(int argc, char **argv) {
     return 0;
 }
 
-int embedding_row(const char *path, std::string_view token_string) {
+int embedding_row(
+    const std::filesystem::path &path,
+    std::string_view token_string) {
     const adi::MachModel model(path);
     const auto token = parse_u32(token_string, "token");
     const auto embedding = model.embedding();
@@ -427,7 +481,7 @@ int embedding_row(const char *path, std::string_view token_string) {
 }
 
 int bench_moe(int argc, char **argv) {
-    const adi::MachModel model(argv[2]);
+    const adi::MachModel model(path_argument(argv[2]));
     const auto layer = parse_u32(argv[3], "layer");
     const auto iterations = argc == 5 ? parse_u32(argv[4], "iterations") : 1;
     if (iterations == 0) {
@@ -474,7 +528,7 @@ int bench_moe(int argc, char **argv) {
 // Use this to compare scheduling strategies against each other, and measure
 // the runtime in situ before drawing conclusions about it.
 int bench_moe_batch(int argc, char **argv) {
-    const adi::MachModel model(argv[2]);
+    const adi::MachModel model(path_argument(argv[2]));
     const auto layer = parse_u32(argv[3], "layer");
     const auto batch = parse_u32(argv[4], "batch");
     const auto iterations = argc >= 6 ? parse_u32(argv[5], "iterations") : 3;
@@ -562,7 +616,7 @@ int bench_moe_batch(int argc, char **argv) {
 }
 
 int bench_attention(int argc, char **argv) {
-    const adi::MachModel model(argv[2]);
+    const adi::MachModel model(path_argument(argv[2]));
     const auto layer = parse_u32(argv[3], "layer");
     const auto tokens = argc == 5 ? parse_u32(argv[4], "tokens") : 1;
     if (tokens == 0) {
@@ -593,7 +647,7 @@ int bench_attention(int argc, char **argv) {
 }
 
 int bench_linear_attention(int argc, char **argv) {
-    const adi::MachModel model(argv[2]);
+    const adi::MachModel model(path_argument(argv[2]));
     const auto layer = parse_u32(argv[3], "layer");
     const auto tokens = argc == 5 ? parse_u32(argv[4], "tokens") : 1;
     if (tokens == 0) {
@@ -624,7 +678,7 @@ int bench_linear_attention(int argc, char **argv) {
 }
 
 int bench_prefill(int argc, char **argv) {
-    const adi::MachModel model(argv[2]);
+    const adi::MachModel model(path_argument(argv[2]));
     const auto prompt_tokens = parse_u32(argv[3], "tokens");
     adi::ExecutionOptions execution;
     execution.prefill_ubatch = parse_u32(argv[4], "ubatch");
@@ -688,7 +742,9 @@ int bench_prefill(int argc, char **argv) {
     return 0;
 }
 
-int decode_one(const char *path, std::string_view token_string) {
+int decode_one(
+    const std::filesystem::path &path,
+    std::string_view token_string) {
     const adi::MachModel model(path);
     const auto token = parse_u32(token_string, "token");
     std::vector<float> logits(model.config().vocabulary);
@@ -718,7 +774,7 @@ int decode_one(const char *path, std::string_view token_string) {
 }
 
 int decode_batch(
-    const char *path,
+    const std::filesystem::path &path,
     std::string_view token_string,
     std::string_view batch_string) {
     const adi::MachModel model(path);
@@ -750,7 +806,7 @@ int decode_batch(
     return 0;
 }
 
-int tokenize(const char *path, std::string_view text) {
+int tokenize(const std::filesystem::path &path, std::string_view text) {
     const adi::MachModel model(path);
     adi::Tokenizer tokenizer(model);
     const auto tokens = tokenizer.encode(text);
@@ -763,7 +819,7 @@ int tokenize(const char *path, std::string_view text) {
 }
 
 int generate_text(int argc, char **argv) {
-    const adi::MachModel model(argv[2]);
+    const adi::MachModel model(path_argument(argv[2]));
     adi::Tokenizer tokenizer(model);
     adi::GenerationOptions options;
     adi::ExecutionOptions execution;
@@ -796,7 +852,7 @@ int serve_command(int argc, char **argv) {
     for (int index = 2; index < argc; ++index) {
         const std::string_view argument = argv[index];
         if (argument == "--model" && index + 1 < argc) {
-            options.model = argv[++index];
+            options.model = path_argument(argv[++index]);
         } else if (argument == "--host" && index + 1 < argc) {
             options.host = argv[++index];
         } else if (argument == "--port" && index + 1 < argc) {
@@ -845,14 +901,14 @@ void usage() {
 
 } // namespace
 
-int main(int argc, char **argv) {
+int adi_main(int argc, char **argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--version") {
         std::cout << "adi " << adi::version() << '\n';
         return 0;
     }
     if (argc == 3 && std::string_view(argv[1]) == "inspect") {
         try {
-            return inspect(argv[2]);
+            return inspect(path_argument(argv[2]));
         } catch (const std::exception &error) {
             std::cerr << "adi: " << error.what() << '\n';
             return 1;
@@ -860,7 +916,7 @@ int main(int argc, char **argv) {
     }
     if (argc == 3 && std::string_view(argv[1]) == "validate") {
         try {
-            return validate(argv[2]);
+            return validate(path_argument(argv[2]));
         } catch (const std::exception &error) {
             std::cerr << "adi: " << error.what() << '\n';
             return 1;
@@ -895,7 +951,7 @@ int main(int argc, char **argv) {
     }
     if (argc == 4 && std::string_view(argv[1]) == "embedding-row") {
         try {
-            return embedding_row(argv[2], argv[3]);
+            return embedding_row(path_argument(argv[2]), argv[3]);
         } catch (const std::exception &error) {
             std::cerr << "adi: " << error.what() << '\n';
             return 1;
@@ -950,7 +1006,7 @@ int main(int argc, char **argv) {
     if (argc == 4 && std::string_view(argv[1]) == "decode-token") {
         try {
             return profiled_benchmark(
-                [&] { return decode_one(argv[2], argv[3]); });
+                [&] { return decode_one(path_argument(argv[2]), argv[3]); });
         } catch (const std::exception &error) {
             std::cerr << "adi: " << error.what() << '\n';
             return 1;
@@ -959,7 +1015,10 @@ int main(int argc, char **argv) {
     if (argc == 5 && std::string_view(argv[1]) == "decode-batch") {
         try {
             return profiled_benchmark(
-                [&] { return decode_batch(argv[2], argv[3], argv[4]); });
+                [&] {
+                    return decode_batch(
+                        path_argument(argv[2]), argv[3], argv[4]);
+                });
         } catch (const std::exception &error) {
             std::cerr << "adi: " << error.what() << '\n';
             return 1;
@@ -967,7 +1026,7 @@ int main(int argc, char **argv) {
     }
     if (argc == 4 && std::string_view(argv[1]) == "tokenize") {
         try {
-            return tokenize(argv[2], argv[3]);
+            return tokenize(path_argument(argv[2]), argv[3]);
         } catch (const std::exception &error) {
             std::cerr << "adi: " << error.what() << '\n';
             return 1;
@@ -993,3 +1052,28 @@ int main(int argc, char **argv) {
     usage();
     return 2;
 }
+
+#ifdef _WIN32
+int wmain(int argc, wchar_t **wide_argv) {
+    try {
+        std::vector<std::string> arguments;
+        arguments.reserve(static_cast<std::size_t>(argc));
+        for (int index = 0; index < argc; ++index) {
+            arguments.push_back(wide_to_utf8(wide_argv[index]));
+        }
+        std::vector<char *> argv;
+        argv.reserve(arguments.size());
+        for (auto &argument : arguments) {
+            argv.push_back(argument.data());
+        }
+        return adi_main(argc, argv.data());
+    } catch (const std::exception &error) {
+        std::cerr << "adi: " << error.what() << '\n';
+        return 1;
+    }
+}
+#else
+int main(int argc, char **argv) {
+    return adi_main(argc, argv);
+}
+#endif
