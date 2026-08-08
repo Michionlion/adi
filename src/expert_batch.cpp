@@ -46,6 +46,12 @@ std::uint32_t expert_batch_lanes() noexcept {
     return selected_batch_kernel().lanes;
 }
 
+ExpertMatvecRowsKernel selected_expert_matvec_rows_kernel() noexcept {
+    return selected_cpu_isa() == CpuIsa::avx2
+               ? x86_expert_matvec_rows_avx2
+               : nullptr;
+}
+
 void expert_matmul_tiles_batch(
     const MachExpertMatrix &matrix,
     std::span<const float> state_values,

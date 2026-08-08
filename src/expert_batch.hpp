@@ -12,6 +12,19 @@ namespace adi::detail {
 // selected ISA, or zero when that ISA has no batch kernel.
 [[nodiscard]] std::uint32_t expert_batch_lanes() noexcept;
 
+using ExpertMatvecRowsKernel = void (*)(
+    const MachExpertMatrix &matrix,
+    std::span<const float> state_values,
+    std::span<const std::uint16_t> wave_indexes,
+    std::span<const float> wave_gamma,
+    std::span<const float> input,
+    std::span<float> output,
+    std::uint32_t row_begin,
+    std::uint32_t row_end);
+
+[[nodiscard]] ExpertMatvecRowsKernel
+selected_expert_matvec_rows_kernel() noexcept;
+
 // Smallest batch at which the SIMD kernel is used. Below it the packing and
 // per-tile setup cost more than they save, and the scalar loop wins. This is
 // lower than the non-expert kernel's threshold because a tile here holds 32
@@ -51,6 +64,16 @@ void x86_expert_tiles_batch_avx2(
     std::uint32_t batch,
     std::span<float> outputs,
     std::span<float> packed);
+
+void x86_expert_matvec_rows_avx2(
+    const MachExpertMatrix &matrix,
+    std::span<const float> state_values,
+    std::span<const std::uint16_t> wave_indexes,
+    std::span<const float> wave_gamma,
+    std::span<const float> input,
+    std::span<float> output,
+    std::uint32_t row_begin,
+    std::uint32_t row_end);
 
 void x86_expert_tiles_batch_avx512(
     const MachExpertMatrix &matrix,

@@ -61,6 +61,14 @@ void x86_ne_tiles_batch_avx2(
     std::span<float> outputs,
     std::span<float> packed);
 
+void x86_ne_matvec_rows_avx2(
+    const MachNeMatrix &matrix,
+    std::span<const float> signed_tlut,
+    std::span<const float> input,
+    std::span<float> output,
+    std::uint32_t row_begin,
+    std::uint32_t row_end);
+
 void x86_ne_tiles_batch_avx512(
     const MachNeMatrix &matrix,
     std::span<const float> state_values,

@@ -192,7 +192,7 @@ const SimdOps &avx2_ops() noexcept {
             CpuIsa::avx2,
             kernels.hadamard,
             kernels.int5_dot,
-            nullptr,
+            x86_int5_dot_batch_avx2,
             kernels.bf16_dot,
             kernels.f32_dot,
             kernels.gated_delta,

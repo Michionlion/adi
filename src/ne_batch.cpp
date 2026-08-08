@@ -45,9 +45,17 @@ std::uint32_t ne_batch_lanes() noexcept {
 }
 
 NeMatvecRowsKernel selected_ne_matvec_rows_kernel() noexcept {
-    return selected_cpu_isa() == CpuIsa::avx512
-               ? x86_ne_matvec_rows_avx512
-               : nullptr;
+    switch (selected_cpu_isa()) {
+    case CpuIsa::avx512:
+        return x86_ne_matvec_rows_avx512;
+    case CpuIsa::avx2:
+        return x86_ne_matvec_rows_avx2;
+    case CpuIsa::scalar:
+    case CpuIsa::neon:
+    case CpuIsa::sve:
+        return nullptr;
+    }
+    return nullptr;
 }
 
 void ne_matmul_tiles_batch(

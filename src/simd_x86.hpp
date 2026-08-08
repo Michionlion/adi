@@ -41,6 +41,13 @@ struct X86Kernels {
 [[nodiscard]] CpuFeatures x86_detect_features() noexcept;
 [[nodiscard]] const X86Kernels &x86_avx2_kernels() noexcept;
 [[nodiscard]] const X86Kernels &x86_avx512_kernels() noexcept;
+void x86_int5_dot_batch_avx2(
+    std::span<const std::uint8_t> packed,
+    std::span<const std::uint16_t> scales,
+    std::span<const float> inputs,
+    std::uint32_t batch,
+    std::span<float> outputs,
+    std::span<float> scratch);
 [[nodiscard]] float x86_int5_dot_vbmi(
     std::span<const std::uint8_t> packed,
     std::span<const std::uint16_t> scales,
