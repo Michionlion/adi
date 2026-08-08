@@ -15,8 +15,8 @@ import json
 import math
 import os
 import queue
-import signal
 import shutil
+import signal
 import socket
 import subprocess
 import sys
