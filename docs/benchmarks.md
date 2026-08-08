@@ -618,9 +618,80 @@ non-expert matvec is about 55% of a batch-1 step, so 1.23x on it predicts
 1.12x overall against the 1.13x measured.
 
 Decode is still nowhere near memory-bound after this: 702.5 MB of non-expert
-weights in 172.6 ms is 4.07 GB/s, about 7% of the machine's 58.9 GB/s. The
-kernel now runs at IPC near 8, so the next lever is instruction count rather
-than stalls or bandwidth.
+weights in 172.6 ms is 4.07 GB/s, about 7% of the machine's 58.9 GB/s.
+
+### The state register is a window, not a recurrence
+
+The note above guessed that instruction count was the next lever. It was not,
+and the way it failed is the useful part. Counted at the flags the runtime
+actually builds with -- `-O3 -ffp-contract=off`, no `-march`, so baseline
+SSE2 -- one thread, per pass over the 8192x2048 shape:
+
+| inner loop | cycles | instructions | IPC | cycles/state |
+| --- | ---: | ---: | ---: | ---: |
+| shipped | 39.3 M | 245.2 M | 6.24 | 4.69 |
+| both loops unrolled | 43.1 M | 121.6 M | 2.82 | 5.14 |
+| states read as a window | 22.9 M | 106.9 M | 4.66 | 2.73 |
+
+`#pragma GCC unroll` on the row and step loops does exactly what it promises:
+every control decision in the walk -- the first-state test, the stream wrap,
+the high/low byte select, the step test -- becomes a constant, and the
+instruction count halves. It is **slower**. The branches were perfectly
+predicted, the front end was never the constraint, and IPC simply collapses
+to fill the same wall time. The earlier "IPC near 8" reading came from a
+harness built at `-O2 -march=native`, which is not what ships; at the real
+flags the shipped loop is IPC 6.24 and latency-bound.
+
+What it was waiting on is the recurrence. Eight fresh bits per transition is
+exactly one byte, so the 16-bit state register is a sliding window over the
+tile's 128-byte stream: state i is stream bytes i and i + 1, most significant
+first, wrapping at the end. Because the bytes sit high-then-low inside each
+16-bit word, an even state is one word verbatim and an odd state straddles a
+word pair. Writing it as the recurrence it literally is serializes all 128
+states behind a shift-and-or chain, and since the state indexes the value
+table, no lookup can start before its state exists. Reading it as a window
+makes the states independent and the lookups pipeline.
+
+That is the whole change, and it is bit-exact by construction: the same 128
+states, in the same order, computed rather than accumulated.
+
+| interleaved A/B (medians) | accumulator | + window | |
+| --- | ---: | ---: | ---: |
+| `bench-ne`, 8192x2048, 60 iterations, 10 pairs | 1.882 ms | 1.356 ms | 1.39x |
+| `bench-linear` layer 0, `non_expert`, 13 pairs | 5.156 ms | 3.857 ms | 1.34x |
+| `decode-token`, `non_expert`, 11 pairs | 163.1 ms | 109.6 ms | 1.49x |
+| `decode-token`, step, 11 pairs | 0.3174 s | 0.2563 s | 1.24x |
+
+Measured three ways in one session against the original kernel, so the
+cumulative figures come from one set of conditions:
+
+| | non_expert | step |
+| --- | ---: | ---: |
+| before the accumulator | 214.1 ms | 0.3682 s |
+| accumulator in a register | 163.5 ms | 0.3225 s |
+| plus window states | 109.4 ms | 0.2626 s |
+
+**1.96x on the kernel and 1.40x on a batch-1 decode step**, 2.72 to 3.81
+tokens/second. The non-expert matvec is now 109 ms of a 263 ms step rather
+than 214 of 368.
+
+Two things that did not pay. Prescaling the value table by `weight_scale`,
+which is exact because the product was already rounded to float before
+meeting the input, removes two multiplies per state and is 48% slower --
+102.4 M instructions against 106.9 M but 34.0 M cycles against 22.9 M -- and
+it would need a 512 KB table per matrix besides. Giving the flat walk the
+same window treatment changes the batch kernel not at all, 2.576 ms against
+2.576 ms at batch 8 and prefill inside noise, because that kernel stages its
+states into an array and is bound by the vector work behind it; the flat walk
+is therefore left alone.
+
+At 6.42 GB/s the kernel is still at 11% of what the machine sustains, so the
+remaining ceiling is not bandwidth. The loads are now the binding constraint:
+four per state, two into the value table and two into the tile input, against
+about three per cycle. The tile input is sixteen floats reused by all sixteen
+rows of a tile and could be held in registers, but not in the sixteen the
+baseline SSE2 target has, so that one needs an ISA-specific translation unit
+like the batch kernel already has.
 
 ### Exactness
 
