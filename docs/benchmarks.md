@@ -801,3 +801,95 @@ Bit-exact, not tolerance-bounded:
 - the scalar loop is retained as `expert_accumulate_tiles_scalar` and runs on
   ISAs without a batch kernel;
 - the full suite passes under `ADI_CPU_ISA` of scalar, avx2, and avx512.
+
+## Causal attention and nested caller scheduling
+
+Measured on 2026-08-08 on the same eight-core EPYC 9645 VM and Release build
+as the sections above. The comparisons are interleaved A/B runs against
+`2d4cf5a`, with the model warm in the page cache.
+
+Full-attention prefill already batched all four packed projections, but then
+advanced the shared KV state and evaluated every causal query serially. Once
+all projected keys and values have been normalized, rotated, and appended in
+token order, query `i` only reads the immutable state prefix ending at `i`.
+Those query computations now run independently across the worker pool. Work is
+pulled longest-history first, because a static contiguous split gives the last
+worker almost twice the average work on a first chunk starting at position
+zero.
+
+Single-token decode has a different parallel axis. There is only one query
+position, but its sixteen query heads are independent. At histories of at
+least 64 tokens they run across the pool, each preserving its token-by-token
+online-softmax order. Short histories keep the grouped two-KV-head loop and
+avoid the dispatch.
+
+### Default-width prefill
+
+A 128-token prompt at the default microbatch of 128, medians of four
+interleaved pairs:
+
+| | before | after | change |
+| --- | ---: | ---: | ---: |
+| seconds/prefill | 3.580 | 3.358 | -6.2% |
+| prompt tokens/second | 35.76 | 38.12 | +6.6% |
+| full-attention stage | 368.5 ms | 289.5 ms | -21.4% |
+| MoE stage | 1852.9 ms | 1704.6 ms | -8.0% |
+
+The final logits checksum is `0x93d70f88b181c002` and the complete state
+checksum is `0xf9c7bc1e51e18bfe`.
+
+The MoE improvement comes from fixing nested worker context, not from an MoE
+kernel change. A dynamic expert dispatch has seven pool workers plus the
+calling thread. Pool workers correctly ran an expert batch kernel's nested
+tile dispatch in place, while the caller recursively submitted its tile work
+to the already-busy pool and waited. That caller-owned expert became a tail
+after the other workers drained the outer queue. The caller now enters the
+same worker context for its share. On `bench-moe-batch` with 128 varied rows,
+the median forward falls from 68.30 to 60.72 ms, an 11.1% cut.
+
+### Long-context full-attention decode
+
+`bench-attention` advances one full-attention layer through 2,048 positions,
+so the average query sees a history of 1,024.5 tokens. Medians of three
+interleaved pairs:
+
+| | before | after | change |
+| --- | ---: | ---: | ---: |
+| milliseconds/token | 3.033 | 2.175 | -28.3% |
+| full-attention stage, 2,048 tokens | 6204.7 ms | 4448.1 ms | -28.3% |
+| non-expert projections | 3731.8 ms | 3710.1 ms | tie |
+| attention work excluding projections | 2526.5 ms | 775.8 ms | -69.3% |
+
+The output checksum is `1.00434` on both. Parallelizing only the two KV heads
+was an intermediate 13.6% slower than parallelizing the sixteen independent
+query heads at this length. The query-head path rereads shared KV cache lines,
+but eight-way compute parallelism wins decisively on this machine.
+
+Short-context batch-1 decode remains within its documented noise floor. Seven
+interleaved token steps had medians of 0.219 seconds before and 0.208 seconds
+after; this section does not claim that difference as a speedup.
+
+### Rejected wider codec work
+
+Two adjacent experiments did not pay and are not retained:
+
+- letting the AVX-512 non-expert batch kernel cover all 128 inputs in one pass
+  instead of two 64-input groups moved the 8192x2048 projection from 11.15 to
+  13.25 ms; the extra live accumulators spill and cost 19%;
+- multiplying an expert state's eight contiguous components with AVX and then
+  adding the products in scalar decoder order was bit-exact but measured 0.448
+  ms against 0.450 ms on the 512x2048 projection, indistinguishable from
+  noise.
+
+### Exactness
+
+- parallel and grouped online attention are bit-exact on a direct 67-token
+  reference test, above the parallel threshold;
+- model-backed serial, batched-decode, and prefill equivalence tests keep
+  logits and complete decoder state unchanged;
+- causal query tasks only read state after every ordered append is complete,
+  and each task receives a span ending at its own position, so no query can
+  observe a future key or value;
+- the nested-dispatch test synchronizes every pool thread, including the
+  caller, then verifies each inner dispatch stays on its outer thread and
+  executes every index exactly once.
