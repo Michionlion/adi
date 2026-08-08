@@ -384,6 +384,61 @@ attention from 1261 ms to 488 ms of the batch-32 decode step. Batch 1 is
 unchanged because a single task runs in place on the calling thread, which is
 not a worker, so the recurrence still spreads across its 32 value heads.
 
+### Decode dispatch and thresholds
+
+Three further decode changes, medians of seven runs, sequences/second:
+
+| Batch | 1 | 2 | 3 | 4 | 8 | 16 | 32 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| One dispatch per sequence | 2.94 | 4.01 | 5.24 | 10.29 | 17.03 | 27.20 | 31.69 |
+| Sequences times heads | | | | 10.81 | 18.09 | 27.19 | 33.20 |
+| Non-expert threshold of two | 2.91 | 5.42 | 7.87 | 10.32 | 16.72 | | |
+
+Dispatching the recurrence over sequences and value heads together, rather
+than one task per sequence, is worth a consistent 5% at batches 4, 8 and 32.
+The individual ranges overlap, so the number to trust is the direction and
+the structure it removes: one task per sequence used `min(threads, batch)`
+cores, so batch three ran on three of eight.
+
+`ne_batch_minimum` mattered much more. It was four, so batches two and three
+fell off the non-expert SIMD kernel onto the scalar loop, and a decode step
+cost more at batch two (0.499 s) than at batch four (0.388 s). A batch of two
+occupies one SIMD block exactly as sixteen does, so the kernel costs one pass
+over the tiles either way; the scalar loop costs a pass per batch item. On
+the 1408x2048 shared-expert gate, serially, one pass is 0.93 ms against 1.60
+at batch two and 1.77 at batch three. Lowering the threshold to two makes
+step time monotonic in the batch again: 0.344, 0.369, 0.381, 0.388, 0.479
+seconds at batches 1, 2, 3, 4 and 8.
+
+### MoE dispatch under realistic routing
+
+`adi decode-batch` gives every sequence the same token, so every sequence
+routes to the same eight experts. That is not what serving looks like, and it
+is not what the dispatch was tuned for. `adi bench-moe-batch ... varied`
+routes them independently:
+
+| | active experts | rows per expert | parallel efficiency |
+| --- | ---: | ---: | ---: |
+| identical, batch 8 | 8 | 8 | 0.61 |
+| identical, batch 32 | 8 | 32 | 0.57 |
+| varied, batch 8 | 50 | 1..3 | 0.88 |
+| varied, batch 32 | 127 | 1..13 | 0.92 |
+
+The dispatch is already well balanced where it counts. The low efficiency on
+the identical pattern is eight equal tasks on eight workers with the router,
+the counting sort, the gather, the serial route reduction and the shared
+expert all outside the expert dispatch; it is not imbalance.
+
+What realistic routing does show is that half the expert kernel time goes to
+experts holding a single row, because 127 of 256 experts activate and most
+hold one or two. Routing those through the batch-lane kernel rather than
+`mach_expert_matvec` measured 0.01602 against 0.01549 seconds per forward at
+batch 8 and 0.03859 against 0.04052 at batch 32 -- worse at one, better at
+the other, both inside the spread -- so `expert_batch_minimum` stays at two.
+Decode MoE is bound by streaming each active expert's packed weights once,
+which no amount of row scheduling changes; only more tokens sharing an expert
+does.
+
 ### Where decode time goes now
 
 Wall time per decode step, from the stage timers:
@@ -400,15 +455,37 @@ batch 8: a step costs 367 ms for one sequence and 441 ms for eight, so the
 batch is nearly free. And linear attention is still the largest single stage
 at every batch, so it is where the next decode work belongs.
 
-The dispatch over sequences also leaves cores idle between batch 2 and 7,
-where `parallel_tasks` creates only one task per sequence: linear attention
-costs about the same 170 to 190 ms at batches 1, 4, and 8. Splitting the
-recurrence over sequences and value heads together, the way
-`linear_attention_prefill_chunk` splits over heads, would fill them.
+### The single-vector non-expert kernel
 
-MoE dispatch in decode reaches 0.58 to 0.64 parallel efficiency against the
-0.933 the same dispatch reaches in prefill, because decode spreads few rows
-over many experts and most fall below the batch kernel's threshold.
+Linear attention being the largest decode stage does not mean the recurrence
+is what costs. `adi bench-linear MODEL 0 1`, one layer, one token:
+
+| | ms | share |
+| --- | ---: | ---: |
+| three non-expert projections | 5.228 | 95.1% |
+| convolution, recurrence, normalizations, gating | 0.255 | 4.6% |
+
+The gated-delta recurrence is not the problem. `mach_ne_matvec` is. Its
+`KernelTimer` runs on the calling thread and wraps its own `parallel_ranges`,
+so its 243.4 ms across 250 calls is directly comparable to the 370 ms token:
+**two thirds of a batch-1 decode step is the single-vector non-expert
+kernel**, and it moves 6.4 million weight elements per millisecond because
+its accumulation is scalar per element.
+
+It has no SIMD path because the obvious axis is illegal: the eight states of
+a tile row accumulate into one scalar, and reassociating that reduction would
+change the result. There is a legal axis. State i of a non-expert tile lands
+in local row `i >> 3` at local columns `(i & 7) * 2` and `+ 1`, so for a
+fixed step every one of the 16 rows in a tile reads the *same* pair of input
+columns while drawing its own pair of weights from its own state. Sixteen
+rows are sixteen independent accumulators, which is exactly one AVX-512
+register: broadcast the two input scalars, gather the sixteen weight pairs,
+and each lane performs its row's adds in the scalar kernel's order.
+
+That is the same bargain the batch kernels struck, on a different axis, and
+it is bit-exactly reachable. It is not a small change -- it needs a gather
+per step against the 512 KB state table -- and its ceiling is set by trellis
+streaming rather than arithmetic, so it wants a prototype before a promise.
 
 ### Exactness
 
