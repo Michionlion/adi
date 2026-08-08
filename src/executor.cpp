@@ -1187,8 +1187,9 @@ void moe_forward_batch(
     const Backend &backend) {
     constexpr std::uint32_t routes_per_token = 8;
     // Measured optimum for mach_expert_matmul on this codec; see the task
-    // construction below. It follows that kernel's SIMD width, so re-measure
-    // it on a machine with a different one.
+    // construction below. Re-measure it on a machine with a different SIMD
+    // width: the AVX2 kernel continues amortizing through four blocks, so its
+    // measured optimum is also 32 rows.
     constexpr std::uint32_t expert_rows_per_task = 32;
     const auto &config = model.config();
     const auto batch = inputs.size() / config.hidden;
@@ -1296,9 +1297,8 @@ void moe_forward_batch(
     // costs about 0.75 ms for any batch of 1 to 16 rows, 1.27 for 17 to 32,
     // and roughly 0.65 more per block after that. Cost per row therefore falls
     // monotonically and splitting is pure overhead beyond what balance needs,
-    // so the cap is now two full blocks. Measured end to end at a 64-token
-    // prefill, medians of seven runs: 28.0 tokens/second at twelve, 29.2 at
-    // sixteen, 29.8 at thirty-two, 27.8 at sixty-four, 28.3 uncapped.
+    // so the cap is now two full AVX-512 blocks. AVX2 reaches the same
+    // end-to-end optimum at four of its narrower blocks.
     scratch.tasks.clear();
     for (const auto expert : scratch.active) {
         const auto rows = scratch.counts[expert];

@@ -2,9 +2,12 @@
 
 #include "adi/kernels.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <span>
+#include <utility>
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || \
     defined(_M_IX86)
@@ -69,19 +72,29 @@ void hadamard_avx2(std::span<float> values) {
 __m256 unpack_int5_block(
     const std::uint8_t *packed,
     __m256 scale) {
-    std::uint64_t word = 0;
-    for (std::uint32_t byte = 0; byte < 5; ++byte) {
-        word |= static_cast<std::uint64_t>(packed[byte]) << (byte * 8);
-    }
-    const auto codes = _mm256_setr_epi32(
-        static_cast<std::int32_t>((word >> 0) & 0x1FU) - 16,
-        static_cast<std::int32_t>((word >> 5) & 0x1FU) - 16,
-        static_cast<std::int32_t>((word >> 10) & 0x1FU) - 16,
-        static_cast<std::int32_t>((word >> 15) & 0x1FU) - 16,
-        static_cast<std::int32_t>((word >> 20) & 0x1FU) - 16,
-        static_cast<std::int32_t>((word >> 25) & 0x1FU) - 16,
-        static_cast<std::int32_t>((word >> 30) & 0x1FU) - 16,
-        static_cast<std::int32_t>((word >> 35) & 0x1FU) - 16);
+    std::uint32_t low;
+    std::memcpy(&low, packed, sizeof(low));
+    const auto word =
+        static_cast<std::uint64_t>(low) |
+        (static_cast<std::uint64_t>(packed[4]) << 32);
+    const auto words = _mm256_set1_epi64x(static_cast<std::int64_t>(word));
+    // Build one little-endian 32-bit window per code, then shift each lane by
+    // its bit offset inside that window. This is the AVX2 analogue of the
+    // VBMI byte-permute plus multishift decoder, without reading past the
+    // five-byte block.
+    const auto windows = _mm256_shuffle_epi8(
+        words,
+        _mm256_setr_epi8(
+            0, 1, 2, 3, 0, 1, 2, 3,
+            9, 10, 11, 12, 9, 10, 11, 12,
+            2, 3, 4, 5, 3, 4, 5, 6,
+            11, 12, 13, 14, 12, 13, 14, 15));
+    auto codes = _mm256_srlv_epi32(
+        windows,
+        _mm256_setr_epi32(0, 5, 2, 7, 4, 1, 6, 3));
+    codes = _mm256_sub_epi32(
+        _mm256_and_si256(codes, _mm256_set1_epi32(0x1F)),
+        _mm256_set1_epi32(16));
     return _mm256_mul_ps(_mm256_cvtepi32_ps(codes), scale);
 }
 
@@ -104,6 +117,56 @@ float int5_dot_avx2(
         }
     }
     return reduce_avx2(sum);
+}
+
+inline __m256 accumulate_int5_block(
+    __m256 sum,
+    __m256 weights,
+    const float *input) {
+    return _mm256_add_ps(
+        sum,
+        _mm256_mul_ps(weights, _mm256_loadu_ps(input)));
+}
+
+template <std::size_t Batch, std::size_t... Indexes>
+void int5_dot_batch_fixed_avx2(
+    std::span<const std::uint8_t> packed,
+    std::span<const std::uint16_t> scales,
+    std::span<const float> inputs,
+    std::span<float> outputs,
+    std::index_sequence<Indexes...>) {
+    const auto columns = scales.size() * 64;
+    __m256 sums[Batch];
+    ((sums[Indexes] = _mm256_setzero_ps()), ...);
+    for (std::size_t group = 0; group < scales.size(); ++group) {
+        const auto scale = _mm256_set1_ps(f16_to_f32(scales[group]));
+        for (std::size_t block = 0; block < 8; ++block) {
+            const auto weights = unpack_int5_block(
+                packed.data() + group * 40 + block * 5,
+                scale);
+            const auto input_offset = group * 64 + block * 8;
+            ((sums[Indexes] = accumulate_int5_block(
+                  sums[Indexes],
+                  weights,
+                  inputs.data() + Indexes * columns + input_offset)),
+             ...);
+        }
+    }
+    ((outputs[Indexes] = reduce_avx2(sums[Indexes])), ...);
+}
+
+template <std::size_t Batch>
+void int5_dot_batch_fixed_avx2(
+    std::span<const std::uint8_t> packed,
+    std::span<const std::uint16_t> scales,
+    std::span<const float> inputs,
+    std::span<float> outputs) {
+    int5_dot_batch_fixed_avx2<Batch>(
+        packed,
+        scales,
+        inputs,
+        outputs,
+        std::make_index_sequence<Batch>{});
 }
 
 float bf16_dot_avx2(
@@ -217,6 +280,81 @@ const X86Kernels &x86_avx2_kernels() noexcept {
     static const X86Kernels kernels;
 #endif
     return kernels;
+}
+
+void x86_int5_dot_batch_avx2(
+    std::span<const std::uint8_t> packed,
+    std::span<const std::uint16_t> scales,
+    std::span<const float> inputs,
+    std::uint32_t batch,
+    std::span<float> outputs,
+    std::span<float> scratch) {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || \
+    defined(_M_IX86)
+    if (batch == 2) {
+        int5_dot_batch_fixed_avx2<2>(packed, scales, inputs, outputs);
+        return;
+    }
+    if (batch == 4) {
+        int5_dot_batch_fixed_avx2<4>(packed, scales, inputs, outputs);
+        return;
+    }
+    if (batch == 8) {
+        int5_dot_batch_fixed_avx2<8>(packed, scales, inputs, outputs);
+        return;
+    }
+    // The shared batch interface reserves sixteen floats per item for the
+    // AVX-512 kernel. AVX2 uses the first eight as lane accumulators and keeps
+    // the same stride so dispatch needs no ISA-specific scratch contract.
+    constexpr std::size_t scratch_stride = 16;
+    std::fill_n(
+        scratch.begin(),
+        static_cast<std::size_t>(batch) * scratch_stride,
+        0.0F);
+    const auto columns = scales.size() * 64;
+    for (std::size_t group = 0; group < scales.size(); ++group) {
+        const auto scale = _mm256_set1_ps(f16_to_f32(scales[group]));
+        for (std::size_t block = 0; block < 8; ++block) {
+            const auto weights = unpack_int5_block(
+                packed.data() + group * 40 + block * 5,
+                scale);
+            const auto input_offset = group * 64 + block * 8;
+            for (std::uint32_t batch_index = 0;
+                 batch_index < batch;
+                 ++batch_index) {
+                auto *lanes =
+                    scratch.data() +
+                    static_cast<std::size_t>(batch_index) * scratch_stride;
+                const auto *input =
+                    inputs.data() +
+                    static_cast<std::size_t>(batch_index) * columns +
+                    input_offset;
+                _mm256_storeu_ps(
+                    lanes,
+                    _mm256_add_ps(
+                        _mm256_loadu_ps(lanes),
+                        _mm256_mul_ps(
+                            weights,
+                            _mm256_loadu_ps(input))));
+            }
+        }
+    }
+    for (std::uint32_t batch_index = 0;
+         batch_index < batch;
+         ++batch_index) {
+        outputs[batch_index] = reduce_avx2(
+            _mm256_loadu_ps(
+                scratch.data() +
+                static_cast<std::size_t>(batch_index) * scratch_stride));
+    }
+#else
+    (void)packed;
+    (void)scales;
+    (void)inputs;
+    (void)batch;
+    (void)outputs;
+    (void)scratch;
+#endif
 }
 
 } // namespace adi::detail

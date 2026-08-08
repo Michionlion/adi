@@ -70,6 +70,42 @@ int main() {
     };
     verify_available_isas(verify);
 
+    // Batch eight takes the AVX2 register-resident path; batch seven above
+    // deliberately continues to exercise the arbitrary-batch fallback.
+    constexpr std::uint32_t fixed_batch = 8;
+    std::vector<float> fixed_inputs(
+        static_cast<std::size_t>(fixed_batch) * columns);
+    for (auto &value : fixed_inputs) {
+        value = static_cast<float>(
+                    static_cast<std::int32_t>(next() % 2049) - 1024) /
+                256.0F;
+    }
+    const auto verify_fixed_batch = [&](adi::detail::CpuIsa isa) {
+        adi::detail::force_cpu_isa_for_testing(isa);
+        std::vector<float> expected(fixed_batch);
+        for (std::uint32_t batch_index = 0;
+             batch_index < fixed_batch;
+             ++batch_index) {
+            expected[batch_index] = adi::detail::int5_scaled_dot(
+                packed,
+                scales,
+                std::span<const float>(fixed_inputs).subspan(
+                    static_cast<std::size_t>(batch_index) * columns,
+                    columns));
+        }
+        std::vector<float> actual(fixed_batch);
+        std::vector<float> weights(columns);
+        adi::detail::int5_scaled_dot_batch(
+            packed,
+            scales,
+            fixed_inputs,
+            fixed_batch,
+            actual,
+            weights);
+        assert(actual == expected);
+    };
+    verify_available_isas(verify_fixed_batch);
+
     constexpr std::uint32_t head_rows = 1024;
     std::vector<std::uint8_t> head_packed(
         static_cast<std::size_t>(head_rows) * columns / 8 * 5);
