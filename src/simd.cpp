@@ -1,5 +1,7 @@
 #include "simd.hpp"
 
+#include "environment.hpp"
+
 #include "adi/kernels.hpp"
 #include "simd_x86.hpp"
 
@@ -295,7 +297,9 @@ const SimdOps &ops_for_isa(CpuIsa isa) noexcept {
 
 CpuIsa requested_isa() noexcept {
     const auto &features = cpu_features();
-    if (const char *requested = std::getenv("ADI_CPU_ISA");
+    std::array<char, 32> requested_buffer{};
+    if (const char *requested =
+            environment_variable("ADI_CPU_ISA", requested_buffer);
         requested != nullptr) {
         const std::string_view value(requested);
         if (value == "scalar") {

@@ -154,6 +154,30 @@ void check_rejected_ubatch(const adi::MachModel &model) {
     }
 }
 
+void check_cancelled_prefill(const adi::MachModel &model) {
+    const auto tokens = prompt_tokens(model, 9);
+    adi::DecoderState state;
+    adi::PrefillScratch scratch;
+    std::vector<float> logits(model.config().vocabulary);
+    std::uint32_t checks = 0;
+    bool cancelled = false;
+    try {
+        adi::prefill(
+            model,
+            tokens,
+            state,
+            logits,
+            scratch,
+            adi::cpu_backend(),
+            [&] { return ++checks == 2; });
+    } catch (const std::runtime_error &) {
+        cancelled = true;
+    }
+    assert(cancelled);
+    assert(checks == 2);
+    assert(state.position == 0);
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -162,6 +186,7 @@ int main(int argc, char **argv) {
     const bool full = argc == 3 && std::string_view(argv[2]) == "--full";
 
     check_rejected_ubatch(model);
+    check_cancelled_prefill(model);
     check_decode_anchor(model, 3);
 
     if (full) {

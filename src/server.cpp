@@ -16,6 +16,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -178,8 +179,12 @@ class Winsock {
 #endif
 
 struct Connection {
+    Connection(SocketHandle socket_value, TimePoint deadline_value)
+        : socket(socket_value), deadline(deadline_value) {}
+
     SocketHandle socket;
     TimePoint deadline;
+    std::mutex send_mutex;
 };
 
 bool try_acquire_connection(
@@ -239,6 +244,7 @@ void wait_for_socket(SocketHandle socket, short events, TimePoint deadline) {
 }
 
 void send_all(Connection &connection, std::string_view data) {
+    std::lock_guard lock(connection.send_mutex);
     auto idle = std::min(
         connection.deadline,
         std::chrono::steady_clock::now() + send_idle_deadline);
@@ -707,8 +713,9 @@ void send_event(
     Connection &connection,
     std::string_view event,
     std::string data) {
-    send_all(connection, "event: " + std::string(event) + "\n");
-    send_all(connection, "data: " + data + "\n\n");
+    send_all(
+        connection,
+        "event: " + std::string(event) + "\ndata: " + data + "\n\n");
 }
 
 void stream_responses(
@@ -799,13 +806,23 @@ void stream_responses(
                 pending.erase(0, scan.error_length);
             }
         };
-        const auto cancellation_check = [&]() {
-            if (std::chrono::steady_clock::now() >= connection.deadline) {
+        auto next_connection_probe =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+        const auto cancellation_check = [&]() mutable {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= connection.deadline) {
                 throw std::runtime_error("request deadline exceeded");
             }
             if (connection_cancelled(
                     connection.socket, connection.deadline)) {
                 throw SocketFailure("client disconnected during generation");
+            }
+            if (now >= next_connection_probe) {
+                // A read EOF can be a valid HTTP half-close, so it cannot by
+                // itself distinguish a waiting client from a fully closed
+                // connection. An SSE comment safely probes the response side.
+                send_all(connection, ": keepalive\n\n");
+                next_connection_probe = now + std::chrono::milliseconds(250);
             }
             return false;
         };

@@ -15,6 +15,13 @@
 namespace adi {
 namespace {
 
+void throw_if_prefill_cancelled(
+    const std::function<bool()> &cancelled) {
+    if (cancelled && cancelled()) {
+        throw std::runtime_error("prefill cancelled");
+    }
+}
+
 void normalize_head(
     std::span<float> values,
     std::span<const std::uint16_t> weights,
@@ -650,13 +657,13 @@ void full_attention_forward_batch(
             apply_rope(query, scratch);
         }
         for (std::uint32_t head = 0; head < kv_heads; ++head) {
-            auto key = std::span<float>(
+            auto head_key = std::span<float>(
                 batch_scratch.projection_1.data() +
                     batch_index * kv_heads * head_size +
                     static_cast<std::size_t>(head) * head_size,
                 head_size);
-            normalize_head(key, descriptor.key_norm, epsilon);
-            apply_rope(key, scratch);
+            normalize_head(head_key, descriptor.key_norm, epsilon);
+            apply_rope(head_key, scratch);
         }
         state.keys.insert(state.keys.end(), key.begin(), key.end());
         state.values.insert(state.values.end(), value.begin(), value.end());
@@ -1823,7 +1830,8 @@ void prefill(
     DecoderState &state,
     std::span<float> logits,
     PrefillScratch &scratch,
-    const Backend &backend) {
+    const Backend &backend,
+    const std::function<bool()> &cancelled) {
     const auto &config = model.config();
     if (tokens.empty() ||
         (!logits.empty() && logits.size() != config.vocabulary) ||
@@ -1836,6 +1844,7 @@ void prefill(
         })) {
         throw std::invalid_argument("prefill token is out of range");
     }
+    throw_if_prefill_cancelled(cancelled);
     const auto count = tokens.size();
     const auto initial_position = state.position;
     scratch.hidden.resize(count * config.hidden);
@@ -1857,6 +1866,7 @@ void prefill(
             scratch.rope_sine[token_index * 32 + index] = std::sin(theta);
         }
     }
+    throw_if_prefill_cancelled(cancelled);
 
     std::vector<std::uint32_t> positions(count);
     std::vector<FullAttentionState *> full_states(count);
@@ -1866,6 +1876,7 @@ void prefill(
             initial_position + static_cast<std::uint32_t>(token_index);
     }
     for (std::uint32_t layer = 0; layer < config.layers; ++layer) {
+        throw_if_prefill_cancelled(cancelled);
         const auto &descriptor = model.layer(layer);
         if (descriptor.full_attention) {
             scratch.batch.projection_5.resize(count * config.hidden);
@@ -2063,6 +2074,7 @@ void prefill(
             }
         }
     }
+    throw_if_prefill_cancelled(cancelled);
 
     // Intermediate prompt chunks discard their logits, so the final
     // normalization and the eight vocabulary-head chunks are computed only
@@ -2074,6 +2086,7 @@ void prefill(
             scratch.token.hidden.begin());
         finalize_hidden(model, scratch.token, backend);
         for (std::uint32_t chunk = 0; chunk < 8; ++chunk) {
+            throw_if_prefill_cancelled(cancelled);
             const auto head = model.head_chunk(chunk);
             backend.head_matvec(
                 head,
@@ -2083,6 +2096,7 @@ void prefill(
                     head.rows));
         }
     }
+    throw_if_prefill_cancelled(cancelled);
     state.position += static_cast<std::uint32_t>(count);
 }
 

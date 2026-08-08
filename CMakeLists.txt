@@ -1,12 +1,32 @@
 cmake_minimum_required(VERSION 3.20)
 project(adi VERSION 0.1.0 LANGUAGES CXX)
 
+if(CMAKE_CONFIGURATION_TYPES AND CMAKE_BUILD_TYPE)
+    message(STATUS
+        "CMAKE_BUILD_TYPE is ignored by this multi-config generator; "
+        "use cmake --build --config instead")
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(ADI_BUILD_TESTS "Build ADI tests" ON)
 set(ADI_TEST_MODEL "" CACHE FILEPATH "Mach-1 GGUF used for checkpoint tests")
+
+# CMake's MSVC Release flags define NDEBUG globally. Keep that normal runtime
+# behavior below, but remove the global definition so optimized test binaries
+# retain the assertions that form this dependency-free test suite.
+if(MSVC AND ADI_BUILD_TESTS)
+    foreach(configuration RELEASE RELWITHDEBINFO MINSIZEREL)
+        string(REPLACE "/DNDEBUG" ""
+            CMAKE_CXX_FLAGS_${configuration}
+            "${CMAKE_CXX_FLAGS_${configuration}}")
+        string(REPLACE "-DNDEBUG" ""
+            CMAKE_CXX_FLAGS_${configuration}
+            "${CMAKE_CXX_FLAGS_${configuration}}")
+    endforeach()
+endif()
 
 add_library(adi_runtime STATIC
     src/attention.cpp
@@ -43,7 +63,9 @@ add_library(adi_runtime STATIC
 )
 target_include_directories(adi_runtime PUBLIC include)
 if(MSVC)
-    target_compile_options(adi_runtime PRIVATE /W4 /permissive-)
+    # MSBuild parallelizes projects, but this runtime is one large project.
+    # /MP lets cl compile its independent translation units concurrently too.
+    target_compile_options(adi_runtime PRIVATE /W4 /permissive- /MP)
 else()
     target_compile_options(adi_runtime PRIVATE -Wall -Wextra -Wpedantic)
 endif()
@@ -105,6 +127,15 @@ endif()
 
 add_executable(adi src/main.cpp)
 target_link_libraries(adi PRIVATE adi_runtime)
+
+if(MSVC AND ADI_BUILD_TESTS)
+    foreach(runtime_target adi_runtime adi)
+        target_compile_definitions(${runtime_target} PRIVATE
+            $<$<CONFIG:Release>:NDEBUG>
+            $<$<CONFIG:RelWithDebInfo>:NDEBUG>
+            $<$<CONFIG:MinSizeRel>:NDEBUG>)
+    endforeach()
+endif()
 
 if(WIN32)
     target_link_libraries(adi_runtime PUBLIC ws2_32)
@@ -273,9 +304,7 @@ if(ADI_BUILD_TESTS)
             adi_prefill_ubatch_test
             adi_linear_prefill_test
             adi_moe_batch_test)
-        if(MSVC)
-            target_compile_options(${test_target} PRIVATE /UNDEBUG)
-        else()
+        if(NOT MSVC)
             target_compile_options(${test_target} PRIVATE -UNDEBUG)
         endif()
     endforeach()

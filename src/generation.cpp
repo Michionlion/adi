@@ -151,7 +151,9 @@ void prefill_prompt(
             tokens.subspan(offset, count),
             state,
             final_chunk ? logits : std::span<float>{},
-            scratch);
+            scratch,
+            cpu_backend(),
+            cancelled);
     }
     throw_if_cancelled(cancelled);
 }
