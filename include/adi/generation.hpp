@@ -31,6 +31,10 @@ struct GenerationResult {
     std::uint32_t input_tokens;
     std::uint32_t output_tokens;
     FinishReason finish_reason;
+    // Wall time for model prompt processing and generation. Queue wait and
+    // input tokenization are intentionally excluded.
+    double prefill_seconds = 0.0;
+    double decode_seconds = 0.0;
 };
 
 using TokenCallback = std::function<void(std::string_view)>;

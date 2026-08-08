@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <condition_variable>
 #include <cmath>
 #include <deque>
@@ -259,6 +260,7 @@ GenerationResult generate_from_prompt(
     DecoderScratch scratch;
     PrefillScratch prefill_scratch;
     std::vector<float> logits(model.config().vocabulary);
+    const auto prefill_started = std::chrono::steady_clock::now();
     prefill_prompt(
         model,
         prompt_tokens,
@@ -268,6 +270,7 @@ GenerationResult generate_from_prompt(
         execution,
         cancelled);
     tokenizer.mask_unused_logits(logits);
+    const auto prefill_finished = std::chrono::steady_clock::now();
     std::mt19937_64 random(options.seed);
     std::vector<std::uint32_t> output_tokens;
     output_tokens.reserve(max_output_tokens);
@@ -292,11 +295,18 @@ GenerationResult generate_from_prompt(
             tokenizer.mask_unused_logits(logits);
         }
     }
+    const auto decode_finished = std::chrono::steady_clock::now();
+    const double prefill_seconds = std::chrono::duration<double>(
+        prefill_finished - prefill_started).count();
+    const double decode_seconds = std::chrono::duration<double>(
+        decode_finished - prefill_finished).count();
     return {
         sanitize_utf8(tokenizer.decode(output_tokens)),
         static_cast<std::uint32_t>(prompt_tokens.size()),
         static_cast<std::uint32_t>(output_tokens.size()),
         finish_reason,
+        prefill_seconds,
+        decode_seconds,
     };
 }
 
@@ -347,6 +357,8 @@ struct ContinuousBatcher::Impl {
         std::uint32_t max_output_tokens = 0;
         std::vector<std::uint32_t> output_tokens;
         std::mt19937_64 random;
+        double prefill_seconds = 0.0;
+        std::chrono::steady_clock::time_point decode_started;
     };
 
     Impl(
@@ -424,11 +436,15 @@ struct ContinuousBatcher::Impl {
 
     void finish(Active &active, FinishReason reason) {
         try {
+            const auto decode_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - active.decode_started).count();
             active.request->promise.set_value({
                 sanitize_utf8(tokenizer.decode(active.output_tokens)),
                 active.input_tokens,
                 static_cast<std::uint32_t>(active.output_tokens.size()),
                 reason,
+                active.prefill_seconds,
+                decode_seconds,
             });
         } catch (...) {
             active.request->complete_stream();
@@ -459,6 +475,7 @@ struct ContinuousBatcher::Impl {
         DecoderState state;
         PrefillScratch prefill_scratch;
         std::vector<float> prompt_logits(model.config().vocabulary);
+        const auto prefill_started = std::chrono::steady_clock::now();
         prefill_prompt(
             model,
             prompt_tokens,
@@ -468,12 +485,17 @@ struct ContinuousBatcher::Impl {
             execution,
             request_cancelled);
         tokenizer.mask_unused_logits(prompt_logits);
+        const auto prefill_finished = std::chrono::steady_clock::now();
+        const double prefill_seconds = std::chrono::duration<double>(
+            prefill_finished - prefill_started).count();
         Active admitted{
             request,
             static_cast<std::uint32_t>(prompt_tokens.size()),
             max_output_tokens,
             {},
             std::mt19937_64(request->options.seed),
+            prefill_seconds,
+            prefill_finished,
         };
         admitted.output_tokens.reserve(max_output_tokens);
 

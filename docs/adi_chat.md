@@ -65,6 +65,13 @@ uv run tools/adi_chat.py --connect http://127.0.0.1:9932
 The API `model` field is omitted by default because ADI treats it as optional.
 Use `--model-id NAME` when a caller needs to send it explicitly.
 
+During a streamed response, an in-place footer shows prompt-prefill time and
+then a rolling five-second output rate. The footer disappears when generation
+finishes, leaving separate prefill and decode lines with the server's exact
+token counts, phase durations, and throughput, followed by client-observed time
+to first token (TTFT), total request time, and session token count. Redirected
+output omits the changing footer but keeps the final summary.
+
 ## Interactive commands
 
 ```text
@@ -75,7 +82,8 @@ Use `--model-id NAME` when a caller needs to send it explicitly.
 /save PATH            save a session
 /load PATH            load a session
 /paste                enter a multi-line message; finish with a single `.`
-/stats                show cumulative token usage
+/stats                show cumulative token usage, request time, and throughput
+/settings             show the endpoint and generation settings
 /exit                 exit and stop the ADI child process
 ```
 

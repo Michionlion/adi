@@ -45,7 +45,28 @@ curl http://127.0.0.1:9932/v1/responses \
 
 Successful responses use the Responses API `response` object with one
 assistant `message`, one `output_text` content item, and input/output/total
-token usage. Streaming responses emit the normal lifecycle from
+token usage. ADI also returns a top-level `timings` object compatible with
+llama.cpp's performance fields:
+
+```json
+{
+  "timings": {
+    "prompt_n": 128,
+    "prompt_ms": 3200.0,
+    "prompt_per_token_ms": 25.0,
+    "prompt_per_second": 40.0,
+    "predicted_n": 32,
+    "predicted_ms": 8000.0,
+    "predicted_per_token_ms": 250.0,
+    "predicted_per_second": 4.0
+  }
+}
+```
+
+Prompt timing measures model prefill and excludes request queueing and
+tokenization. Prediction timing starts after prefill and ends when generation
+finishes. Streaming responses carry these timings in the terminal response
+object and emit the normal lifecycle from
 `response.created` through `response.completed`, including UTF-8-safe
 `response.output_text.delta` events. Hitting `max_output_tokens` instead
 returns status `incomplete`, `incomplete_details.reason` set to
