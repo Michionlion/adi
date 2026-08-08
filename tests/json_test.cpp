@@ -15,6 +15,8 @@ int main() {
     assert(adi::json_dump(value) ==
            R"({"input":"hello\nworld","max":2,"stream":false,"items":[null,"☺"]})");
     assert(adi::json_dump(adi::parse_json("-0.25")) == "-0.25");
+    assert(adi::json_dump(adi::parse_json("0.1")) == "0.1");
+    assert(adi::json_dump(adi::parse_json("3.14")) == "3.14");
 
     bool rejected = false;
     try {

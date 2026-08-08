@@ -4,7 +4,6 @@
 #include <charconv>
 #include <cmath>
 #include <cstdint>
-#include <limits>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -299,9 +298,7 @@ void dump_value(std::string &output, const Json &value) {
         const auto [end, error] = std::to_chars(
             buffer,
             buffer + sizeof(buffer),
-            *number,
-            std::chars_format::general,
-            std::numeric_limits<double>::max_digits10);
+            *number);
         if (error != std::errc{}) {
             throw std::runtime_error("cannot serialize JSON number");
         }
