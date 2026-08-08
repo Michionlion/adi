@@ -330,6 +330,19 @@ class AdiChatTests(unittest.TestCase):
                 conversation.messages,
             )
 
+    def test_old_session_format_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = Path(directory) / "session.json"
+            session.write_text(
+                '{"version":1,"system_prompt":null,"messages":[]}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                adi_chat.ClientError,
+                "unsupported session format",
+            ):
+                adi_chat.Conversation.load(session)
+
     def test_repl_can_disable_and_reenable_tools(self) -> None:
         advertised_tools: list[object] = []
 

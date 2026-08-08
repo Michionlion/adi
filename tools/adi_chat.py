@@ -350,7 +350,7 @@ class Conversation:
             document = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise ClientError(f"cannot load session {path}: {error}") from error
-        if not isinstance(document, dict) or document.get("version") not in {1, 2}:
+        if not isinstance(document, dict) or document.get("version") != 2:
             raise ClientError(f"unsupported session format in {path}")
         system_prompt = document.get("system_prompt")
         if system_prompt is not None and not isinstance(system_prompt, str):
@@ -359,46 +359,29 @@ class Conversation:
         if not isinstance(messages, list):
             raise ClientError(f"invalid message list in {path}")
         validated: list[dict[str, Any]] = []
-        if document["version"] == 2:
-            for index, message in enumerate(messages):
-                if not isinstance(message, dict):
-                    raise ClientError(f"invalid message {index} in {path}")
-                item_type = message.get("type")
-                if item_type in {None, "message"}:
-                    if message.get("role") not in {"user", "assistant"} or not isinstance(
-                        message.get("content"), (str, list)
-                    ):
-                        raise ClientError(f"invalid message {index} in {path}")
-                elif item_type == "function_call":
-                    if not all(
-                        isinstance(message.get(key), str)
-                        for key in ("call_id", "name", "arguments")
-                    ):
-                        raise ClientError(f"invalid function call {index} in {path}")
-                elif item_type == "function_call_output":
-                    if not isinstance(message.get("call_id"), str) or not isinstance(
-                        message.get("output"), str
-                    ):
-                        raise ClientError(f"invalid function output {index} in {path}")
-                else:
-                    raise ClientError(f"unsupported item {index} in {path}")
-                validated.append(message)
-            return cls(system_prompt=system_prompt, messages=validated)
-
-        expected_role = "user"
         for index, message in enumerate(messages):
             if not isinstance(message, dict):
                 raise ClientError(f"invalid message {index} in {path}")
-            role = message.get("role")
-            content = message.get("content")
-            if role != expected_role or not isinstance(content, str):
-                raise ClientError(
-                    f"session messages must alternate user/assistant at message {index}"
-                )
-            validated.append({"role": role, "content": content})
-            expected_role = "assistant" if role == "user" else "user"
-        if expected_role == "assistant":
-            raise ClientError(f"session {path} ends with an unanswered user message")
+            item_type = message.get("type")
+            if item_type in {None, "message"}:
+                if message.get("role") not in {"user", "assistant"} or not isinstance(
+                    message.get("content"), (str, list)
+                ):
+                    raise ClientError(f"invalid message {index} in {path}")
+            elif item_type == "function_call":
+                if not all(
+                    isinstance(message.get(key), str)
+                    for key in ("call_id", "name", "arguments")
+                ):
+                    raise ClientError(f"invalid function call {index} in {path}")
+            elif item_type == "function_call_output":
+                if not isinstance(message.get("call_id"), str) or not isinstance(
+                    message.get("output"), str
+                ):
+                    raise ClientError(f"invalid function output {index} in {path}")
+            else:
+                raise ClientError(f"unsupported item {index} in {path}")
+            validated.append(message)
         return cls(system_prompt=system_prompt, messages=validated)
 
 
