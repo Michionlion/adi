@@ -506,6 +506,10 @@ Both results are worth knowing before anyone tries again. What would change
 the picture is a lookup that is not a gather -- fewer, wider loads, or a
 representation whose weights are computed rather than looked up.
 
+That guess was wrong in an instructive way. Both of those were measured and
+neither pays: see "The accumulator, not the lookup" below. The lookup was not
+what the kernel was spending its time on, so making it cheaper could not help.
+
 ### Measuring batch-1 decode
 
 Batch-1 decode is far noisier than prefill and noisier than the rest of
@@ -518,10 +522,114 @@ which is what made the row-kernel A/B inconclusive until it was measured at
 the kernel instead. Use `adi bench-linear` and the `non_expert` counter, not
 `decode-batch`, to judge a change aimed at this path.
 
+## How much headroom batch-1 decode has
+
+Every packed weight is read once per token and no kernel change alters that,
+so the first question is what the machine can stream. Measured on this
+8-core EPYC 9645 VM with a STREAM-style probe, best of five, working sets far
+larger than the 16 MB L3:
+
+| | 1 thread | 8 threads |
+| --- | ---: | ---: |
+| sequential read, 2 GB | 41.2 GB/s | 58.9 GB/s |
+| STREAM triad, 256 MB/array | 39.1 GB/s | 50.7 GB/s |
+| sequential read, 8 MB (L3-resident) | 90.2 GB/s | 83.0 GB/s |
+
+A decode step's own counters give the footprint. `adi decode-token` reports
+`non_expert work_items=1405091840` and `expert work_items=1006632960`, so a
+token reads 1.405e9 non-expert weights at 4 bits and 1.007e9 expert weights at
+1.5 bits: **702.5 MB plus 188.7 MB, 891 MB total**. At the 0.362 s step
+measured alongside those counters that is **2.46 GB/s**.
+
+So batch-1 decode runs at about **4% of what the machine sustains**, and there
+is roughly 24x of bandwidth headroom rather than the 5x that would still have
+left the kernels responsible. Decode is not near a bandwidth floor; the
+matvec is the constraint, and batching remains a throughput lever rather than
+the only one.
+
+The cache geometry matters for the sections below and `lscpu` reports it
+misleadingly. Per `/sys/devices/system/cpu/cpu0/cache`: L1d is 64 KB private,
+L2 is **512 KB private**, and L3 is **16 MB shared by all eight cores** --
+not the "128 MiB (8 instances)" that `lscpu` prints. The 512 KB non-expert
+state-value table is therefore exactly the size of one core's entire L2.
+
+### The accumulator, not the lookup
+
+The 512 KB state table does miss L1 on essentially every lookup. Counted with
+`perf stat` over a standalone replica of the tile loop at the 8192x2048
+in_proj_qkv shape, one thread, fixed setup cancelled by differencing two
+round counts:
+
+| inner loop | cycles/pass | instructions/pass | L1 misses/pass | IPC |
+| --- | ---: | ---: | ---: | ---: |
+| current kernel | 46.5 M | 180.2 M | 7.94 M | 3.87 |
+| arithmetic decode into a 4 KB tlut | 60.1 M | 268.2 M | 0.14 M | 4.47 |
+| row accumulator in a register | 31.2 M | 242.9 M | 7.94 M | 7.78 |
+| row accumulator + signed 8 KB tlut | 31.7 M | 268.2 M | 0.14 M | 8.47 |
+
+A pass decodes 8.39 M states, so the current kernel misses L1 on **95% of its
+state lookups** and the arithmetic decode removes 98% of those misses. It is
+still slower: the misses are L2 hits that the out-of-order engine already
+overlaps, so they cost throughput the core had to spare, while the decode adds
+88 M instructions per pass directly onto the serial chain from the state to
+the address. Cycles rise 29%.
+
+What the kernel actually spent its time on is the accumulator. State i lands
+in local row `i >> 3`, so eight consecutive states -- sixteen adds -- all land
+in the same `row_sums` slot, and because the row index moves under the flat
+walk the compiler keeps that slot in memory. The sixteen adds then chain
+through store-to-load forwarding rather than through the adder. Grouping the
+walk by row lets the running sum stay in a register across the eight states
+that touch it, in the same order, so the result is unchanged: 46.5 M cycles
+to 31.2 M, with IPC going 3.87 to 7.78 on *more* instructions, which is the
+signature of removing a stall rather than removing work.
+
+The batch SIMD kernel already had this structure and says so in
+`ne_accumulate_tile_row`; only the single-vector path was left on the flat
+walk. `for_each_ne_row_state` in `ne_trellis.hpp` now gives both the same
+grouping.
+
+Two things were tried on top and are not worth keeping. Folding the sign into
+a 1024-entry 8 KB table -- `(product >> 6) & 0x3FF` is exactly
+`row | (negative << 9)`, so it is three integer ops and one L1-resident load
+-- lands within 2% of the plain table (31.7 M against 31.2 M) despite 98%
+fewer misses. Loading the value pair as one 8-byte load instead of two 4-byte
+loads is likewise inside the noise. Splitting the row sum into two
+accumulators, which would not have been bit-exact, was also no faster, so the
+remaining chain is not the limit either.
+
+### What the row accumulator is worth
+
+Interleaved A/B of two binaries, alternating run by run so host drift cancels.
+This VM's spread is wide -- the standalone replica shows run-to-run ranges
+near 100% at eight threads -- so medians over many pairs, not single runs.
+
+| | before | after | |
+| --- | ---: | ---: | ---: |
+| `bench-ne`, 8192x2048, 60 iterations, 8 pairs | 2.594 ms | 2.008 ms | 1.29x |
+| `bench-linear` layer 0, `non_expert` total, 15 pairs | 6.524 ms | 5.141 ms | 1.27x |
+| `decode-token`, `non_expert` total, 11 pairs | 213.1 ms | 172.6 ms | 1.23x |
+| `decode-token`, step, 11 pairs | 0.3807 s | 0.3372 s | 1.13x |
+
+The `bench-linear` distributions barely overlap: every "before" sample but one
+falls between 6.43 and 6.98 ms, every "after" sample between 4.92 and 5.99.
+The step gain follows from the kernel gain and the share it holds -- the
+non-expert matvec is about 55% of a batch-1 step, so 1.23x on it predicts
+1.12x overall against the 1.13x measured.
+
+Decode is still nowhere near memory-bound after this: 702.5 MB of non-expert
+weights in 172.6 ms is 4.07 GB/s, about 7% of the machine's 58.9 GB/s. The
+kernel now runs at IPC near 8, so the next lever is instruction count rather
+than stalls or bandwidth.
+
 ### Exactness
 
 Bit-exact, not tolerance-bounded:
 
+- the row-grouped walk `for_each_ne_row_state` reproduces the flat walk's
+  state sequence, and its local row and step decomposition, on the same 4,000
+  randomized tiles and single-bit edge cases the flat walk is checked against,
+  including the transition that wraps the stream;
 - the 64-token prefill keeps logits checksum `0x8c24a3f4644e03d3` and state
   checksum `0xc75f92166aad6875` through every change above;
 - the 256-token prefill keeps `0x35a5f9bc4d1133d2` and `0xd3861b9b0d49fdd`,
